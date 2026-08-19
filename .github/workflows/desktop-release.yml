@@ -83,6 +83,7 @@ jobs:
               prerelease_flag="--prerelease"
             fi
             gh release create "$RELEASE_TAG" \
+              --target "$CHECKOUT_REF" \
               --repo "${{ github.repository }}" \
               --title "Paseo $RELEASE_TAG" \
               --notes "" \
