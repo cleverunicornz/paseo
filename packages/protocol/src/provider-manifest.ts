@@ -248,6 +248,14 @@ export const AGENT_PROVIDER_DEFINITIONS: AgentProviderDefinition[] = [
     modes: [],
   },
   {
+    id: "yeet-code",
+    label: "Yeet Code",
+    description: "Situated Gateway agent over remote Agent Client Protocol v2",
+    enabledByDefault: false,
+    defaultModeId: null,
+    modes: [],
+  },
+  {
     id: "omp",
     label: "Oh My Pi",
     description: "Multi-provider coding agent with native approvals, host tools, and subagents",
