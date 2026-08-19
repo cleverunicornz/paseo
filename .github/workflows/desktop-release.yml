@@ -168,7 +168,7 @@ jobs:
           build_args+=("-c.publish.owner=$GITHUB_REPOSITORY_OWNER")
           build_args+=("-c.publish.repo=${GITHUB_REPOSITORY#*/}")
           if [[ -z "${CSC_LINK:-}" ]]; then
-            echo "::warning::Apple signing credentials are not configured; building unsigned and skipping notarization."
+            echo "::warning::Apple Developer ID credentials are not configured; building without Developer ID signing and skipping notarization."
             unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
             export CSC_IDENTITY_AUTO_DISCOVERY=false
             build_args+=("-c.mac.notarize=false")
