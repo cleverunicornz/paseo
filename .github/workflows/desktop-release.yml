@@ -164,6 +164,14 @@ jobs:
           build_args=(-- --publish never --mac --${{ matrix.electron_arch }})
           build_args+=("-c.publish.releaseType=$RELEASE_TYPE")
           build_args+=("-c.publish.channel=$RELEASE_CHANNEL")
+          build_args+=("-c.publish.owner=$GITHUB_REPOSITORY_OWNER")
+          build_args+=("-c.publish.repo=${GITHUB_REPOSITORY#*/}")
+          if [[ -z "${CSC_LINK:-}" ]]; then
+            echo "::warning::Apple signing credentials are not configured; building unsigned and skipping notarization."
+            unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            build_args+=("-c.mac.notarize=false")
+          fi
           npm run build:desktop "${build_args[@]}"
 
       - name: Upload packaged smoke diagnostics
@@ -272,6 +280,8 @@ jobs:
           build_args=(-- --publish never --linux --x64)
           build_args+=("-c.publish.releaseType=$RELEASE_TYPE")
           build_args+=("-c.publish.channel=$RELEASE_CHANNEL")
+          build_args+=("-c.publish.owner=$GITHUB_REPOSITORY_OWNER")
+          build_args+=("-c.publish.repo=${GITHUB_REPOSITORY#*/}")
           npm run build:desktop "${build_args[@]}"
 
       - name: Upload packaged smoke diagnostics
@@ -377,6 +387,8 @@ jobs:
           build_args=(-- --publish never --win --x64 --arm64)
           build_args+=("-c.publish.releaseType=$RELEASE_TYPE")
           build_args+=("-c.publish.channel=$RELEASE_CHANNEL")
+          build_args+=("-c.publish.owner=$GITHUB_REPOSITORY_OWNER")
+          build_args+=("-c.publish.repo=${GITHUB_REPOSITORY#*/}")
           npm run build:desktop "${build_args[@]}"
 
       - name: Upload packaged smoke diagnostics
