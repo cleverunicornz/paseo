@@ -47,6 +47,7 @@ import type { OmpRuntime } from "./providers/omp/runtime.js";
 import { PiRpcAgentClient } from "./providers/pi/agent.js";
 import { TraeACPAgentClient } from "./providers/trae-acp-agent.js";
 import { MockLoadTestAgentClient } from "./providers/mock-load-test-agent.js";
+import { YeetCodeAgentClient } from "./providers/yeet-code-agent.js";
 import { MockSlowProviderClient } from "./providers/mock-slow-provider.js";
 import { ClaudeProviderOptionsSchema } from "./providers/claude/options.js";
 import { CodexProviderOptionsSchema } from "./providers/codex/options.js";
@@ -228,6 +229,12 @@ const PROVIDER_CLIENT_FACTORIES: Record<string, ProviderClientFactory> = {
     }),
   mock: (logger) => new MockLoadTestAgentClient(logger),
   "mock-slow": () => new MockSlowProviderClient(),
+  "yeet-code": (logger, runtimeSettings, options) =>
+    new YeetCodeAgentClient({
+      logger,
+      runtimeSettings,
+      providerParams: options?.providerParams,
+    }),
 };
 
 function getCursorACPCommand(
