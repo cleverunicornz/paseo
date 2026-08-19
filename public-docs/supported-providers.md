@@ -18,6 +18,7 @@ Work out of the box once the underlying CLI is installed and authenticated.
 - [Codex](/docs/codex). OpenAI's workspace agent with sandbox controls and optional network access.
 - [OpenCode](https://opencode.ai/). Open-source coding assistant with multi-provider model support.
 - [Pi](https://pi.dev). Minimal terminal-based coding agent with multi-provider LLM support.
+- **Yeet Code**. A first-class remote ACP v2 connection to a configured Yeet Code Gateway.
 
 ## ACP catalog
 
