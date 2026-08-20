@@ -1,0 +1,157 @@
+name: Daily Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'cleverunicornz/paseo'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FORK_REPOSITORY: cleverunicornz/paseo
+      UPSTREAM_REPOSITORY: getpaseo/paseo
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch fork and upstream main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags origin main
+          git fetch --no-tags upstream main
+
+      - name: Propose upstream sync
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_sha="$(git rev-parse upstream/main)"
+          origin_sha="$(git rev-parse origin/main)"
+          upstream_short="${upstream_sha:0:12}"
+          branch="automation/sync-upstream-${upstream_short}"
+
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            {
+              echo "## Upstream sync"
+              echo
+              echo "Fork main already contains \`${upstream_sha}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "state=current" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          existing_pr="$(gh pr list \
+            --repo "$FORK_REPOSITORY" \
+            --state open \
+            --head "$branch" \
+            --json url \
+            --jq '.[0].url')"
+          if [[ -n "$existing_pr" ]]; then
+            {
+              echo "## Upstream sync"
+              echo
+              echo "Existing proposal: $existing_pr"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "state=proposed" >> "$GITHUB_OUTPUT"
+            echo "pr_url=$existing_pr" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::error::Remote branch $branch exists without an open pull request; refusing to overwrite it."
+            exit 1
+          fi
+
+          merge_base="$(git merge-base origin/main upstream/main)"
+          upstream_commits="$(git log --format='- `%h` %s' "$merge_base..upstream/main")"
+          fork_commits="$(git log --left-only --format='- `%h` %s' origin/main...upstream/main)"
+          overlap="$(comm -12 \
+            <(git diff --name-only "$merge_base...origin/main" | LC_ALL=C sort) \
+            <(git diff --name-only "$merge_base...upstream/main" | LC_ALL=C sort) || true)"
+
+          git switch --create "$branch" origin/main
+          if ! git merge --no-ff --no-commit upstream/main; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            git merge --abort
+            {
+              echo "## Upstream sync blocked"
+              echo
+              echo "Upstream \`${upstream_sha}\` conflicts with fork main."
+              echo
+              echo "### Conflicting files"
+              echo '```text'
+              echo "${conflicts:-Unable to determine conflicting files}"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Upstream sync has merge conflicts."
+            exit 1
+          fi
+
+          git config user.name "paseo-upstream-sync[bot]"
+          git config user.email "paseo-upstream-sync[bot]@users.noreply.github.com"
+          git commit -m "chore: sync upstream/main (${upstream_short})"
+
+          pr_body="$RUNNER_TEMP/upstream-sync-pr.md"
+          {
+            echo "## Automated upstream synchronization"
+            echo
+            echo "This PR imports \`${UPSTREAM_REPOSITORY}@${upstream_sha}\` into this fork."
+            echo "It targets \`${FORK_REPOSITORY}:main\` only; it does not create or update a PR in \`${UPSTREAM_REPOSITORY}\`."
+            echo
+            echo "### Upstream commits"
+            echo "${upstream_commits:-None}"
+            echo
+            echo "### Fork-only commits retained"
+            echo "${fork_commits:-None}"
+            echo
+            echo "### Direct changed-path overlap"
+            echo '```text'
+            echo "${overlap:-None}"
+            echo '```'
+            echo
+            echo "A clean Git merge is not approval to merge. The 04:00 UTC review automation checks CI and the retained fork scope before merging."
+          } > "$pr_body"
+
+          git push origin "HEAD:refs/heads/${branch}"
+          pr_url="$(gh pr create \
+            --repo "$FORK_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "chore: sync upstream/main (${upstream_short})" \
+            --body-file "$pr_body")"
+          gh workflow run ci.yml --repo "$FORK_REPOSITORY" --ref "$branch"
+
+
+          {
+            echo "## Upstream sync proposed"
+            echo
+            echo "- Upstream: \`${upstream_sha}\`"
+            echo "- Fork base: \`${origin_sha}\`"
+            echo "- Pull request: $pr_url"
+            echo "- CI: dispatched for \`${branch}\`"
+            echo
+            echo "### Direct changed-path overlap"
+            echo '```text'
+            echo "${overlap:-None}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "state=proposed" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
