@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
       pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -135,6 +136,8 @@ jobs:
             --head "$branch" \
             --title "chore: sync upstream/main (${upstream_short})" \
             --body-file "$pr_body")"
+          gh workflow run ci.yml --repo "$FORK_REPOSITORY" --ref "$branch"
+
 
           {
             echo "## Upstream sync proposed"
@@ -142,6 +145,7 @@ jobs:
             echo "- Upstream: \`${upstream_sha}\`"
             echo "- Fork base: \`${origin_sha}\`"
             echo "- Pull request: $pr_url"
+            echo "- CI: dispatched for \`${branch}\`"
             echo
             echo "### Direct changed-path overlap"
             echo '```text'
