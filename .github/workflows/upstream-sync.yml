@@ -107,7 +107,7 @@ jobs:
             exit 1
           fi
 
-          git commit -m "chore: sync upstream/main (${upstream_short})"
+          git commit -m "chore: sync upstream/main (${upstream_short}) [skip ci]"
 
           pr_body="$RUNNER_TEMP/upstream-sync-pr.md"
           {
@@ -135,10 +135,9 @@ jobs:
             --repo "$FORK_REPOSITORY" \
             --base main \
             --head "$branch" \
-            --title "chore: sync upstream/main (${upstream_short})" \
+            --title "chore: sync upstream/main (${upstream_short}) [skip ci]" \
             --body-file "$pr_body")"
           gh workflow run ci.yml --repo "$FORK_REPOSITORY" --ref "$branch"
-
 
           {
             echo "## Upstream sync proposed"

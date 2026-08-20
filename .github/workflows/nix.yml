@@ -28,6 +28,7 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'getpaseo/paseo'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
