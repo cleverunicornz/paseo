@@ -28,8 +28,8 @@ permissions:
 
 jobs:
   build:
-    if: github.repository == 'getpaseo/paseo'
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.repository == 'getpaseo/paseo') }}
+    runs-on: org-ci-linux-x64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,8 +108,8 @@ jobs:
         run: nix build .#desktop -o result-desktop
 
   build-desktop-darwin:
-    if: github.repository == 'getpaseo/paseo'
-    runs-on: macos-14
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.repository == 'getpaseo/paseo') }}
+    runs-on: warp-macos-14-arm64-6x
     steps:
       - uses: actions/checkout@v4
         with:

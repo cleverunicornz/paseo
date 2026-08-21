@@ -19,8 +19,9 @@ env:
 
 jobs:
   changes:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     name: changes
-    runs-on: ubuntu-latest
+    runs-on: org-ci-linux-x64
     permissions:
       contents: read
       pull-requests: read
@@ -57,8 +58,8 @@ jobs:
   format:
     name: format
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.format != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.format != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
@@ -78,8 +79,8 @@ jobs:
   lint:
     name: lint
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
@@ -105,8 +106,8 @@ jobs:
   typecheck:
     name: typecheck
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
@@ -133,10 +134,10 @@ jobs:
           npm pack --dry-run --ignore-scripts --workspace=@getpaseo/server
 
   server-tests-ubuntu:
-    name: server-tests (ubuntu-latest)
+    name: server-tests (CVU Linux)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps: &server_test_steps
@@ -176,19 +177,19 @@ jobs:
         run: npm run test:hub-cli-contract --workspace=@getpaseo/server
 
   server-tests-windows:
-    name: server-tests (windows-latest)
+    name: server-tests (WarpBuild Windows)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false') }}
-    runs-on: windows-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' || needs.changes.outputs.hub != 'false')) }}
+    runs-on: warp-windows-latest-x64-4x
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps: *server_test_steps
 
   desktop-tests-ubuntu:
-    name: desktop-tests (ubuntu-latest)
+    name: desktop-tests (CVU Linux)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false')) }}
+    runs-on: org-ci-linux-x64
     timeout-minutes: 30
     permissions:
       contents: read
@@ -254,10 +255,10 @@ jobs:
           retention-days: 7
 
   desktop-tests-windows:
-    name: desktop-tests (windows-latest)
+    name: desktop-tests (WarpBuild Windows)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false') }}
-    runs-on: windows-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false')) }}
+    runs-on: warp-windows-latest-x64-4x
     timeout-minutes: 30
     permissions:
       contents: read
@@ -266,8 +267,8 @@ jobs:
   app-tests:
     name: app-tests
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.app != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.app != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
@@ -294,8 +295,8 @@ jobs:
   sdk-tests:
     name: sdk-tests
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
@@ -327,8 +328,8 @@ jobs:
   playwright-1:
     name: playwright (shard 1/4)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_SHARD: "1/4"
@@ -375,8 +376,8 @@ jobs:
   playwright-2:
     name: playwright (shard 2/4)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_SHARD: "2/4"
@@ -386,8 +387,8 @@ jobs:
   playwright-3:
     name: playwright (shard 3/4)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_SHARD: "3/4"
@@ -397,8 +398,8 @@ jobs:
   playwright-4:
     name: playwright (shard 4/4)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_SHARD: "4/4"
@@ -408,8 +409,8 @@ jobs:
   relay-tests:
     name: relay-tests
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.relay != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.relay != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
@@ -432,8 +433,8 @@ jobs:
   cli-tests-1:
     name: cli-tests (shard 1/3)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PASEO_LOCAL_SPEECH_AUTO_DOWNLOAD: "0"
@@ -464,8 +465,8 @@ jobs:
   cli-tests-2:
     name: cli-tests (shard 2/3)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PASEO_LOCAL_SPEECH_AUTO_DOWNLOAD: "0"
@@ -478,8 +479,8 @@ jobs:
   cli-tests-3:
     name: cli-tests (shard 3/3)
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.cli != 'false')) }}
+    runs-on: org-ci-linux-x64
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PASEO_LOCAL_SPEECH_AUTO_DOWNLOAD: "0"
