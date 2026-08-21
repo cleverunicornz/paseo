@@ -182,3 +182,10 @@ The app runs on iOS, Android, web (browser), and web (Electron desktop). Code is
 ## Debugging
 
 Find the complete daemon logs and traces in the $PASEO_HOME/daemon.log
+
+## CI runner policy
+
+- Linux and platform-neutral workflow jobs use `org-ci-linux-x64`.
+- Native macOS build/test jobs use `warp-macos-15-arm64-6x`.
+- Native Windows build/test jobs use `warp-windows-latest-x64-4x`.
+- Do not use GitHub-hosted runners, generic `self-hosted`, or WarpBuild Linux.
