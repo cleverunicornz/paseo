@@ -210,10 +210,6 @@ jobs:
       - name: Run desktop tests
         run: npm run test --workspace=@getpaseo/desktop
 
-      - name: Install virtual display
-        if: ${{ runner.os == 'Linux' }}
-        run: sudo apt-get update && sudo apt-get install -y xvfb xauth
-
       - name: Install Playwright browser
         if: ${{ runner.os == 'Linux' }}
         run: npx playwright install chromium
