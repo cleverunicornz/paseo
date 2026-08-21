@@ -190,6 +190,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false')) }}
     runs-on: org-ci-linux-x64
+    container: mcr.microsoft.com/playwright:v1.58.2-noble
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
     timeout-minutes: 30
     permissions:
       contents: read
@@ -209,10 +212,6 @@ jobs:
 
       - name: Run desktop tests
         run: npm run test --workspace=@getpaseo/desktop
-
-      - name: Install Playwright browser
-        if: ${{ runner.os == 'Linux' }}
-        run: npx playwright install chromium
 
       - name: Run desktop renderer E2E
         if: ${{ runner.os == 'Linux' }}
@@ -265,8 +264,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.app != 'false')) }}
     runs-on: org-ci-linux-x64
+    container: mcr.microsoft.com/playwright:v1.58.2-noble
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
     steps:
       - uses: actions/checkout@v4
 
@@ -277,10 +278,6 @@ jobs:
 
       - name: Install dependencies with retry
         run: node scripts/npm-retry.mjs ci
-
-      - name: Install Playwright browsers
-        timeout-minutes: 10
-        run: npx playwright install chromium
 
       - name: Build app dependencies
         run: npm run build:app-deps
@@ -326,8 +323,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
+    container: mcr.microsoft.com/playwright:v1.58.2-noble
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "1/4"
       PLAYWRIGHT_ARTIFACT: "1"
     steps: &playwright_test_steps
@@ -340,10 +339,6 @@ jobs:
 
       - name: Install dependencies with retry
         run: node scripts/npm-retry.mjs ci
-
-      - name: Install Playwright browsers
-        timeout-minutes: 10
-        run: npx playwright install chromium
 
       - name: Build app dependencies
         run: npm run build:app-deps
@@ -374,8 +369,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
+    container: mcr.microsoft.com/playwright:v1.58.2-noble
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "2/4"
       PLAYWRIGHT_ARTIFACT: "2"
     steps: *playwright_test_steps
@@ -385,8 +382,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
+    container: mcr.microsoft.com/playwright:v1.58.2-noble
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "3/4"
       PLAYWRIGHT_ARTIFACT: "3"
     steps: *playwright_test_steps
@@ -396,8 +395,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
+    container: mcr.microsoft.com/playwright:v1.58.2-noble
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "4/4"
       PLAYWRIGHT_ARTIFACT: "4"
     steps: *playwright_test_steps
