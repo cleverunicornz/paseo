@@ -253,7 +253,7 @@ jobs:
           retention-days: 7
 
       - name: Restore runner workspace ownership
-        if: ${{ always() && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         shell: bash
         run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
 
@@ -297,7 +297,7 @@ jobs:
         run: npm run test --workspace=@getpaseo/app
 
       - name: Restore runner workspace ownership
-        if: ${{ always() && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         shell: bash
         run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
 
@@ -384,7 +384,7 @@ jobs:
           retention-days: 7
 
       - name: Restore runner workspace ownership
-        if: ${{ always() && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         shell: bash
         run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
 
