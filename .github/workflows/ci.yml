@@ -252,6 +252,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Restore runner workspace ownership
+        if: ${{ always() && runner.os == 'Linux' }}
+        shell: bash
+        run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
+
   desktop-tests-windows:
     name: desktop-tests (WarpBuild Windows)
     needs: changes
@@ -290,6 +295,11 @@ jobs:
 
       - name: Run app unit tests
         run: npm run test --workspace=@getpaseo/app
+
+      - name: Restore runner workspace ownership
+        if: ${{ always() && runner.os == 'Linux' }}
+        shell: bash
+        run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
 
   sdk-tests:
     name: sdk-tests
@@ -372,6 +382,11 @@ jobs:
             packages/app/test-results/
             packages/app/playwright-report/
           retention-days: 7
+
+      - name: Restore runner workspace ownership
+        if: ${{ always() && runner.os == 'Linux' }}
+        shell: bash
+        run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
 
   playwright-2:
     name: playwright (shard 2/4)
