@@ -160,7 +160,7 @@ jobs:
       - name: Install agent CLIs for provider tests
         if: ${{ needs.changes.outputs.full != 'false' || needs.changes.outputs.server != 'false' }}
         env:
-          NPM_CONFIG_PREFIX: ${{ runner.temp }}/npm-global
+          NPM_CONFIG_PREFIX: ${{ github.workspace }}/.ci/npm-global-${{ github.job }}
         run: |
           node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code opencode-ai
           node -e "const fs=require('fs'),path=require('path'),cp=require('child_process'); const prefix=cp.execFileSync('npm',['prefix','-g'],{encoding:'utf8'}).trim(); fs.appendFileSync(process.env.GITHUB_PATH, prefix + '\n' + path.join(prefix,'bin') + '\n')"
@@ -371,7 +371,7 @@ jobs:
 
       - name: Install agent CLIs for provider tests
         env:
-          NPM_CONFIG_PREFIX: ${{ runner.temp }}/npm-global
+          NPM_CONFIG_PREFIX: ${{ github.workspace }}/.ci/npm-global-${{ github.job }}
         run: |
           node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code @openai/codex@0.105.0 opencode-ai
           node -e "const fs=require('fs'),path=require('path'),cp=require('child_process'); const prefix=cp.execFileSync('npm',['prefix','-g'],{encoding:'utf8'}).trim(); fs.appendFileSync(process.env.GITHUB_PATH, prefix + '\n' + path.join(prefix,'bin') + '\n')"
@@ -496,7 +496,7 @@ jobs:
 
       - name: Install agent CLIs for provider tests
         env:
-          NPM_CONFIG_PREFIX: ${{ runner.temp }}/npm-global
+          NPM_CONFIG_PREFIX: ${{ github.workspace }}/.ci/npm-global-${{ github.job }}
         run: |
           node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code @openai/codex@0.105.0 opencode-ai
           node -e "const fs=require('fs'),path=require('path'),cp=require('child_process'); const prefix=cp.execFileSync('npm',['prefix','-g'],{encoding:'utf8'}).trim(); fs.appendFileSync(process.env.GITHUB_PATH, prefix + '\n' + path.join(prefix,'bin') + '\n')"
