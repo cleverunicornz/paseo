@@ -1,4 +1,4 @@
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { expect, type Page } from "@playwright/test";
@@ -268,14 +268,18 @@ export function commitPaseoConfig(repoPath: string): void {
   execFileSync("git", ["commit", "-m", "Update project config"], { cwd: repoPath });
 }
 
-// The daemon writes atomically via a temp file + rename, so blocking writes requires
-// removing write permission from the *directory*, not just the file.
+// Replace paseo.json with a directory so the daemon's atomic temp-file rename
+// fails even when the browser container runs as root.
 export async function blockPaseoConfigWrites(repoPath: string): Promise<void> {
-  await chmod(repoPath, 0o555);
+  const configPath = path.join(repoPath, "paseo.json");
+  await rename(configPath, `${configPath}.blocked`);
+  await mkdir(configPath);
 }
 
 export async function unblockPaseoConfigWrites(repoPath: string): Promise<void> {
-  await chmod(repoPath, 0o755);
+  const configPath = path.join(repoPath, "paseo.json");
+  await rm(configPath, { recursive: true });
+  await rename(`${configPath}.blocked`, configPath);
 }
 
 // --- WebSocket helpers ---
