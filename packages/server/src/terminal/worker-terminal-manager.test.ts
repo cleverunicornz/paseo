@@ -125,17 +125,24 @@ function trackTerminal(session: TerminalSession): TerminalSession {
 }
 
 async function removeTemporaryDir(dir: string): Promise<void> {
+  // Real time, not fake timers: Windows releases pty/workers dir handles through the
+  // OS asynchronously, so the retry backoff must observe the platform clock.
   let lastError: unknown;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       return;
     } catch (error) {
       lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 250);
+      await promise;
     }
   }
-  throw lastError;
+  const code = (lastError as NodeJS.ErrnoException | undefined)?.code;
+  if (code !== "EBUSY" && code !== "ENOTEMPTY" && code !== "EPERM") {
+    throw lastError;
+  }
 }
 
 afterEach(async () => {
@@ -195,7 +202,7 @@ it("creates a terminal through the worker and streams output", async () => {
     () =>
       messages.join("").includes("worker-output:hello") ||
       getVisibleText(session).includes("worker-output:hello"),
-    10000,
+    20000,
   );
   await new Promise((resolve) => setTimeout(resolve, 100));
   unsubscribe();

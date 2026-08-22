@@ -77,7 +77,16 @@ afterEach(async () => {
   while (temporaryDirs.length > 0) {
     const dir = temporaryDirs.pop();
     if (dir) {
-      rmSync(dir, { recursive: true, force: true });
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
+      } catch (error) {
+        // Windows can keep pty dir handles briefly after killAndWait; a leaked temp
+        // dir must not fail the suite once the terminals themselves are gone.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EBUSY" && code !== "ENOTEMPTY" && code !== "EPERM") {
+          throw error;
+        }
+      }
     }
   }
 });
