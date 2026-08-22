@@ -1,0 +1,111 @@
+name: Fork Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Exact branch or SHA to verify."
+        required: true
+        type: string
+      task:
+        description: "Focused fork-maintenance evidence to run."
+        required: true
+        default: fork-contract
+        type: choice
+        options:
+          - fork-contract
+          - provider-tests
+          - typecheck
+          - server-build
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-maintenance-${{ inputs.ref }}-${{ inputs.task }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: org-ci-linux-x64
+    timeout-minutes: 30
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      ONNXRUNTIME_NODE_INSTALL: skip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: node scripts/npm-retry.mjs ci
+
+      - name: Build server stack
+        run: npm run build:server
+
+      - name: Typecheck fork packages
+        if: inputs.task == 'fork-contract' || inputs.task == 'typecheck'
+        run: |
+          npm run typecheck --workspace=@getpaseo/protocol
+          npm run typecheck --workspace=@getpaseo/server
+          npm run typecheck --workspace=@getpaseo/app
+
+      - name: Run protocol provider tests
+        if: inputs.task == 'fork-contract' || inputs.task == 'provider-tests'
+        run: >-
+          npm run test --workspace=@getpaseo/protocol --
+          src/paseo-config-schema.test.ts
+          src/provider-snapshot-codec.test.ts
+          src/messages.providers-snapshot.test.ts
+
+      - name: Run server provider tests
+        if: inputs.task == 'fork-contract' || inputs.task == 'provider-tests'
+        run: >-
+          npm run test:unit --workspace=@getpaseo/server --
+          src/server/agent/mutable-provider-config-owner.test.ts
+          src/server/agent/provider-launch-config.test.ts
+          src/server/agent/provider-registry.test.ts
+          src/server/agent/provider-snapshot-manager.test.ts
+          src/server/agent/providers/remote-acp-v2-agent.test.ts
+          src/server/agent/providers/yeet-code-agent.test.ts
+          src/server/persisted-config.test.ts
+
+      - name: Lint fork implementation
+        if: inputs.task == 'fork-contract'
+        run: >-
+          npm run lint --
+          packages/app/src/components/provider-icons.ts
+          packages/protocol/src/provider-config.ts
+          packages/protocol/src/provider-icon-names.ts
+          packages/protocol/src/provider-manifest.ts
+          packages/server/src/server/agent/provider-registry.ts
+          packages/server/src/server/agent/providers/remote-acp-v2-agent.ts
+          packages/server/src/server/agent/providers/yeet-code-agent.ts
+          packages/server/src/server/persisted-config.ts
+
+      - name: Check fork formatting
+        if: inputs.task == 'fork-contract'
+        run: >-
+          npm run format:check:files --
+          .agents/skills/fork-maintainer/SKILL.md
+          .github/workflows/fork-maintenance.yml
+          docs/providers.md
+          public-docs/supported-providers.md
+          packages/app/src/components/provider-icons.ts
+          packages/protocol/src/provider-config.ts
+          packages/protocol/src/provider-icon-names.ts
+          packages/protocol/src/provider-manifest.ts
+          packages/server/src/server/agent/provider-registry.ts
+          packages/server/src/server/agent/provider-snapshot-manager.test.ts
+          packages/server/src/server/agent/providers/remote-acp-v2-agent.test.ts
+          packages/server/src/server/agent/providers/remote-acp-v2-agent.ts
+          packages/server/src/server/agent/providers/yeet-code-agent.test.ts
+          packages/server/src/server/agent/providers/yeet-code-agent.ts
+          packages/server/src/server/persisted-config.ts

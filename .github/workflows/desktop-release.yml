@@ -1,13 +1,6 @@
 name: Desktop Release
 
 on:
-  push:
-    tags:
-      - "v*"
-      - "desktop-v*"
-      - "desktop-macos-v*"
-      - "desktop-linux-v*"
-      - "desktop-windows-v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -44,22 +37,23 @@ on:
         type: string
 
 concurrency:
-  group: desktop-release-${{ github.ref }}
+  group: desktop-release-${{ inputs.tag }}-${{ inputs.platform }}
   cancel-in-progress: false
 
 env:
-  SOURCE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-  CHECKOUT_REF: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.checkout_ref || github.ref_name) || github.ref_name }}
-  SHOULD_PUBLISH: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish != 'false' }}
-  ROLLOUT_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.rollout_hours || '36' }}
+  SOURCE_TAG: ${{ inputs.tag }}
+  CHECKOUT_REF: ${{ inputs.checkout_ref || inputs.tag }}
+  SHOULD_PUBLISH: ${{ inputs.publish != 'false' }}
+  ROLLOUT_HOURS: ${{ inputs.rollout_hours }}
   DESKTOP_PACKAGE_PATH: "packages/desktop"
 
 jobs:
   create-release:
-    if: ${{ (github.event_name == 'push' && !startsWith(github.ref_name, 'desktop-macos-v') && !startsWith(github.ref_name, 'desktop-linux-v') && !startsWith(github.ref_name, 'desktop-windows-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.platform == 'all' && github.event.inputs.publish != 'false') }}
+    if: ${{ inputs.platform == 'all' && inputs.publish != 'false' }}
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: org-ci-linux-x64
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,19 +88,20 @@ jobs:
 
   publish-macos:
     needs: [create-release]
-    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'macos')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'desktop-v') || startsWith(github.ref_name, 'desktop-macos-v')))) }}
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && (inputs.platform == 'all' || inputs.platform == 'macos') }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: warp-macos-15-arm64-6x
             electron_arch: arm64
-          - runner: macos-15-intel
+          - runner: warp-macos-15-arm64-6x
             electron_arch: x64
     permissions:
       contents: write
       packages: read
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -220,11 +215,12 @@ jobs:
 
   publish-linux:
     needs: [create-release]
-    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'linux')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'desktop-v') || startsWith(github.ref_name, 'desktop-linux-v')))) }}
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && (inputs.platform == 'all' || inputs.platform == 'linux') }}
     permissions:
       contents: write
       packages: read
-    runs-on: ubuntu-22.04
+    runs-on: org-ci-linux-x64
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -265,9 +261,6 @@ jobs:
           packageJson.version = version;
           fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
           NODE
-
-      - name: Install Linux smoke display
-        run: sudo apt-get update && sudo apt-get install -y xvfb xauth
 
       - name: Build desktop release
         shell: bash
@@ -330,11 +323,12 @@ jobs:
 
   publish-windows:
     needs: [create-release]
-    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'windows')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'desktop-v') || startsWith(github.ref_name, 'desktop-windows-v')))) }}
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && (inputs.platform == 'all' || inputs.platform == 'windows') }}
     permissions:
       contents: write
       packages: read
-    runs-on: windows-latest
+    runs-on: warp-windows-latest-x64-4x
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -437,12 +431,13 @@ jobs:
 
   finalize-rollout:
     needs: [publish-macos, publish-linux, publish-windows]
-    if: ${{ always() && (needs.publish-macos.result == 'success' || needs.publish-macos.result == 'skipped') && (needs.publish-linux.result == 'success' || needs.publish-linux.result == 'skipped') && (needs.publish-windows.result == 'success' || needs.publish-windows.result == 'skipped') && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish != 'false') }}
+    if: ${{ always() && (needs.publish-macos.result == 'success' || needs.publish-macos.result == 'skipped') && (needs.publish-linux.result == 'success' || needs.publish-linux.result == 'skipped') && (needs.publish-windows.result == 'success' || needs.publish-windows.result == 'skipped') && inputs.publish != 'false' }}
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: org-ci-linux-x64
+    timeout-minutes: 15
     concurrency:
-      group: desktop-rollout-${{ github.event.inputs.tag || github.ref_name }}
+      group: desktop-rollout-${{ inputs.tag }}
       cancel-in-progress: false
 
     steps:
