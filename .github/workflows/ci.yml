@@ -194,7 +194,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false')) }}
     runs-on: org-ci-linux-x64
-    container: mcr.microsoft.com/playwright:v1.58.2-noble
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.2-noble
+      options: --user 0
     env:
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       GIT_CONFIG_COUNT: "1"
@@ -276,7 +278,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.app != 'false')) }}
     runs-on: org-ci-linux-x64
-    container: mcr.microsoft.com/playwright:v1.58.2-noble
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.2-noble
+      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
@@ -343,7 +347,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container: mcr.microsoft.com/playwright:v1.58.2-noble
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.2-noble
+      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
@@ -401,7 +407,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container: mcr.microsoft.com/playwright:v1.58.2-noble
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.2-noble
+      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
@@ -417,7 +425,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container: mcr.microsoft.com/playwright:v1.58.2-noble
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.2-noble
+      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
@@ -433,7 +443,9 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container: mcr.microsoft.com/playwright:v1.58.2-noble
+    container:
+      image: mcr.microsoft.com/playwright:v1.58.2-noble
+      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
