@@ -109,7 +109,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@playwright/test": "1.62.0",
+    "@playwright/test": "^1.56.1",
     "@types/express": "^4.17.20",
     "@types/node": "^20.9.0",
     "@types/qrcode": "^1.5.6",
