@@ -1,9 +1,8 @@
-import { chmod, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, test as base, type Page } from "../support/fixtures";
 import { connectSeedClient, seedWorkspace } from "../support/helpers/seed-client";
 import {
-  blockPaseoConfigWrites,
   bumpPaseoConfigOnDisk,
   chooseProjectIconImage,
   clickReloadProjectSettings,
@@ -34,6 +33,7 @@ import {
   fillProjectName,
   installDaemonConnectionGate,
   installReadTransportFailure,
+  installWriteTransportFailure,
   navigateToProjectSettings,
   openProjectEditSheet,
   openProjectSettings,
@@ -42,7 +42,6 @@ import {
   restorePaseoConfig,
   returnToProjectsList,
   saveProjectEdits,
-  unblockPaseoConfigWrites,
 } from "../support/helpers/project-settings";
 import { gotoAppShell } from "../support/helpers/app";
 import { openCompactSettings } from "../support/helpers/settings";
@@ -106,9 +105,6 @@ const test = base.extend<ProjectsSettingsFixtures>({
       path: workspace.repoPath,
     });
 
-    // Defensive: restore directory write permission in case the test left it blocked
-    // (write_failed test), so that cleanup can remove files inside.
-    await chmod(workspace.repoPath, 0o755).catch(() => undefined);
     await workspace.cleanup();
   },
   gitlabRemoteProject: async ({ page: _page }, provide) => {
@@ -398,14 +394,14 @@ test.describe("Projects settings — error UX", () => {
     await expectProjectSettingsFormVisible(page);
   });
 
-  test("write_failed callout appears on save with blocked directory, retry re-attempts, reload clears it", async ({
+  test("write_failed callout appears on rejected save, retry re-attempts, reload clears it", async ({
     page,
     editableProject,
   }) => {
+    const writeFailure = await installWriteTransportFailure(page);
+
     await openProjects(page);
     await openProjectSettings(page, editableProject.name);
-
-    await blockPaseoConfigWrites(editableProject.path);
 
     await clickSaveProjectSettings(page);
 
@@ -415,7 +411,7 @@ test.describe("Projects settings — error UX", () => {
     await clickRetryProjectSettingsSave(page);
     await expectProjectSettingsError(page, "write_failed");
 
-    await unblockPaseoConfigWrites(editableProject.path);
+    writeFailure.allowRecovery();
     await clickReloadProjectSettings(page);
     await expectNoProjectSettingsError(page, "write_failed");
     await expectProjectSettingsFormVisible(page);

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { expect, type Page } from "@playwright/test";
@@ -268,21 +268,63 @@ export function commitPaseoConfig(repoPath: string): void {
   execFileSync("git", ["commit", "-m", "Update project config"], { cwd: repoPath });
 }
 
-// Replace paseo.json with a directory so the daemon's atomic temp-file rename
-// fails even when the browser container runs as root.
-export async function blockPaseoConfigWrites(repoPath: string): Promise<void> {
-  const configPath = path.join(repoPath, "paseo.json");
-  await rename(configPath, `${configPath}.blocked`);
-  await mkdir(configPath);
-}
-
-export async function unblockPaseoConfigWrites(repoPath: string): Promise<void> {
-  const configPath = path.join(repoPath, "paseo.json");
-  await rm(configPath, { recursive: true });
-  await rename(`${configPath}.blocked`, configPath);
-}
-
 // --- WebSocket helpers ---
+
+// Proxies daemon traffic but turns project-config writes into the same
+// write_failed domain response emitted by a filesystem write exception.
+export async function installWriteTransportFailure(
+  page: Page,
+): Promise<{ allowRecovery: () => void }> {
+  let shouldFailWrites = true;
+
+  await page.routeWebSocket(daemonWsRoutePattern(), (ws) => {
+    const server = ws.connectToServer();
+
+    ws.onMessage((message) => {
+      const sessionMessage = getSessionMessage(message);
+      if (shouldFailWrites && sessionMessage?.type === "write_project_config_request") {
+        const requestId = sessionMessage.requestId;
+        const repoRoot = sessionMessage.repoRoot;
+        if (typeof requestId === "string" && typeof repoRoot === "string") {
+          ws.send(
+            JSON.stringify({
+              type: "session",
+              message: {
+                type: "write_project_config_response",
+                payload: {
+                  requestId,
+                  repoRoot,
+                  ok: false,
+                  error: { code: "write_failed" },
+                },
+              },
+            }),
+          );
+        }
+        return;
+      }
+      try {
+        server.send(message);
+      } catch {
+        // server socket already closed
+      }
+    });
+
+    server.onMessage((message) => {
+      try {
+        ws.send(message);
+      } catch {
+        // client socket already closed
+      }
+    });
+  });
+
+  return {
+    allowRecovery() {
+      shouldFailWrites = false;
+    },
+  };
+}
 
 // Proxies all daemon WS traffic transparently, but rejects paseo.json reads
 // until the test explicitly allows recovery. Closing the transport leaves the
