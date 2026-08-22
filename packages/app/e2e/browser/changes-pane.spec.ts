@@ -1124,7 +1124,12 @@ test("horizontally scrolled selection copies exactly and does not paint the gutt
   await useUnwrappedDiffLines(page);
   await openSelectionWorkspaceChanges(page, workspace);
   const horizontalOffset = await horizontallyScrollFirstFile(page, 320);
-  const before = await readSelectionPaintSamples(page);
+  const probe = await selectionCodeProbe(page, {
+    startOffset: 48,
+    endOffset: 58,
+    horizontalOffset,
+  });
+  const before = await readSelectionPaintSamples(page, "unified", probe);
   await dragAddedTextRange(page, {
     lines: [content],
     horizontalOffset,
@@ -1135,7 +1140,7 @@ test("horizontally scrolled selection copies exactly and does not paint the gutt
   await expect
     .poll(() => page.evaluate(() => navigator.clipboard.readText()))
     .toBe(content.slice(48, 58));
-  const after = await readSelectionPaintSamples(page);
+  const after = await readSelectionPaintSamples(page, "unified", probe);
   expect(after.gutter).toEqual(before.gutter);
   expect(after.code).not.toEqual(before.code);
 });
@@ -1603,31 +1608,64 @@ async function dragAddedTextRange(
 async function readSelectionPaintSamples(
   page: Page,
   side: "unified" | "right" = "unified",
+  codeProbe?: { leftOffset: number; width: number },
 ): Promise<{ gutter: number[]; code: number[]; opposite: number[] }> {
-  return page.getByTestId("diff-file-0-body").evaluate((body, selectedSide) => {
-    const canvas = document.querySelector<HTMLCanvasElement>('[data-testid="git-diff-canvas"]')!;
-    const bodyBounds = body.getBoundingClientRect();
-    const canvasBounds = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / canvasBounds.width;
-    const scaleY = canvas.height / canvasBounds.height;
-    const context = canvas.getContext("2d")!;
-    const sample = (left: number, top: number, width: number, height: number) =>
-      Array.from(
-        context.getImageData(
-          Math.round((left - canvasBounds.left) * scaleX),
-          Math.round((top - canvasBounds.top) * scaleY),
-          Math.max(1, Math.round(width * scaleX)),
-          Math.max(1, Math.round(height * scaleY)),
-        ).data,
-      );
-    const columnLeft =
-      selectedSide === "right" ? bodyBounds.left + bodyBounds.width / 2 : bodyBounds.left;
-    return {
-      gutter: sample(columnLeft + 2, bodyBounds.top + 24, 8, 8),
-      code: sample(columnLeft + 80, bodyBounds.top + 24, 80, 10),
-      opposite: sample(bodyBounds.left + 80, bodyBounds.top + 24, 80, 10),
-    };
-  }, side);
+  return page.getByTestId("diff-file-0-body").evaluate(
+    (body, { selectedSide, probe }) => {
+      const canvas = document.querySelector<HTMLCanvasElement>('[data-testid="git-diff-canvas"]')!;
+      const bodyBounds = body.getBoundingClientRect();
+      const canvasBounds = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / canvasBounds.width;
+      const scaleY = canvas.height / canvasBounds.height;
+      const context = canvas.getContext("2d")!;
+      const sample = (left: number, top: number, width: number, height: number) =>
+        Array.from(
+          context.getImageData(
+            Math.round((left - canvasBounds.left) * scaleX),
+            Math.round((top - canvasBounds.top) * scaleY),
+            Math.max(1, Math.round(width * scaleX)),
+            Math.max(1, Math.round(height * scaleY)),
+          ).data,
+        );
+      const columnLeft =
+        selectedSide === "right" ? bodyBounds.left + bodyBounds.width / 2 : bodyBounds.left;
+      return {
+        gutter: sample(columnLeft + 2, bodyBounds.top + 24, 8, 8),
+        code: sample(
+          columnLeft + (probe?.leftOffset ?? 80),
+          bodyBounds.top + 24,
+          probe?.width ?? 80,
+          10,
+        ),
+        opposite: sample(bodyBounds.left + 80, bodyBounds.top + 24, 80, 10),
+      };
+    },
+    { selectedSide: side, probe: codeProbe },
+  );
+}
+
+// The code probe must be derived from the same measured font metrics the drag uses.
+// A fixed pixel offset only intersects a horizontally scrolled selection for one
+// environment's fonts; runner images with a different monospace fallback move the
+// selection out of the hardcoded window without changing what the app painted.
+async function selectionCodeProbe(
+  page: Page,
+  input: { startOffset: number; endOffset: number; horizontalOffset?: number },
+): Promise<{ leftOffset: number; width: number }> {
+  const metrics = await page.getByTestId("git-diff-canvas").evaluate((element) => {
+    const style = getComputedStyle(element);
+    const fontSize = Number.parseFloat(style.fontSize);
+    const context = document.createElement("canvas").getContext("2d")!;
+    context.font = `${fontSize}px ${style.fontFamily}`;
+    return { fontSize, characterWidth: context.measureText("A").width };
+  });
+  const gutterWidth = 2 * Math.ceil(metrics.fontSize * 0.62) + 12;
+  const selectionLeft =
+    gutterWidth + 8 + input.startOffset * metrics.characterWidth - (input.horizontalOffset ?? 0);
+  return {
+    leftOffset: Math.max(gutterWidth + 8, selectionLeft),
+    width: Math.max(1, (input.endOffset - input.startOffset) * metrics.characterWidth),
+  };
 }
 
 async function dragWithinFirstAddedGrapheme(page: Page): Promise<void> {
