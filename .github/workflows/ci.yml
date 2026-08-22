@@ -241,6 +241,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Provide sudo compatibility inside the browser container
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: printf '%s\n' '#!/bin/sh' 'exec "$@"' > /usr/local/bin/sudo && chmod 0755 /usr/local/bin/sudo
+
       - name: Build and smoke unpacked desktop app
         if: ${{ runner.os == 'Linux' }}
         run: npm run build:desktop -- --publish never --linux --x64 --dir
