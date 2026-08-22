@@ -202,14 +202,6 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.desktop != 'false')) }}
     runs-on: org-ci-linux-x64
-    container:
-      image: mcr.microsoft.com/playwright:v1.58.2-noble
-      options: --user 0
-    env:
-      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: "*"
     timeout-minutes: 30
     permissions:
       contents: read
@@ -230,6 +222,10 @@ jobs:
       - name: Run desktop tests
         run: npm run test --workspace=@getpaseo/desktop
 
+      - name: Install Playwright browser
+        if: ${{ runner.os == 'Linux' }}
+        run: npx playwright install chromium
+
       - name: Run desktop renderer E2E
         if: ${{ runner.os == 'Linux' }}
         run: npm run test:e2e:renderer --workspace=@getpaseo/desktop
@@ -249,16 +245,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Provide sudo compatibility inside the browser container
-        if: ${{ runner.os == 'Linux' }}
-        shell: bash
-        run: printf '%s\n' '#!/bin/sh' '[ "$1" != "-n" ] || shift' 'exec "$@"' > /usr/local/bin/sudo && chmod 0755 /usr/local/bin/sudo
-
       - name: Build and smoke unpacked desktop app
         if: ${{ runner.os == 'Linux' }}
         run: npm run build:desktop -- --publish never --linux --x64 --dir
         env:
-          ELECTRON_DISABLE_SANDBOX: "1"
           EP_GH_IGNORE_TIME: true
           PASEO_DESKTOP_SMOKE: "1"
           PASEO_DESKTOP_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/desktop-smoke
@@ -271,11 +261,6 @@ jobs:
           path: ${{ runner.temp }}/desktop-smoke
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Restore runner workspace ownership
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        shell: bash
-        run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
 
   desktop-tests-windows:
     name: desktop-tests (WarpBuild Windows)
@@ -292,15 +277,8 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.app != 'false')) }}
     runs-on: org-ci-linux-x64
-    container:
-      image: mcr.microsoft.com/playwright:v1.58.2-noble
-      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: "*"
     steps:
       - uses: actions/checkout@v4
 
@@ -312,16 +290,14 @@ jobs:
       - name: Install dependencies with retry
         run: node scripts/npm-retry.mjs ci
 
+      - name: Install Playwright browser
+        run: npx playwright install chromium
+
       - name: Build app dependencies
         run: npm run build:app-deps
 
       - name: Run app unit tests
         run: npm run test --workspace=@getpaseo/app
-
-      - name: Restore runner workspace ownership
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        shell: bash
-        run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
 
   sdk-tests:
     name: sdk-tests
@@ -361,17 +337,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container:
-      image: mcr.microsoft.com/playwright:v1.58.2-noble
-      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "1/4"
       PLAYWRIGHT_ARTIFACT: "1"
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: "*"
     steps: &playwright_test_steps
       - uses: actions/checkout@v4
 
@@ -382,6 +351,9 @@ jobs:
 
       - name: Install dependencies with retry
         run: node scripts/npm-retry.mjs ci
+
+      - name: Install Playwright browser
+        run: npx playwright install chromium
 
       - name: Build app dependencies
         run: npm run build:app-deps
@@ -411,27 +383,15 @@ jobs:
             packages/app/playwright-report/
           retention-days: 7
 
-      - name: Restore runner workspace ownership
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        shell: bash
-        run: chown -R "$(stat -c '%u:%g' "$(dirname "$GITHUB_WORKSPACE")")" "$GITHUB_WORKSPACE"
-
   playwright-2:
     name: playwright (shard 2/4)
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container:
-      image: mcr.microsoft.com/playwright:v1.58.2-noble
-      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "2/4"
       PLAYWRIGHT_ARTIFACT: "2"
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: "*"
     steps: *playwright_test_steps
 
   playwright-3:
@@ -439,17 +399,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container:
-      image: mcr.microsoft.com/playwright:v1.58.2-noble
-      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "3/4"
       PLAYWRIGHT_ARTIFACT: "3"
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: "*"
     steps: *playwright_test_steps
 
   playwright-4:
@@ -457,17 +410,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (!cancelled() && (needs.changes.outputs.full != 'false' || needs.changes.outputs.browser != 'false')) }}
     runs-on: org-ci-linux-x64
-    container:
-      image: mcr.microsoft.com/playwright:v1.58.2-noble
-      options: --user 0
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
       PLAYWRIGHT_SHARD: "4/4"
       PLAYWRIGHT_ARTIFACT: "4"
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: "*"
     steps: *playwright_test_steps
 
   relay-tests:
