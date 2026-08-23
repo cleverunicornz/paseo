@@ -64,6 +64,9 @@ export const es: TranslationResources = {
       workspaces: "Espacios de trabajo",
       agents: "Agentes",
       newAgent: "Nuevo agente",
+      open: "Abrir {{name}}",
+      openInSidePanel: "Abrir {{name}} en el panel lateral",
+      openInFocusedPane: "Abrir {{name}} en el panel enfocado",
       addProject: "Agregar proyecto",
       home: "Hogar",
       groupByProject: "Agrupar por proyecto",
@@ -607,7 +610,7 @@ export const es: TranslationResources = {
         files: "Archivos",
         pullRequest: "Solicitud de extracción",
         terminalProfilesMenu: "Terminal profiles",
-        editTerminalProfiles: "Edit profiles…",
+        editTerminalProfiles: "Edit profiles",
       },
       sidePanel: {
         open: "Abrir panel lateral",
@@ -1775,6 +1778,7 @@ export const es: TranslationResources = {
       label: "Archivos",
       subtitle: "Archivos del espacio de trabajo",
       tooltip: "Explorar archivos del espacio de trabajo",
+      chooseFile: "Elige un archivo",
     },
     pullRequest: {
       label: "Solicitud de extracción",

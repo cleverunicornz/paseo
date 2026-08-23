@@ -64,6 +64,9 @@ export const ar: TranslationResources = {
       workspaces: "مساحات العمل",
       agents: "الوكلاء",
       newAgent: "وكيل جديد",
+      open: "فتح {{name}}",
+      openInSidePanel: "فتح {{name}} في اللوحة الجانبية",
+      openInFocusedPane: "فتح {{name}} في الجزء النشط",
       addProject: "إضافة مشروع",
       home: "بيت",
       groupByProject: "تجميع حسب المشروع",
@@ -602,7 +605,7 @@ export const ar: TranslationResources = {
         files: "الملفات",
         pullRequest: "طلب السحب",
         terminalProfilesMenu: "Terminal profiles",
-        editTerminalProfiles: "Edit profiles…",
+        editTerminalProfiles: "Edit profiles",
       },
       sidePanel: {
         open: "افتح اللوحة الجانبية",
@@ -1729,6 +1732,7 @@ export const ar: TranslationResources = {
       label: "الملفات",
       subtitle: "ملفات مساحة العمل",
       tooltip: "تصفح ملفات مساحة العمل",
+      chooseFile: "اختر ملفًا",
     },
     pullRequest: {
       label: "طلب السحب",

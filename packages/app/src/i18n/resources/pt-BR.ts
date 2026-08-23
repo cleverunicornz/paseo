@@ -64,6 +64,9 @@ export const ptBR: TranslationResources = {
       workspaces: "Espaços de trabalho",
       agents: "Agentes",
       newAgent: "Novo agente",
+      open: "Abrir {{name}}",
+      openInSidePanel: "Abrir {{name}} no painel lateral",
+      openInFocusedPane: "Abrir {{name}} no painel em foco",
       addProject: "Adicionar projeto",
       home: "Início",
       groupByProject: "Agrupar por projeto",
@@ -606,7 +609,7 @@ export const ptBR: TranslationResources = {
         files: "Arquivos",
         pullRequest: "Pull request",
         terminalProfilesMenu: "Perfis de terminal",
-        editTerminalProfiles: "Editar perfis…",
+        editTerminalProfiles: "Editar perfis",
       },
       sidePanel: {
         open: "Abrir painel lateral",
@@ -1761,6 +1764,7 @@ export const ptBR: TranslationResources = {
       label: "Arquivos",
       subtitle: "Arquivos do espaço de trabalho",
       tooltip: "Explorar arquivos do espaço de trabalho",
+      chooseFile: "Escolha um arquivo",
     },
     pullRequest: {
       label: "Pull request",
