@@ -64,6 +64,9 @@ export const ko: TranslationResources = {
       workspaces: "워크스페이스",
       agents: "에이전트",
       newAgent: "새 에이전트",
+      open: "{{name}} 열기",
+      openInSidePanel: "사이드 패널에서 {{name}} 열기",
+      openInFocusedPane: "포커스된 창에서 {{name}} 열기",
       addProject: "프로젝트 추가",
       home: "홈",
       groupByProject: "프로젝트별 그룹화",
@@ -604,7 +607,7 @@ export const ko: TranslationResources = {
         files: "파일",
         pullRequest: "풀 리퀘스트",
         terminalProfilesMenu: "터미널 프로필",
-        editTerminalProfiles: "프로필 편집…",
+        editTerminalProfiles: "프로필 편집",
       },
       sidePanel: {
         open: "사이드 패널 열기",
@@ -1739,6 +1742,7 @@ export const ko: TranslationResources = {
       label: "파일",
       subtitle: "워크스페이스 파일",
       tooltip: "워크스페이스 파일 탐색",
+      chooseFile: "파일 선택",
     },
     pullRequest: {
       label: "풀 리퀘스트",

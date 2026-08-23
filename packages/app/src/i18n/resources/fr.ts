@@ -65,6 +65,9 @@ export const fr: TranslationResources = {
       workspaces: "Espaces de travail",
       agents: "Agents",
       newAgent: "Nouvel agent",
+      open: "Ouvrir {{name}}",
+      openInSidePanel: "Ouvrir {{name}} dans le panneau latéral",
+      openInFocusedPane: "Ouvrir {{name}} dans le volet actif",
       addProject: "Ajouter un projet",
       home: "Maison",
       groupByProject: "Grouper par projet",
@@ -607,7 +610,7 @@ export const fr: TranslationResources = {
         files: "Fichiers",
         pullRequest: "Demande de fusion",
         terminalProfilesMenu: "Terminal profiles",
-        editTerminalProfiles: "Edit profiles…",
+        editTerminalProfiles: "Edit profiles",
       },
       sidePanel: {
         open: "Ouvrir le panneau latéral",
@@ -1779,6 +1782,7 @@ export const fr: TranslationResources = {
       label: "Fichiers",
       subtitle: "Fichiers de l’espace de travail",
       tooltip: "Parcourir les fichiers de l’espace de travail",
+      chooseFile: "Choisissez un fichier",
     },
     pullRequest: {
       label: "Demande de fusion",

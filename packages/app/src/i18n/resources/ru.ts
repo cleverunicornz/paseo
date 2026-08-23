@@ -64,6 +64,9 @@ export const ru: TranslationResources = {
       workspaces: "Рабочие пространства",
       agents: "Агенты",
       newAgent: "Новый агент",
+      open: "Открыть {{name}}",
+      openInSidePanel: "Открыть {{name}} в боковой панели",
+      openInFocusedPane: "Открыть {{name}} в активной области",
       addProject: "Добавить проект",
       home: "Главная",
       groupByProject: "Группировать по проекту",
@@ -607,7 +610,7 @@ export const ru: TranslationResources = {
         files: "Файлы",
         pullRequest: "PR",
         terminalProfilesMenu: "Профили терминала",
-        editTerminalProfiles: "Изменить профили…",
+        editTerminalProfiles: "Изменить профили",
       },
       sidePanel: {
         open: "Открыть боковую панель",
@@ -1760,6 +1763,7 @@ export const ru: TranslationResources = {
       label: "Файлы",
       subtitle: "Файлы рабочего пространства",
       tooltip: "Просмотр файлов рабочего пространства",
+      chooseFile: "Выберите файл",
     },
     pullRequest: {
       label: "PR",

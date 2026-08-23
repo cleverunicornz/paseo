@@ -61,6 +61,9 @@ export const en = {
       workspaces: "Workspaces",
       agents: "Agents",
       newAgent: "New agent",
+      open: "Open {{name}}",
+      openInSidePanel: "Open {{name}} in Side panel",
+      openInFocusedPane: "Open {{name}} in focused pane",
       addProject: "Add project",
       home: "Home",
       groupByProject: "Group by project",
@@ -600,7 +603,7 @@ export const en = {
         files: "Files",
         pullRequest: "Pull request",
         terminalProfilesMenu: "Terminal profiles",
-        editTerminalProfiles: "Edit profiles…",
+        editTerminalProfiles: "Edit profiles",
       },
       sidePanel: {
         open: "Open side panel",
@@ -1739,6 +1742,7 @@ export const en = {
       label: "Files",
       subtitle: "Workspace files",
       tooltip: "Browse workspace files",
+      chooseFile: "Choose a file",
     },
     pullRequest: {
       label: "Pull request",

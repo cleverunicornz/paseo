@@ -64,6 +64,9 @@ export const zhCN: TranslationResources = {
       workspaces: "工作区",
       agents: "Agents",
       newAgent: "新建 Agent",
+      open: "打开{{name}}",
+      openInSidePanel: "在侧边面板中打开{{name}}",
+      openInFocusedPane: "在当前窗格中打开{{name}}",
       addProject: "添加 project",
       home: "首页",
       groupByProject: "按项目分组",
@@ -602,7 +605,7 @@ export const zhCN: TranslationResources = {
         files: "文件",
         pullRequest: "拉取请求",
         terminalProfilesMenu: "Terminal profiles",
-        editTerminalProfiles: "Edit profiles…",
+        editTerminalProfiles: "Edit profiles",
       },
       sidePanel: {
         open: "打开侧边面板",
@@ -1709,6 +1712,7 @@ export const zhCN: TranslationResources = {
       label: "文件",
       subtitle: "工作区文件",
       tooltip: "浏览工作区文件",
+      chooseFile: "选择文件",
     },
     pullRequest: {
       label: "拉取请求",

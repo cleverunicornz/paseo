@@ -64,6 +64,9 @@ export const ja: TranslationResources = {
       workspaces: "ワークスペース",
       agents: "エージェント",
       newAgent: "新しいエージェント",
+      open: "{{name}}を開く",
+      openInSidePanel: "{{name}}をサイドパネルで開く",
+      openInFocusedPane: "{{name}}をフォーカス中のペインで開く",
       addProject: "プロジェクトを追加",
       home: "ホーム",
       groupByProject: "プロジェクトでグループ化",
@@ -607,7 +610,7 @@ export const ja: TranslationResources = {
         files: "ファイル",
         pullRequest: "プルリクエスト",
         terminalProfilesMenu: "ターミナルプロファイル",
-        editTerminalProfiles: "プロファイルを編集…",
+        editTerminalProfiles: "プロファイルを編集",
       },
       sidePanel: {
         open: "サイドパネルを開く",
@@ -1746,6 +1749,7 @@ export const ja: TranslationResources = {
       label: "ファイル",
       subtitle: "ワークスペースのファイル",
       tooltip: "ワークスペースのファイルを参照",
+      chooseFile: "ファイルを選択",
     },
     pullRequest: {
       label: "プルリクエスト",
