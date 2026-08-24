@@ -60,7 +60,9 @@ If upstream `main` is already an ancestor of fork `main`, there is no source syn
 
 ### 2. Verify upstream provenance and assurance
 
-Resolve an exact upstream SHA. Require completed green upstream checks for that SHA before running its code on a self-hosted runner. Record the upstream check-run URLs in the pull request.
+Resolve an exact upstream SHA. Require completed green upstream checks for that SHA before running its code anywhere. Record the upstream check-run URLs in the pull request.
+
+Unvetted merged code — including the fork-contract assurance run — executes only on WarpBuild ephemeral runners, never on the self-hosted fleet. The fleet is reserved for reviewed fork operations and release builds.
 
 Upstream assurance is authoritative for unchanged upstream behavior. Do not repeat upstream's Playwright, Windows, macOS, desktop, or broad package matrix.
 
@@ -171,7 +173,7 @@ When one exists:
 2. Construct a fork release candidate containing that exact upstream release tree plus the maintained fork delta. Do not include later unreleased upstream commits. If fork `main` has moved past the release commit, use a dedicated release branch from the exact upstream tag and apply the maintained fork changes there.
 3. Prove the fork contract on the exact release candidate.
 4. Preserve the established fork version, channel, and prerelease convention. Escalate rather than inventing a new convention.
-5. Manually dispatch `desktop-release.yml` with the exact tag and checkout ref. Build Linux, macOS, and Windows because the fork artifacts contain code absent from upstream binaries.
+5. Manually dispatch `desktop-release.yml` with the exact tag and checkout ref. Build all three lanes in parallel — macOS first (primary daily driver), then Linux, Windows last — and treat each lane as independently complete the moment its artifacts land. The fork artifacts contain code absent from upstream binaries.
 6. Use the workflow's packaged-app smoke and artifacts as release evidence. Do not rerun upstream's native test matrix.
 7. Manually dispatch `release-notes-sync.yml` when release notes need synchronization.
 8. Verify every expected artifact and release URL before reporting the release complete.
