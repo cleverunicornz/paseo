@@ -45,15 +45,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-
       - name: Detect affected CI contracts
         id: filter
-        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
-        with:
-          filters: .github/ci-paths.yml
+        env:
+          ROUTE_EVENT: ${{ github.event_name }}
+          ROUTE_BASE: ${{ github.event.pull_request.base.sha }}
+          ROUTE_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          node scripts/ci-route.mjs \
+            --event "$ROUTE_EVENT" \
+            --filters .github/ci-paths.yml \
+            ${ROUTE_BASE:+--base "$ROUTE_BASE"} \
+            ${ROUTE_HEAD:+--head "$ROUTE_HEAD"}
 
       - name: Validate CI contracts
-        run: node --test scripts/ci-workflow.test.mjs scripts/daemon-launch-contract.test.mjs
+        run: node --test scripts/ci-workflow.test.mjs scripts/daemon-launch-contract.test.mjs scripts/ci-route.test.mjs
 
   format:
     name: format

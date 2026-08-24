@@ -29,6 +29,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      NIX_PATH: nixpkgs=channel:nixos-unstable
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,9 +41,11 @@ jobs:
           node-version: "22"
           cache: "npm"
 
-      - uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Install Nix
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location https://nixos.org/nix/install | sh -s -- --no-daemon
+          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
 
       - name: Update lockfile + Nix hash if stale
         run: ./scripts/update-nix.sh
@@ -108,14 +112,18 @@ jobs:
 
   build-desktop-darwin:
     runs-on: macos-14
+    env:
+      NIX_PATH: nixpkgs=channel:nixos-unstable
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Install Nix
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location https://nixos.org/nix/install | sh -s -- --no-daemon
+          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
 
       - name: Build Nix desktop package
         run: nix build .#desktop -o result-desktop

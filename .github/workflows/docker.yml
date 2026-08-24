@@ -141,21 +141,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - name: Prepare multi-arch builder
+        run: |
+          set -euo pipefail
+          docker run --privileged --rm tonistiigi/binfmt --install all
+          docker buildx create --use --name paseo-builder
 
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/base/Dockerfile
-          platforms: ${{ env.PLATFORMS }}
-          build-args: |
-            PASEO_VERSION=${{ needs.setup.outputs.install_version }}
-          tags: ${{ needs.setup.outputs.check_tag }}
-          push: false
-          provenance: false
-          cache-from: type=gha,scope=paseo
-          cache-to: type=gha,scope=paseo,mode=max
+      - name: Build check image
+        env:
+          PASEO_VERSION: ${{ needs.setup.outputs.install_version }}
+          IMAGE_TAGS: ${{ needs.setup.outputs.check_tag }}
+        run: |
+          set -euo pipefail
+          args=(--file docker/base/Dockerfile --platform "$PLATFORMS" --provenance=false
+                --build-arg "PASEO_VERSION=$PASEO_VERSION"
+                --cache-from type=gha,scope=paseo --cache-to type=gha,scope=paseo,mode=max)
+          while IFS= read -r tag; do [[ -n "$tag" ]] && args+=(--tag "$tag"); done <<< "$IMAGE_TAGS"
+          docker buildx build "${args[@]}" .
 
   publish:
     needs: setup
@@ -167,25 +169,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - name: Prepare multi-arch builder
+        run: |
+          set -euo pipefail
+          docker run --privileged --rm tonistiigi/binfmt --install all
+          docker buildx create --use --name paseo-builder
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
 
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/base/Dockerfile
-          platforms: ${{ env.PLATFORMS }}
-          build-args: |
-            PASEO_VERSION=${{ needs.setup.outputs.install_version }}
-          tags: ${{ needs.setup.outputs.publish_tags }}
-          push: true
-          provenance: false
-          cache-from: type=gha,scope=paseo
-          cache-to: type=gha,scope=paseo,mode=max
+      - name: Build and publish image
+        env:
+          PASEO_VERSION: ${{ needs.setup.outputs.install_version }}
+          IMAGE_TAGS: ${{ needs.setup.outputs.publish_tags }}
+        run: |
+          set -euo pipefail
+          args=(--file docker/base/Dockerfile --platform "$PLATFORMS" --push --provenance=false
+                --build-arg "PASEO_VERSION=$PASEO_VERSION"
+                --cache-from type=gha,scope=paseo --cache-to type=gha,scope=paseo,mode=max)
+          while IFS= read -r tag; do [[ -n "$tag" ]] && args+=(--tag "$tag"); done <<< "$IMAGE_TAGS"
+          docker buildx build "${args[@]}" .
