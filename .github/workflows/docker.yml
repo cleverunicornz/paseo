@@ -66,6 +66,7 @@ jobs:
       publish: ${{ steps.values.outputs.publish }}
       check_tag: ${{ steps.values.outputs.check_tag }}
       publish_tags: ${{ steps.values.outputs.publish_tags }}
+      safe: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v6
 
@@ -133,8 +134,8 @@ jobs:
 
   build:
     needs: setup
-    if: needs.setup.outputs.publish != 'true'
-    runs-on: ubuntu-latest
+    if: needs.setup.outputs.publish != 'true' && needs.setup.outputs.safe == 'true'
+    runs-on: org-ci-linux-x64
     permissions:
       contents: read
     steps:
@@ -159,7 +160,7 @@ jobs:
   publish:
     needs: setup
     if: needs.setup.outputs.publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: org-ci-linux-x64
     permissions:
       contents: read
       packages: write
