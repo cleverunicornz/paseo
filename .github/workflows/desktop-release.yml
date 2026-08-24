@@ -456,10 +456,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: |
-            package.json
-            package-lock.json
-            scripts
           ref: ${{ env.CHECKOUT_REF }}
 
       - name: Resolve release tag
