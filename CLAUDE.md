@@ -115,7 +115,7 @@ See [docs/development.md](docs/development.md) for full setup, build sync requir
   - Never run `npm run test` for an entire workspace unless explicitly asked.
   - If you must run a broad suite, pipe output to a file and read it afterward: `npx vitest run <file> --bail=1 > /tmp/test-output.txt 2>&1` then read the file.
   - Never re-run a test suite that another agent already ran and reported green — trust the result.
-  - For full suite verification, push to CI and check GitHub Actions instead.
+  - For remote or broad verification, manually dispatch the narrow workflow task that proves the change. Never push merely to trigger CI.
 - **Always run typecheck and lint after every change.**
 - **Build workspace packages before diagnosing cross-package type errors.** This repo consumes generated declarations across workspaces. If typecheck fails in a package that depends on another workspace, rebuild the owning stack first so `dist` declarations are current:
   - `npm run build:client` — rebuild protocol and client declarations.
@@ -182,3 +182,10 @@ The app runs on iOS, Android, web (browser), and web (Electron desktop). Code is
 ## Debugging
 
 Find the complete daemon logs and traces in the $PASEO_HOME/daemon.log
+
+## Fork maintenance
+
+- Before synchronizing `getpaseo/paseo`, resolving a fork compatibility change, or mirroring an upstream release, read `.agents/skills/fork-maintainer/SKILL.md` and follow it end to end.
+- The scheduled Paseo agent owns maintenance decisions. GitHub workflows are manually dispatched build, test, and release tools; enabled workflows never run on push, pull request, merge, tag, or schedule.
+- Upstream check runs are authoritative for unchanged upstream behavior. Run only assurance that exercises the intersection between incoming upstream changes and this fork's maintained delta.
+- Linux and platform-neutral workflow jobs use `org-ci-linux-x64`. Native release jobs use `warp-macos-15-arm64-6x` and `warp-windows-latest-x64-4x`.
