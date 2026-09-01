@@ -1,13 +1,6 @@
 name: Desktop Release
 
 on:
-  push:
-    tags:
-      - "v*"
-      - "desktop-v*"
-      - "desktop-macos-v*"
-      - "desktop-linux-v*"
-      - "desktop-windows-v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -44,22 +37,23 @@ on:
         type: string
 
 concurrency:
-  group: desktop-release-${{ github.ref }}
+  group: desktop-release-${{ inputs.tag }}-${{ inputs.platform }}
   cancel-in-progress: false
 
 env:
-  SOURCE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-  CHECKOUT_REF: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.checkout_ref || github.ref_name) || github.ref_name }}
-  SHOULD_PUBLISH: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish != 'false' }}
-  ROLLOUT_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.rollout_hours || '36' }}
+  SOURCE_TAG: ${{ inputs.tag }}
+  CHECKOUT_REF: ${{ inputs.checkout_ref || inputs.tag }}
+  SHOULD_PUBLISH: ${{ inputs.publish != 'false' }}
+  ROLLOUT_HOURS: ${{ inputs.rollout_hours }}
   DESKTOP_PACKAGE_PATH: "packages/desktop"
 
 jobs:
   create-release:
-    if: ${{ (github.event_name == 'push' && !startsWith(github.ref_name, 'desktop-macos-v') && !startsWith(github.ref_name, 'desktop-linux-v') && !startsWith(github.ref_name, 'desktop-windows-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.platform == 'all' && github.event.inputs.publish != 'false') }}
+    if: ${{ inputs.platform == 'all' && inputs.publish != 'false' }}
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: org-ci-linux-x64
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,6 +77,7 @@ jobs:
               prerelease_flag="--prerelease"
             fi
             gh release create "$RELEASE_TAG" \
+              --target "$CHECKOUT_REF" \
               --repo "${{ github.repository }}" \
               --title "Paseo $RELEASE_TAG" \
               --notes "" \
@@ -93,19 +88,20 @@ jobs:
 
   publish-macos:
     needs: [create-release]
-    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'macos')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'desktop-v') || startsWith(github.ref_name, 'desktop-macos-v')))) }}
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && (inputs.platform == 'all' || inputs.platform == 'macos') }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: warp-macos-15-arm64-6x
             electron_arch: arm64
-          - runner: macos-15-intel
+          - runner: warp-macos-15-arm64-6x
             electron_arch: x64
     permissions:
       contents: write
       packages: read
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -164,6 +160,14 @@ jobs:
           build_args=(-- --publish never --mac --${{ matrix.electron_arch }})
           build_args+=("-c.publish.releaseType=$RELEASE_TYPE")
           build_args+=("-c.publish.channel=$RELEASE_CHANNEL")
+          build_args+=("-c.publish.owner=$GITHUB_REPOSITORY_OWNER")
+          build_args+=("-c.publish.repo=${GITHUB_REPOSITORY#*/}")
+          if [[ -z "${CSC_LINK:-}" ]]; then
+            echo "::warning::Apple Developer ID credentials are not configured; building without Developer ID signing and skipping notarization."
+            unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            build_args+=("-c.mac.notarize=false")
+          fi
           npm run build:desktop "${build_args[@]}"
 
       - name: Upload packaged smoke diagnostics
@@ -211,11 +215,12 @@ jobs:
 
   publish-linux:
     needs: [create-release]
-    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'linux')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'desktop-v') || startsWith(github.ref_name, 'desktop-linux-v')))) }}
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && (inputs.platform == 'all' || inputs.platform == 'linux') }}
     permissions:
       contents: write
       packages: read
-    runs-on: ubuntu-22.04
+    runs-on: org-ci-linux-x64
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -257,8 +262,18 @@ jobs:
           fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
           NODE
 
-      - name: Install Linux smoke display
-        run: sudo apt-get update && sudo apt-get install -y xvfb xauth
+      - name: Install Linux smoke display and desktop runtime libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUDO=""
+          if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+          $SUDO apt-get update
+          # Hosted GitHub runners ship these Electron runtime libraries in the
+          # image; the self-hosted org-ci-linux-x64 runner does not.
+          $SUDO apt-get install -y xvfb xauth libgtk-3-0 libnss3 libgbm1
+          # libasound2 was renamed to libasound2t64 starting with Ubuntu 24.04.
+          $SUDO apt-get install -y libasound2 || $SUDO apt-get install -y libasound2t64
 
       - name: Build desktop release
         shell: bash
@@ -272,6 +287,8 @@ jobs:
           build_args=(-- --publish never --linux --x64)
           build_args+=("-c.publish.releaseType=$RELEASE_TYPE")
           build_args+=("-c.publish.channel=$RELEASE_CHANNEL")
+          build_args+=("-c.publish.owner=$GITHUB_REPOSITORY_OWNER")
+          build_args+=("-c.publish.repo=${GITHUB_REPOSITORY#*/}")
           npm run build:desktop "${build_args[@]}"
 
       - name: Upload packaged smoke diagnostics
@@ -319,11 +336,12 @@ jobs:
 
   publish-windows:
     needs: [create-release]
-    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'windows')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'desktop-v') || startsWith(github.ref_name, 'desktop-windows-v')))) }}
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && (inputs.platform == 'all' || inputs.platform == 'windows') }}
     permissions:
       contents: write
       packages: read
-    runs-on: windows-latest
+    runs-on: warp-windows-latest-x64-4x
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -377,6 +395,8 @@ jobs:
           build_args=(-- --publish never --win --x64 --arm64)
           build_args+=("-c.publish.releaseType=$RELEASE_TYPE")
           build_args+=("-c.publish.channel=$RELEASE_CHANNEL")
+          build_args+=("-c.publish.owner=$GITHUB_REPOSITORY_OWNER")
+          build_args+=("-c.publish.repo=${GITHUB_REPOSITORY#*/}")
           npm run build:desktop "${build_args[@]}"
 
       - name: Upload packaged smoke diagnostics
@@ -424,21 +444,18 @@ jobs:
 
   finalize-rollout:
     needs: [publish-macos, publish-linux, publish-windows]
-    if: ${{ always() && (needs.publish-macos.result == 'success' || needs.publish-macos.result == 'skipped') && (needs.publish-linux.result == 'success' || needs.publish-linux.result == 'skipped') && (needs.publish-windows.result == 'success' || needs.publish-windows.result == 'skipped') && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish != 'false') }}
+    if: ${{ always() && (needs.publish-macos.result == 'success' || needs.publish-macos.result == 'skipped') && (needs.publish-linux.result == 'success' || needs.publish-linux.result == 'skipped') && (needs.publish-windows.result == 'success' || needs.publish-windows.result == 'skipped') && inputs.publish != 'false' }}
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: org-ci-linux-x64
+    timeout-minutes: 15
     concurrency:
-      group: desktop-rollout-${{ github.event.inputs.tag || github.ref_name }}
+      group: desktop-rollout-${{ inputs.tag }}
       cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: |
-            package.json
-            package-lock.json
-            scripts
           ref: ${{ env.CHECKOUT_REF }}
 
       - name: Resolve release tag
