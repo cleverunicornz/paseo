@@ -723,7 +723,15 @@ describe("ProviderSnapshotManager public surface", () => {
     try {
       const entries = await manager.listProviders({ cwd: "/tmp/project", wait: true });
       const providers = entries.map((entry) => entry.provider).sort();
-      expect(providers).toEqual(["claude", "codex", "copilot", "omp", "opencode", "pi"]);
+      expect(providers).toEqual([
+        "claude",
+        "codex",
+        "copilot",
+        "omp",
+        "opencode",
+        "pi",
+        "yeet-code",
+      ]);
       for (const entry of entries) {
         expect(entry.enabled).toBe(false);
         expect(entry.status).toBe("unavailable");

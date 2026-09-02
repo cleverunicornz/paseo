@@ -75,6 +75,32 @@ OMP is a first-class built-in provider, disabled by default. Its launch contract
 
 OMP supports native Paseo host tools. The adapter registers the full caller-scoped Paseo tool catalog directly with OMP, matching providers such as Claude that expose the full catalog through MCP. Serialize every OMP host definition with `loadMode: "essential"` so `create_agent`, `send_agent_prompt`, `wait_for_agent`, and related tools remain direct calls; omitting the field makes OMP mount non-built-in names under `xd://` instead. OMP's provider-managed task subagents are surfaced as Paseo subagents through `child_session` imports; the parent keeps the subagents track while the child runtime stays owned by OMP. Custom OMP profiles should extend `omp`; other Pi-compatible forks can still extend `pi`, override `command`, and set `params.sessionDir` to their JSONL session directory.
 
+`yeet-code` is a first-class remote ACP v2 provider for a Yeet Code Gateway installation. It does
+not spawn a local agent process and never receives the Gateway's upstream model credentials. Set
+the ACP endpoint and Gateway client bearer through the provider override:
+
+```json
+{
+  "agents": {
+    "providers": {
+      "yeet-code": {
+        "enabled": true,
+        "params": {
+          "url": "http://100.79.9.58:18445/acp"
+        },
+        "env": {
+          "YEET_CODE_GATEWAY_TOKEN": "<gateway-client-bearer>"
+        }
+      }
+    }
+  }
+}
+```
+
+The provider uses standard ACP v2 over HTTP/SSE, discovers composed models from session
+configuration, and supports Gateway-owned session listing, resume/replay, cancellation, images,
+and embedded resources. The token authenticates Paseo to the Gateway only.
+
 Pi RPC extension UI dialog requests (`select`, `input`, `editor`, `confirm`) are bridged into Paseo question permissions and answered with `extension_ui_response`. Pi extensions such as `ask_user` may chain dialogs: for example, a `select` can be followed by an optional-comment `input`. When an `ask_user` tool call declares `allowComment: true`, Paseo presents the selection and optional comment as one question permission, answers Pi's initial `select` immediately, then auto-answers the follow-up optional `input` with the comment the user already supplied (or an empty string). Preserve placeholders and optional/skip semantics for standalone optional inputs so the app can still distinguish "skip this optional input" from "cancel the whole dialog." Fire-and-forget extension UI requests such as notifications are intentionally ignored by the provider adapter unless Paseo grows first-class UI for them.
 
 OpenCode 1 keeps MCP and process environment outside the session boundary. Paseo shares one OpenCode server for ordinary agents and installs a daemon-owned plugin through `OPENCODE_CONFIG_CONTENT`. The plugin reads the exact agent environment and caller-scoped Paseo tool catalog from the daemon's private loopback bridge for each OpenCode session. Bridge context lives only in daemon memory and is removed when the Paseo session closes. The content-addressed plugin artifact contains no session data or secrets.
