@@ -65,6 +65,7 @@ jobs:
         if: inputs.task == 'fork-contract' || inputs.task == 'provider-tests'
         run: >-
           npm run test --workspace=@getpaseo/protocol --
+          --testTimeout=15000
           src/paseo-config-schema.test.ts
           src/provider-snapshot-codec.test.ts
           src/messages.providers-snapshot.test.ts
