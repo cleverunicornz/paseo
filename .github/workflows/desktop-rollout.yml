@@ -23,7 +23,9 @@ jobs:
   stamp:
     permissions:
       contents: write
-    runs-on: org-ci-linux-x64
+    runs-on:
+      group: ci
+      labels: [automation-test-s]
     timeout-minutes: 15
 
     steps:

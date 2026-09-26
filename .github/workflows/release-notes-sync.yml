@@ -19,7 +19,9 @@ concurrency:
 
 jobs:
   sync-release-notes:
-    runs-on: org-ci-linux-x64
+    runs-on:
+      group: ci
+      labels: [automation-test-s]
     timeout-minutes: 10
     permissions:
       contents: write
