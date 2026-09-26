@@ -28,9 +28,11 @@ concurrency:
 jobs:
   run:
     if: github.actor != 'github-actions[bot]'
-    # Unvetted merged upstream code runs here: WarpBuild ephemeral only,
-    # never the self-hosted fleet (org runner policy R2).
-    runs-on: warp-ubuntu-latest-x64-4x
+    # Unvetted merged upstream code runs here: one ephemeral in-cluster
+    # runner pod per job, with no Kubernetes API credential (infra-v2 D-000071).
+    runs-on:
+      group: ci
+      labels: [automation-test-s]
     timeout-minutes: 30
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
