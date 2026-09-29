@@ -193,3 +193,7 @@ Find the complete daemon logs and traces in the $PASEO_HOME/daemon.log
 - The scheduled Paseo agent owns maintenance decisions. GitHub workflows are manually dispatched build, test, and release tools; enabled workflows never run on push, pull request, merge, tag, or schedule.
 - Upstream check runs are authoritative for unchanged upstream behavior. Run only assurance that exercises the intersection between incoming upstream changes and this fork's maintained delta.
 - Linux and platform-neutral workflow jobs use `org-ci-linux-x64`. Native release jobs use `warp-macos-15-arm64-6x` and `warp-windows-latest-x64-4x`.
+
+## Invariants (this fork)
+
+- **Critical — public repository.** This repository is public. Secure material — our own known vulnerabilities from the security vault, their details, exploitability and affected code paths — is never represented in it: not in code, comments, commits, branches, issues, pull requests, reviews or comments. Public CVE and CWE references are fine. A fix lands normally, with a Promise that describes the property the code keeps, never the vulnerability.
