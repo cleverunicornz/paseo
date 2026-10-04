@@ -5158,6 +5158,7 @@ export class AgentManager {
       withRuntimePaseoMcpServer({
         config: storedConfig,
         agentId,
+        values: options.env,
         mcpBaseUrl:
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
             ? this.mcpBaseUrl

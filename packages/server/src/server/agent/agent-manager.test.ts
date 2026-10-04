@@ -3004,6 +3004,45 @@ test("createAgent injects paseo MCP server only into provider launch config", as
   });
 });
 
+test("createAgent expands configured MCP launch values without persisting them", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class CaptureClient extends TestAgentClient {
+    lastConfig: AgentSessionConfig | null = null;
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.lastConfig = config;
+      return new McpCapableTestAgentSession(config);
+    }
+  }
+  const client = new CaptureClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const mcpServers = {
+    remote: {
+      type: "http" as const,
+      url: "https://tools.example/{tenant}?agent={agentId}",
+      headers: { "X-Agent": "{agentId}", "X-Tenant": "{tenant}" },
+    },
+  };
+  try {
+    const snapshot = await manager.createAgent(
+      { provider: "codex", cwd: workdir, mcpServers },
+      undefined,
+      { env: { tenant: "example" } },
+    );
+    expect(client.lastConfig?.mcpServers).toEqual({
+      remote: {
+        type: "http",
+        url: `https://tools.example/example?agent=${snapshot.id}`,
+        headers: { "X-Agent": snapshot.id, "X-Tenant": "example" },
+      },
+    });
+    expect(snapshot.config.mcpServers).toEqual(mcpServers);
+    expect((await storage.get(snapshot.id))?.config?.mcpServers).toEqual(mcpServers);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("createAgent closes and rejects a provider session that cannot honor MCP servers", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
