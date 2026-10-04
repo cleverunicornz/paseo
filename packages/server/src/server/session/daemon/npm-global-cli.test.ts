@@ -56,7 +56,7 @@ describe("DefaultNpmGlobalPaseoCli", () => {
     ]);
   });
 
-  test("runs the global install command for the latest cli", async () => {
+  test("refuses self-update without running an npm install", async () => {
     const calls: CommandCall[] = [];
     const cli = new DefaultNpmGlobalPaseoCli(async (command, args, options) => {
       calls.push({
@@ -69,18 +69,12 @@ describe("DefaultNpmGlobalPaseoCli", () => {
     });
 
     await expect(cli.installLatest()).resolves.toEqual({
-      exitCode: 0,
-      stdout: "changed 42 packages",
-      stderr: "",
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        "This daemon is managed by its release installer. Update the installed release on the host.",
     });
-    expect(calls).toEqual([
-      {
-        command: "npm",
-        args: ["install", "-g", "@getpaseo/cli@latest"],
-        timeout: 300_000,
-        maxBuffer: 10 * 1024 * 1024,
-      },
-    ]);
+    expect(calls).toEqual([]);
   });
 
   test("reports missing npm when npm exits without JSON", async () => {

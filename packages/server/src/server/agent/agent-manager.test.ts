@@ -50,6 +50,13 @@ import type {
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
+import {
+  PluginHookHandlers,
+  validateBeforeRequest,
+  type PluginLifecycle,
+} from "../plugins/lifecycle/index.js";
+import { createPaseoApi } from "@getpaseo/client";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 
 const DESKTOP_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("desktop-client");
 const MOBILE_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("mobile-client");
@@ -3003,6 +3010,138 @@ test("createAgent injects paseo MCP server only into provider launch config", as
     },
   });
 });
+
+test("createAgent expands configured MCP launch values without persisting them", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class CaptureClient extends TestAgentClient {
+    lastConfig: AgentSessionConfig | null = null;
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.lastConfig = config;
+      return new McpCapableTestAgentSession(config);
+    }
+  }
+  const client = new CaptureClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const mcpServers = {
+    remote: {
+      type: "http" as const,
+      url: "https://tools.example/{tenant}?agent={agentId}",
+      headers: { "X-Agent": "{agentId}", "X-Tenant": "{tenant}" },
+    },
+  };
+  try {
+    const snapshot = await manager.createAgent(
+      { provider: "codex", cwd: workdir, mcpServers },
+      undefined,
+      { env: { tenant: "example" } },
+    );
+    expect(client.lastConfig?.mcpServers).toEqual({
+      remote: {
+        type: "http",
+        url: `https://tools.example/example?agent=${snapshot.id}`,
+        headers: { "X-Agent": snapshot.id, "X-Tenant": "example" },
+      },
+    });
+    expect(snapshot.config.mcpServers).toEqual(mcpServers);
+    expect((await storage.get(snapshot.id))?.config?.mcpServers).toEqual(mcpServers);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test.each(["claude", "codex", "acp", "nooa"])(
+  "MCP launch values use session-open hooks on create, refresh and resume for %s",
+  async (provider) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const configs: AgentSessionConfig[] = [];
+    class CaptureSession extends McpCapableTestAgentSession {
+      override describePersistence(): AgentPersistenceHandle {
+        return { provider, sessionId: this.id };
+      }
+    }
+    class CaptureClient extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        configs.push(config);
+        return new CaptureSession(config);
+      }
+      override async resumeSession(
+        _handle: AgentPersistenceHandle,
+        config: AgentSessionConfig,
+      ): Promise<AgentSession> {
+        configs.push(config);
+        return new CaptureSession(config);
+      }
+    }
+    const client = new CaptureClient(provider);
+    const hooks = new PluginHookHandlers(() => {});
+    const paseo = createPaseoApi(
+      new DaemonClient({ url: "ws://127.0.0.1:1/ws", clientId: "launch-unit" }),
+    );
+    hooks.before("agent.session_open", ({ request }) => ({
+      ...request,
+      env: { ...request.env, tenant: "example-$&-{agentId}", agentId: "wrong-agent" },
+    }));
+    const lifecycle: PluginLifecycle = {
+      emit() {},
+      async before(name, request) {
+        return validateBeforeRequest(
+          name,
+          await hooks.invoke("launch", "before", name, request, paseo),
+        );
+      },
+    };
+    const manager = new AgentManager({
+      clients: { [provider]: client },
+      registry: storage,
+      logger,
+      pluginLifecycle: lifecycle,
+    });
+    const mcpServers = {
+      remote: { type: "http" as const, url: "https://tools.example/{tenant}?agent={agentId}" },
+      stream: {
+        type: "sse" as const,
+        url: "https://tools.example/sse/{agentId}",
+        headers: { "X-Tenant": "{tenant}" },
+      },
+      local: { type: "stdio" as const, command: "fixture", args: ["{agentId}"] },
+    };
+    try {
+      const created = await manager.createAgent(
+        { provider, cwd: workdir, mcpServers },
+        undefined,
+        {},
+      );
+      await manager.reloadAgentSession(created.id);
+      await manager.closeAgent(created.id);
+      await manager.resumeAgentFromPersistence(
+        { provider, sessionId: "provider-session" },
+        { provider, cwd: workdir, mcpServers },
+        created.id,
+      );
+      expect(configs).toHaveLength(3);
+      for (const config of configs) {
+        expect(config.mcpServers).toEqual({
+          remote: {
+            type: "http",
+            url: `https://tools.example/example-$&-{agentId}?agent=${created.id}`,
+          },
+          stream: {
+            type: "sse",
+            url: `https://tools.example/sse/${created.id}`,
+            headers: { "X-Tenant": "example-$&-{agentId}" },
+          },
+          local: mcpServers.local,
+        });
+      }
+      expect((await storage.get(created.id))?.config?.mcpServers).toEqual(mcpServers);
+    } finally {
+      hooks.close();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("createAgent closes and rejects a provider session that cannot honor MCP servers", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
