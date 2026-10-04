@@ -3,6 +3,40 @@ import type { AgentSessionConfig, McpServerConfig } from "./agent-sdk-types.js";
 const PASEO_MCP_SERVER_NAME = "paseo";
 const PASEO_MCP_PATHNAME = "/mcp/agents";
 
+export function substituteMcpServerValues(
+  servers: Record<string, McpServerConfig> | undefined,
+  values: Record<string, string>,
+): Record<string, McpServerConfig> | undefined {
+  if (!servers) {
+    return servers;
+  }
+
+  function substitute(value: string): string {
+    return value.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (placeholder, key: string) =>
+      Object.hasOwn(values, key) ? values[key]! : placeholder,
+    );
+  }
+
+  const result: Record<string, McpServerConfig> = {};
+  for (const [name, server] of Object.entries(servers)) {
+    if (server.type === "stdio") {
+      result[name] = server;
+      continue;
+    }
+    const headers = server.headers
+      ? Object.fromEntries(
+          Object.entries(server.headers).map(([header, value]) => [header, substitute(value)]),
+        )
+      : undefined;
+    result[name] = {
+      ...server,
+      url: substitute(server.url),
+      ...(headers ? { headers } : {}),
+    };
+  }
+  return result;
+}
+
 export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSessionConfig {
   const mcpServers = config.mcpServers;
   if (!mcpServers) {
@@ -29,6 +63,7 @@ export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSe
 export function withRuntimePaseoMcpServer(params: {
   config: AgentSessionConfig;
   agentId: string;
+  values?: Record<string, string>;
   mcpBaseUrl: string | null;
   /**
    * Capability token authenticating the injected connection to the daemon's
@@ -38,22 +73,25 @@ export function withRuntimePaseoMcpServer(params: {
   mcpAuthToken: string | null;
 }): AgentSessionConfig {
   const storedConfig = stripInternalPaseoMcpServer(params.config);
-  if (!params.mcpBaseUrl || storedConfig.mcpServers?.[PASEO_MCP_SERVER_NAME]) {
+  const mcpServers = { ...storedConfig.mcpServers };
+  if (params.mcpBaseUrl && !mcpServers[PASEO_MCP_SERVER_NAME]) {
+    mcpServers[PASEO_MCP_SERVER_NAME] = {
+      type: "http",
+      url: `${params.mcpBaseUrl}?callerAgentId={agentId}`,
+      ...(params.mcpAuthToken
+        ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } }
+        : {}),
+    };
+  }
+  if (Object.keys(mcpServers).length === 0) {
     return storedConfig;
   }
-
   return {
     ...storedConfig,
-    mcpServers: {
-      [PASEO_MCP_SERVER_NAME]: {
-        type: "http",
-        url: `${params.mcpBaseUrl}?callerAgentId=${params.agentId}`,
-        ...(params.mcpAuthToken
-          ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } }
-          : {}),
-      },
-      ...storedConfig.mcpServers,
-    },
+    mcpServers: substituteMcpServerValues(mcpServers, {
+      ...params.values,
+      agentId: params.agentId,
+    }),
   };
 }
 
