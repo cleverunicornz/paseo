@@ -1,0 +1,77 @@
+name: Internal daemon qualification
+
+on:
+  pull_request:
+    branches: [internal/main]
+  push:
+    branches: [internal/main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Publish a release from internal/main (empty for checks only)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  ONNXRUNTIME_NODE_INSTALL: skip
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+jobs:
+  daemon:
+    runs-on: {group: ci, labels: build-native}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install verified Node 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --output /tmp/paseo-node.tar.xz https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+          echo 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de  /tmp/paseo-node.tar.xz' | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/paseo-node"
+          tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
+          echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build daemon and CLI
+        run: npm run build:server
+      - name: Check source
+        run: |
+          npm run lint
+          npm run typecheck:server
+          npm run format:check:files -- packages/server/src/server/agent/runtime-mcp-config.ts packages/server/src/server/agent/runtime-mcp-config.test.ts packages/server/src/server/agent/agent-manager.ts packages/server/src/server/agent/agent-manager.test.ts packages/server/src/server/session/daemon/npm-global-cli.ts packages/server/src/server/session/daemon/npm-global-cli.test.ts packages/server/src/server/websocket-server.ts packages/server/src/server/daemon-client.e2e.test.ts public-docs/plugins/reference.md .github/workflows/internal-ci.yml
+      - name: Check launch and update behavior
+        working-directory: packages/server
+        run: |
+          npx vitest run src/server/agent/runtime-mcp-config.test.ts src/server/session/daemon/npm-global-cli.test.ts src/server/session/daemon/daemon-self-updater.test.ts
+          npx vitest run src/server/agent/agent-manager.test.ts
+          npx vitest run src/server/daemon-client.e2e.test.ts -t 'receives server_info on websocket connect'
+      - name: Build bundled web UI
+        run: npm run build:daemon-web-ui
+      - name: Pack release packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/paseo-release"
+          for package in highlight relay protocol client plugin server cli; do
+            npm pack --ignore-scripts --workspace="@getpaseo/$package" --pack-destination "$RUNNER_TEMP/paseo-release"
+          done
+          cd "$RUNNER_TEMP/paseo-release"
+          sha256sum *.tgz > SHA256SUMS
+          sha512sum *.tgz > SHA512SUMS
+          printf '%s\n' "$GITHUB_SHA" > SOURCE_COMMIT
+          node --version > NODE_VERSION
+      - name: Publish source-qualified release
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = internal/main
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/paseo-release/"* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes 'Source-built daemon packages. Package names and protocol remain compatible with the upstream release. Install all seven packages together; SHA256SUMS and SHA512SUMS bind the assets. SOURCE_COMMIT and NODE_VERSION retain build identity.'
