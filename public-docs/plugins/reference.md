@@ -575,8 +575,10 @@ Explicit Codex sandbox and approval options override its mode presets.
 
 HTTP and SSE MCP URLs and header values can contain `{agentId}` and `{key}`
 placeholders. Paseo substitutes the launching agent's ID and explicitly supplied
-launch environment values, including `env` returned by `agent.create` hooks,
-before passing configuration to any provider. The agent ID takes precedence.
+launch environment values, including `env` returned by `agent.create` and
+`agent.session_open` hooks, before passing configuration to any provider.
+Substitution runs after session-open hooks on create, resume, refresh and import.
+The agent ID takes precedence.
 Replacement is literal and single-pass; unknown placeholders remain unchanged.
 Stored configuration keeps its templates, and stdio servers are unchanged.
 Paseo does not read the daemon process environment for this substitution.
