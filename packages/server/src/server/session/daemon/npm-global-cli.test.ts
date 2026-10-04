@@ -71,7 +71,8 @@ describe("DefaultNpmGlobalPaseoCli", () => {
     await expect(cli.installLatest()).resolves.toEqual({
       exitCode: 1,
       stdout: "",
-      stderr: "This daemon is managed by its release installer. Update the installed release on the host.",
+      stderr:
+        "This daemon is managed by its release installer. Update the installed release on the host.",
     });
     expect(calls).toEqual([]);
   });
