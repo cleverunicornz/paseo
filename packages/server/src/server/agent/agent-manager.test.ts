@@ -50,7 +50,11 @@ import type {
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
-import { PluginHookHandlers, validateBeforeRequest, type PluginLifecycle } from "../plugins/lifecycle/index.js";
+import {
+  PluginHookHandlers,
+  validateBeforeRequest,
+  type PluginLifecycle,
+} from "../plugins/lifecycle/index.js";
 import { createPaseoApi } from "@getpaseo/client";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 
@@ -3072,7 +3076,9 @@ test.each(["claude", "codex", "acp", "nooa"])(
     }
     const client = new CaptureClient(provider);
     const hooks = new PluginHookHandlers(() => {});
-    const paseo = createPaseoApi(new DaemonClient({ url: "ws://127.0.0.1:1/ws", clientId: "launch-unit" }));
+    const paseo = createPaseoApi(
+      new DaemonClient({ url: "ws://127.0.0.1:1/ws", clientId: "launch-unit" }),
+    );
     hooks.before("agent.session_open", ({ request }) => ({
       ...request,
       env: { ...request.env, tenant: "example-$&-{agentId}", agentId: "wrong-agent" },
@@ -3080,19 +3086,33 @@ test.each(["claude", "codex", "acp", "nooa"])(
     const lifecycle: PluginLifecycle = {
       emit() {},
       async before(name, request) {
-        return validateBeforeRequest(name, await hooks.invoke("launch", "before", name, request, paseo));
+        return validateBeforeRequest(
+          name,
+          await hooks.invoke("launch", "before", name, request, paseo),
+        );
       },
     };
     const manager = new AgentManager({
-      clients: { [provider]: client }, registry: storage, logger, pluginLifecycle: lifecycle,
+      clients: { [provider]: client },
+      registry: storage,
+      logger,
+      pluginLifecycle: lifecycle,
     });
     const mcpServers = {
       remote: { type: "http" as const, url: "https://tools.example/{tenant}?agent={agentId}" },
-      stream: { type: "sse" as const, url: "https://tools.example/sse/{agentId}", headers: { "X-Tenant": "{tenant}" } },
+      stream: {
+        type: "sse" as const,
+        url: "https://tools.example/sse/{agentId}",
+        headers: { "X-Tenant": "{tenant}" },
+      },
       local: { type: "stdio" as const, command: "fixture", args: ["{agentId}"] },
     };
     try {
-      const created = await manager.createAgent({ provider, cwd: workdir, mcpServers }, undefined, {});
+      const created = await manager.createAgent(
+        { provider, cwd: workdir, mcpServers },
+        undefined,
+        {},
+      );
       await manager.reloadAgentSession(created.id);
       await manager.closeAgent(created.id);
       await manager.resumeAgentFromPersistence(
@@ -3103,8 +3123,15 @@ test.each(["claude", "codex", "acp", "nooa"])(
       expect(configs).toHaveLength(3);
       for (const config of configs) {
         expect(config.mcpServers).toEqual({
-          remote: { type: "http", url: `https://tools.example/example-$&-{agentId}?agent=${created.id}` },
-          stream: { type: "sse", url: `https://tools.example/sse/${created.id}`, headers: { "X-Tenant": "example-$&-{agentId}" } },
+          remote: {
+            type: "http",
+            url: `https://tools.example/example-$&-{agentId}?agent=${created.id}`,
+          },
+          stream: {
+            type: "sse",
+            url: `https://tools.example/sse/${created.id}`,
+            headers: { "X-Tenant": "example-$&-{agentId}" },
+          },
           local: mcpServers.local,
         });
       }
