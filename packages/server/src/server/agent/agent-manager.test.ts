@@ -3052,17 +3052,22 @@ test.each(["claude", "codex", "acp", "nooa"])(
     const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
     const storage = new AgentStorage(join(workdir, "agents"), logger);
     const configs: AgentSessionConfig[] = [];
+    class CaptureSession extends McpCapableTestAgentSession {
+      override describePersistence(): AgentPersistenceHandle {
+        return { provider, sessionId: this.id };
+      }
+    }
     class CaptureClient extends TestAgentClient {
       override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
         configs.push(config);
-        return new McpCapableTestAgentSession(config);
+        return new CaptureSession(config);
       }
       override async resumeSession(
         _handle: AgentPersistenceHandle,
         config: AgentSessionConfig,
       ): Promise<AgentSession> {
         configs.push(config);
-        return new McpCapableTestAgentSession(config);
+        return new CaptureSession(config);
       }
     }
     const client = new CaptureClient(provider);
