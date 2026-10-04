@@ -9,6 +9,44 @@ const BASE_CONFIG: AgentSessionConfig = {
 };
 
 describe("withRuntimePaseoMcpServer", () => {
+  test.each(["claude", "codex", "acp"])(
+    "substitutes HTTP and SSE URLs and headers for %s without changing stored templates",
+    (provider) => {
+      const config: AgentSessionConfig = {
+        ...BASE_CONFIG,
+        provider,
+        mcpServers: {
+          http: {
+            type: "http",
+            url: "https://tools.example/{tenant}/mcp?agent={agentId}&again={agentId}",
+            headers: { "X-Agent": "{agentId}", "X-Tenant": "{tenant}" },
+          },
+          sse: { type: "sse", url: "https://tools.example/{agentId}/{unknown}" },
+          stdio: { type: "stdio", command: "mcp", args: ["{agentId}"] },
+        },
+      };
+      const before = structuredClone(config);
+      const result = withRuntimePaseoMcpServer({
+        config,
+        agentId: "agent-1",
+        values: { tenant: "team-$&-{agentId}", agentId: "wrong-agent" },
+        mcpBaseUrl: null,
+        mcpAuthToken: null,
+      });
+
+      expect(result.mcpServers).toEqual({
+        http: {
+          type: "http",
+          url: "https://tools.example/team-$&-{agentId}/mcp?agent=agent-1&again=agent-1",
+          headers: { "X-Agent": "agent-1", "X-Tenant": "team-$&-{agentId}" },
+        },
+        sse: { type: "sse", url: "https://tools.example/agent-1/{unknown}" },
+        stdio: { type: "stdio", command: "mcp", args: ["{agentId}"] },
+      });
+      expect(config).toEqual(before);
+    },
+  );
+
   test("injects the paseo MCP server with a bearer header when a token is provided", () => {
     const result = withRuntimePaseoMcpServer({
       config: BASE_CONFIG,
