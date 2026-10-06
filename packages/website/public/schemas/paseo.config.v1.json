@@ -75,9 +75,13 @@
                     "backends": {
                       "type": "object",
                       "description": "Named MCP backends agents reach through the daemon at /mcp/backends/<name>.",
+                      "propertyNames": {
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                      },
                       "additionalProperties": {
                         "type": "string",
-                        "format": "uri"
+                        "format": "uri",
+                        "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://"
                       }
                     }
                   },

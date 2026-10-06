@@ -258,36 +258,61 @@ describe("MCP gateway", () => {
     expect(upstream.requests).toHaveLength(0);
   });
 
-  test("refuses dot segments and encoded separators that would climb out of the backend path", async () => {
+  // fetch() normalizes dot segments client-side, so these send raw request targets.
+  function rawStatus(gateway: string, target: string): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      const request = http.request(`${gateway}/cluster`, {
+        method: "POST",
+        path: `/mcp/backends/cluster${target}`,
+        headers: { Authorization: "Bearer token-a" },
+      });
+      request.on("response", (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+      request.on("error", reject);
+      request.end(MCP_INIT);
+    });
+  }
+
+  test.each([
+    ["a dot-dot segment", "/../admin"],
+    ["an encoded dot-dot segment", "/%2e%2e/admin"],
+    ["a double-encoded dot-dot segment", "/%252e%252e/admin"],
+    ["a triple-encoded dot-dot segment", "/%25252e%25252E/admin"],
+    ["an encoded dot segment", "/a/%2E/b"],
+    ["a double-encoded dot segment", "/a/%252E/b"],
+    ["an encoded slash", "/a%2fb"],
+    ["a double-encoded slash", "/%2e%2e%252fadmin"],
+    ["a triple-encoded slash", "/a%25252Fb"],
+    ["an encoded backslash", "/a%5c..%5cb"],
+    ["a double-encoded backslash", "/a%255cb"],
+    ["a literal backslash", "/a\\b"],
+    ["an empty leading segment", "//evil.example/mcp"],
+    ["an encoded leading double slash", "/%2F%2Fevil.example/mcp"],
+    ["a URL with a scheme", "/https://evil.example/mcp"],
+    ["an encoded URL with a scheme", "/https%3A%2F%2Fevil.example%2Fmcp"],
+    ["a double-encoded URL with a scheme", "/http%253A%252F%252Fevil.example"],
+    ["a scheme-only segment", "/javascript:alert"],
+    ["a URL with a scheme after other segments", "/x/http:%2f%2fevil.example"],
+    ["a malformed escape", "/a%zz"],
+    ["a double-encoded malformed escape", "/a%25zz"],
+    ["an invalid UTF-8 escape", "/a%E0%A4%A"],
+    ["an encoded control character", "/a%00b"],
+  ])("refuses a suffix with %s", async (_name, target) => {
     const upstream = await startUpstream();
     const gateway = await startGateway({ backends: { cluster: `${upstream.url}/mcp` } });
 
-    // fetch() normalizes dot segments client-side, so send raw request targets.
-    const rawStatus = (target: string) =>
-      new Promise<number>((resolve, reject) => {
-        const request = http.request(`${gateway}/cluster`, {
-          method: "POST",
-          path: `/mcp/backends/cluster${target}`,
-          headers: { Authorization: "Bearer token-a" },
-        });
-        request.on("response", (response) => {
-          response.resume();
-          resolve(response.statusCode ?? 0);
-        });
-        request.on("error", reject);
-        request.end(MCP_INIT);
-      });
-
-    for (const target of [
-      "/../admin",
-      "/%2e%2e/admin",
-      "/a/%2E/b",
-      "/%2e%2e%2fadmin",
-      "/a%5c..%5cb",
-    ]) {
-      expect(await rawStatus(target)).toBe(400);
-    }
+    expect(await rawStatus(gateway, target)).toBe(400);
     expect(upstream.requests).toHaveLength(0);
+  });
+
+  test("forwards an ordinary multi-segment suffix with encoded characters intact", async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({ backends: { cluster: `${upstream.url}/mcp` } });
+
+    expect(await rawStatus(gateway, "/messages/a%20b/v1.2")).toBe(200);
+    expect(upstream.requests.map((request) => request.url)).toEqual(["/mcp/messages/a%20b/v1.2"]);
   });
 
   test("forwards method, path suffix, query, body and MCP session headers both ways", async () => {

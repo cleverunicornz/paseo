@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -3459,6 +3459,71 @@ test("each agent launches with its own token, which closing the agent revokes", 
 
   rmSync(workdir, { recursive: true, force: true });
 });
+
+test.each(["claude", "codex", "acp"])(
+  "agent records on disk hold MCP templates, never resolved launch values, for %s",
+  async (provider) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+    const storagePath = join(workdir, "agents");
+    const storage = new AgentStorage(storagePath, logger);
+
+    // Providers describe persistence with the configuration they were launched
+    // with, which holds resolved MCP values.
+    class ResolvedMetadataSession extends McpCapableTestAgentSession {
+      override describePersistence(): AgentPersistenceHandle {
+        return { provider, sessionId: this.id, metadata: { ...this.config } };
+      }
+    }
+    class CaptureClient extends TestAgentClient {
+      override readonly capabilities = { ...TEST_CAPABILITIES, supportsMcpServers: true };
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        return new ResolvedMetadataSession(config);
+      }
+    }
+
+    const agentTokens = new AgentTokenRegistry();
+    const manager = new AgentManager({
+      clients: { [provider]: new CaptureClient() },
+      registry: storage,
+      logger,
+      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+      agentTokens,
+    });
+    manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+    const template = {
+      cluster: {
+        type: "http" as const,
+        url: "{paseoMcpGatewayUrl}/cluster",
+        headers: { Authorization: "Bearer {paseoAgentToken}", "X-Tenant": "{tenant}" },
+      },
+    };
+
+    try {
+      const snapshot = await manager.createAgent(
+        { provider, cwd: workdir, mcpServers: template },
+        undefined,
+        { workspaceId: undefined, env: { tenant: "tenant-secret-value" } },
+      );
+      await manager.flush();
+      const token = manager.issueAgentToken(snapshot.id);
+
+      const files = readdirSync(storagePath, { recursive: true, encoding: "utf8" })
+        .map((entry) => join(storagePath, entry))
+        .filter((file) => file.endsWith(".json"));
+      expect(files.length).toBeGreaterThan(0);
+      const written = files.map((file) => readFileSync(file, "utf8")).join("\n");
+      expect(written).not.toContain(token);
+      expect(written).not.toContain("tenant-secret-value");
+      expect(written).not.toContain("127.0.0.1:6767/mcp/backends");
+
+      const stored = await storage.get(snapshot.id);
+      expect(stored?.config?.mcpServers).toEqual(template);
+      expect(stored?.persistence?.metadata?.mcpServers).toEqual(template);
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("createAgent allows best-effort internal MCP when the provider session reports no support", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));

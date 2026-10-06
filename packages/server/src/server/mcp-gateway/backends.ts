@@ -3,6 +3,9 @@ export const MCP_GATEWAY_ROUTE = "/mcp/backends";
 /** Backend names are a single URL path segment the agent addresses. */
 export const MCP_GATEWAY_BACKEND_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+/** Backend URLs are absolute http or https URLs; the published config schema uses the same pattern. */
+export const MCP_GATEWAY_BACKEND_URL_PATTERN = /^[Hh][Tt][Tt][Pp][Ss]?:\/\//;
+
 /**
  * Validates a `{ name: url }` map of MCP gateway backends. `source` names the
  * config key or environment variable in the error so a bad value is easy to
@@ -38,6 +41,9 @@ export function parseMcpGatewayBackendsEnv(value: string, source: string): Recor
 }
 
 function isHttpUrl(value: string): boolean {
+  if (!MCP_GATEWAY_BACKEND_URL_PATTERN.test(value)) {
+    return false;
+  }
   try {
     const url = new URL(value);
     return url.protocol === "http:" || url.protocol === "https:";

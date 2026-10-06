@@ -57,11 +57,51 @@ function decodeSegment(segment: string): string | null {
   }
 }
 
+const MAX_DECODE_ROUNDS = 8;
+const URL_SCHEME_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+// oxlint-disable-next-line no-control-regex -- control characters are what this rejects.
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Decodes until the value stops changing, so every layer of percent-encoding
+ * is judged at once. Null when an escape is malformed or decoding never settles.
+ */
+function decodeCompletely(value: string): string | null {
+  let current = value;
+  for (let round = 0; round < MAX_DECODE_ROUNDS; round += 1) {
+    const next = decodeSegment(current);
+    if (next === null) return null;
+    if (next === current) return current;
+    current = next;
+  }
+  return null;
+}
+
+/**
+ * A suffix segment the backend sees as one plain path segment under its base
+ * path: it decodes cleanly at every layer, and its fully decoded form is not a
+ * dot segment, holds no separator or control character, and is not a URL.
+ * Empty segments (`//`) are allowed only as a trailing slash.
+ */
+function isPlainSuffixSegment(segment: string, isLast: boolean): boolean {
+  const decoded = decodeCompletely(segment);
+  if (decoded === null) return false;
+  if (decoded === "") return isLast;
+  return (
+    decoded !== "." &&
+    decoded !== ".." &&
+    !decoded.includes("/") &&
+    !decoded.includes("\\") &&
+    !CONTROL_CHARACTER_PATTERN.test(decoded) &&
+    !URL_SCHEME_PATTERN.test(decoded)
+  );
+}
+
 /**
  * Splits `/<backend>/<suffix>?<query>` (relative to the gateway mount). The
- * suffix stays percent-encoded for the backend, but no segment may decode to a
- * dot segment or contain a separator, so a caller cannot climb out of the
- * configured backend path.
+ * suffix stays percent-encoded for the backend, and every segment must be a
+ * plain path segment, so a request always stays under the configured backend
+ * path on the configured host.
  */
 function parseTarget(rawUrl: string): ParsedTarget {
   const queryIndex = rawUrl.indexOf("?");
@@ -72,17 +112,14 @@ function parseTarget(rawUrl: string): ParsedTarget {
   if (backend === null || !MCP_GATEWAY_BACKEND_NAME_PATTERN.test(backend)) {
     return { kind: "unknown" };
   }
-  for (const segment of rest) {
-    const decoded = decodeSegment(segment);
-    if (
-      decoded === null ||
-      decoded === "." ||
-      decoded === ".." ||
-      decoded.includes("/") ||
-      decoded.includes("\\")
-    ) {
-      return { kind: "invalid" };
-    }
+  if (pathname.includes("\\")) {
+    return { kind: "invalid" };
+  }
+  const plain = rest.every((segment, index) =>
+    isPlainSuffixSegment(segment, index === rest.length - 1),
+  );
+  if (!plain) {
+    return { kind: "invalid" };
   }
   return { kind: "backend", backend, suffix: rest.join("/"), search };
 }

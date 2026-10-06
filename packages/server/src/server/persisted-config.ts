@@ -13,6 +13,10 @@ import { AgentProfileSchema, AgentSkillSelectionSchema } from "@getpaseo/protoco
 import { PluginIdSchema, PluginSourceSchema } from "@getpaseo/protocol/plugin-config";
 import { TerminalProfileSchema } from "@getpaseo/protocol/terminal-profile";
 import { PaseoServicePortAllocationSchema } from "@getpaseo/protocol/paseo-config-schema";
+import {
+  MCP_GATEWAY_BACKEND_NAME_PATTERN,
+  MCP_GATEWAY_BACKEND_URL_PATTERN,
+} from "./mcp-gateway/backends.js";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
 export const LogFormatSchema = z.enum(["pretty", "json"]);
@@ -243,7 +247,12 @@ export const PersistedConfigSchema = z
             injectIntoAgents: z.boolean().optional(),
             gateway: z
               .object({
-                backends: z.record(z.string(), z.string()).optional(),
+                backends: z
+                  .record(
+                    z.string().regex(MCP_GATEWAY_BACKEND_NAME_PATTERN),
+                    z.string().regex(MCP_GATEWAY_BACKEND_URL_PATTERN),
+                  )
+                  .optional(),
               })
               .strict()
               .optional(),

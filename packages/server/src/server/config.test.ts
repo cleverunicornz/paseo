@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,6 +6,11 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { loadConfig, resolveBundledWebUiDistDir, resolveConfigFromPersisted } from "./config.js";
 import { loadPersistedConfig } from "./persisted-config.js";
+import {
+  MCP_GATEWAY_BACKEND_NAME_PATTERN,
+  MCP_GATEWAY_BACKEND_URL_PATTERN,
+  parseMcpGatewayBackends,
+} from "./mcp-gateway/backends.js";
 
 const roots: string[] = [];
 
@@ -189,6 +194,28 @@ describe("server config", () => {
     expect(() => loadConfig(paseoHome, { env: { PASEO_MCP_GATEWAY_BACKENDS: value } })).toThrow(
       "PASEO_MCP_GATEWAY_BACKENDS",
     );
+  });
+
+  test("the published config schema validates MCP gateway backends like startup does", async () => {
+    const schemaPath = path.resolve(
+      import.meta.dirname,
+      "../../../website/public/schemas/paseo.config.v1.json",
+    );
+    const schema = JSON.parse(await readFile(schemaPath, "utf8"));
+    const backends =
+      schema.definitions.PaseoConfigV1.properties.daemon.properties.mcp.properties.gateway
+        .properties.backends;
+
+    expect(backends.propertyNames.pattern).toBe(MCP_GATEWAY_BACKEND_NAME_PATTERN.source);
+    expect(new RegExp(backends.additionalProperties.pattern).source).toBe(
+      MCP_GATEWAY_BACKEND_URL_PATTERN.source,
+    );
+    expect(() => parseMcpGatewayBackends({ cluster: "http:cluster.example" }, "backends")).toThrow(
+      "http or https URL",
+    );
+    expect(parseMcpGatewayBackends({ "c.1_x-y": "HTTPS://cluster.example/mcp" }, "b")).toEqual({
+      "c.1_x-y": "HTTPS://cluster.example/mcp",
+    });
   });
 
   test("rejects a persisted MCP gateway backend that is not an http URL", async () => {
