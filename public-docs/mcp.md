@@ -166,10 +166,15 @@ attaches the credential the backend needs. Name the backend for each provider ID
 Keys are provider IDs, including custom providers that extend `claude` or `codex`. Each agent of a
 named provider launches against `<daemon>/mcp/backends/<backend>` with its own token:
 
-| Provider    | Launch                                                                                                                                                                                           |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Claude Code | `ANTHROPIC_BASE_URL` is the gateway URL and `ANTHROPIC_AUTH_TOKEN` the agent's token, sent as `Authorization: Bearer`. `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are removed.            |
-| Codex       | A `responses` model provider whose `base_url` is the gateway URL and whose `env_key` is `PASEO_MODEL_GATEWAY_TOKEN`, set to the agent's token. `OPENAI_API_KEY` and `CODEX_API_KEY` are removed. |
+| Provider    | Launch                                                                                                                                         |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | `ANTHROPIC_BASE_URL` is the gateway URL and `ANTHROPIC_AUTH_TOKEN` the agent's token, sent as `Authorization: Bearer`.                         |
+| Codex       | A `responses` model provider whose `base_url` is the gateway URL and whose `env_key` is `PASEO_MODEL_GATEWAY_TOKEN`, set to the agent's token. |
+
+Before setting these, Paseo removes every model-provider variable from the agent's environment,
+whichever provider it runs: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` and `CODEX_API_KEY`. Of the model
+variables, the agent's environment then holds only its own gateway values.
 
 Codex appends its API paths to `base_url`, so a Codex backend URL usually ends in `/v1`; Claude Code
 adds `/v1/...` itself. The provider uses HTTP and SSE; Codex WebSockets stay off. These values
