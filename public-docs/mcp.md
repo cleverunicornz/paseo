@@ -12,12 +12,13 @@ category: Orchestration
 
 ## Configuration
 
-| Setting                            | Default | Purpose                                                                                                             |
-| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
-| `daemon.mcp.enabled`               | `true`  | Run the MCP server.                                                                                                 |
-| `daemon.mcp.injectIntoAgents`      | `false` | Give agents launched by Paseo access to its tools.                                                                  |
-| `daemon.mcp.gateway.backends`      | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon)             |
-| `daemon.mcp.gateway.modelBackends` | `{}`    | Send a provider's model traffic through a gateway backend. [Model traffic](#send-model-traffic-through-the-gateway) |
+| Setting                             | Default | Purpose                                                                                                              |
+| ----------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `daemon.mcp.enabled`                | `true`  | Run the MCP server.                                                                                                  |
+| `daemon.mcp.injectIntoAgents`       | `false` | Give agents launched by Paseo access to its tools.                                                                   |
+| `daemon.mcp.gateway.backends`       | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon)              |
+| `daemon.mcp.gateway.modelBackends`  | `{}`    | Send a provider's model traffic through a gateway backend. [Model traffic](#send-model-traffic-through-the-gateway)  |
+| `daemon.mcp.gateway.envPassthrough` | `[]`    | Variables a gateway-enabled harness may inherit beyond the base set. [Harness environment](#the-harness-environment) |
 
 Depending on the provider, Paseo delivers tools through its native tool interface or MCP. The capabilities are the same. Start a new agent or reload an existing one after changing injection settings.
 
@@ -171,15 +172,45 @@ named provider launches against `<daemon>/mcp/backends/<backend>` with its own t
 | Claude Code | `ANTHROPIC_BASE_URL` is the gateway URL and `ANTHROPIC_AUTH_TOKEN` the agent's token, sent as `Authorization: Bearer`.                         |
 | Codex       | A `responses` model provider whose `base_url` is the gateway URL and whose `env_key` is `PASEO_MODEL_GATEWAY_TOKEN`, set to the agent's token. |
 
-Before setting these, Paseo removes every model-provider variable from the agent's environment,
-whichever provider it runs: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
-`CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` and `CODEX_API_KEY`. Of the model
-variables, the agent's environment then holds only its own gateway values.
+### The harness environment
+
+A gateway-enabled harness's environment is built, not inherited. It contains only:
+
+- the base variables, taken from the daemon's environment and the provider's runtime settings:
+  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, and on Windows
+  `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP` and
+  `TMP`;
+- the variables named in `daemon.mcp.gateway.envPassthrough`, from the same sources;
+- Paseo's launch values for the agent (`PASEO_AGENT_ID`, `PASEO_AGENT_CWD`, and `env` from the
+  create request and `agent.create`/`agent.session_open` hooks);
+- `NO_PROXY` and `no_proxy`, set to `127.0.0.1`, `localhost`, `::1` and the gateway host;
+- its gateway values from the table above.
+
+Model credentials, provider selectors and proxy variables never pass, from any source: names
+starting with `ANTHROPIC_`, `OPENAI_`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`,
+`CLOUD_ML_`, `VERTEX_`, `CLAUDE_CODE_USE_`, `CLAUDE_CODE_SKIP_`, `CLAUDE_CODE_OAUTH_`,
+`CLAUDE_CODE_API_KEY` or `CLAUDE_CODE_CLIENT_`, `CODEX_API_KEY`, and any name ending in `_PROXY`,
+in any case. Everything else the daemon or runtime settings hold is dropped. Claude Code also
+receives the variables the Claude Agent SDK sets for its own child, and a launch through the
+daemon's own executable adds `ELECTRON_RUN_AS_NODE`.
+
+Name what a deployment needs, such as tool configuration, in `envPassthrough`, or replace the list
+with `PASEO_MCP_GATEWAY_ENV_PASSTHROUGH` (a JSON array). Entries are variable names or prefixes
+ending in `*`:
+
+```json
+{
+  "daemon": { "mcp": { "gateway": { "envPassthrough": ["IS_SANDBOX", "CODEX_HOME", "MYTOOL_*"] } } }
+}
+```
+
+The daemon refuses to start with an entry that names, or as a prefix could match, a refused
+variable. Session directories that a deployment relocates (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`)
+reach the harness only through this list.
 
 Codex appends its API paths to `base_url`, so a Codex backend URL usually ends in `/v1`; Claude Code
-adds `/v1/...` itself. The provider uses HTTP and SSE; Codex WebSockets stay off. These values
-override runtime settings and `agent.session_open` hook values, and reach the provider only at
-launch: agent records never hold them, and the token is revoked when the agent closes. A launch
+adds `/v1/...` itself. The provider uses HTTP and SSE; Codex WebSockets stay off. The gateway
+values reach the provider only at launch: agent records never hold them, and the token is revoked when the agent closes. A launch
 fails when the provider cannot use the gateway (providers other than Claude Code and Codex) or the
 daemon does not listen on TCP.
 
