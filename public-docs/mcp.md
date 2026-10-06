@@ -78,7 +78,10 @@ that can access the host through a shell.
 The daemon can proxy an agent's MCP traffic to a named backend and tell the backend which agent is
 calling. Name the backends in `config.json`, or replace the whole set with the
 `PASEO_MCP_GATEWAY_BACKENDS` environment variable (a JSON object of the same shape). Each URL is a
-complete `http://` or `https://` URL with a valid host and no credentials or fragment:
+complete `http://` or `https://` URL with a valid host and no credentials or fragment. A host is
+an IPv4 address, a bracketed IPv6 address, or a DNS name whose labels hold only letters, digits and
+single hyphens between them, with a final label that starts with a letter. DNS names exclude
+underscores, internationalised (`xn--`) labels, trailing dots and consecutive hyphens:
 
 ```json
 {
