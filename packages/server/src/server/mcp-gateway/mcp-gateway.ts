@@ -106,9 +106,13 @@ function isPlainSuffixSegment(segment: string, isLast: boolean): boolean {
  * Splits `/<backend>/<suffix>?<query>` (relative to the gateway mount). The
  * suffix stays percent-encoded for the backend, and every segment must be a
  * plain path segment, so a request always stays under the configured backend
- * path on the configured host.
+ * path on the configured host. A target holding a literal `#` anywhere is
+ * invalid, whatever the backend name.
  */
 function parseTarget(rawUrl: string): ParsedTarget {
+  if (rawUrl.includes("#")) {
+    return { kind: "invalid" };
+  }
   const queryIndex = rawUrl.indexOf("?");
   const pathname = queryIndex < 0 ? rawUrl : rawUrl.slice(0, queryIndex);
   const search = queryIndex < 0 ? "" : rawUrl.slice(queryIndex + 1);
@@ -117,7 +121,7 @@ function parseTarget(rawUrl: string): ParsedTarget {
   if (backend === null || !MCP_GATEWAY_BACKEND_NAME_PATTERN.test(backend)) {
     return { kind: "unknown" };
   }
-  if (pathname.includes("\\") || rawUrl.includes("#")) {
+  if (pathname.includes("\\")) {
     return { kind: "invalid" };
   }
   const plain = rest.every((segment, index) =>
@@ -131,10 +135,13 @@ function parseTarget(rawUrl: string): ParsedTarget {
 
 /**
  * Joins the base URL, the validated suffix and both queries, and returns the
- * result only when it stays on the base origin, under the base path, with
- * exactly the joined query and no fragment.
+ * result only when no part holds a fragment marker and it stays on the base
+ * origin, under the base path, with exactly the joined query.
  */
 export function resolveUpstreamUrl(base: URL, suffix: string, search: string): URL | null {
+  if (suffix.includes("#") || search.includes("#") || base.href.includes("#")) {
+    return null;
+  }
   const basePath = base.pathname.replace(/\/$/, "");
   const path = suffix ? `${basePath}/${suffix}` : basePath || "/";
   const query = [base.search.replace(/^\?/, ""), search]

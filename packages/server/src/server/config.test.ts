@@ -231,6 +231,8 @@ describe("server config", () => {
     "http://-host",
     "http://host-",
     "http://host_name",
+    "http://xn--bcher-kva.example",
+    "http://a--b.example",
     "http://exa..mple",
     "http://host.",
     "http://[::g]",

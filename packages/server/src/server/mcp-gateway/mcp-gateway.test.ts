@@ -373,6 +373,53 @@ describe("MCP gateway", () => {
     expect(upstream.requests.map((request) => request.url)).toEqual(["/mcp/caf%C3%A9"]);
   });
 
+  // Raw request targets relative to the gateway mount, so a literal `#` can
+  // sit in the backend name, right after it, or in the suffix.
+  function rawGatewayStatus(gateway: string, target: string): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      const request = http.request(gateway, {
+        method: "POST",
+        path: `/mcp/backends${target}`,
+        headers: { Authorization: "Bearer token-a" },
+      });
+      request.on("response", (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+      request.on("error", reject);
+      request.end(MCP_INIT);
+    });
+  }
+
+  test.each([
+    ["inside the backend name", "/clus#ter"],
+    ["at the start of the backend name", "/#cluster"],
+    ["right after the backend name", "/cluster#f"],
+    ["right after the backend name and a slash", "/cluster/#f"],
+    ["in the suffix", "/cluster/messages#f"],
+    ["at the end of the suffix", "/cluster/messages#"],
+    ["in the query", "/cluster/messages?x=1#f"],
+    ["at the end of the query", "/cluster?x=1#"],
+    ["after an unknown backend name", "/other#f"],
+  ])(
+    "refuses a literal fragment marker %s with 400 before the hook runs or the backend is called",
+    async (_name, target) => {
+      const upstream = await startUpstream();
+      let hookCalls = 0;
+      const gateway = await startGateway({
+        backends: { cluster: `${upstream.url}/mcp` },
+        resolveUpstream: async (request) => {
+          hookCalls += 1;
+          return request;
+        },
+      });
+
+      expect(await rawGatewayStatus(gateway, target)).toBe(400);
+      expect(hookCalls).toBe(0);
+      expect(upstream.requests).toHaveLength(0);
+    },
+  );
+
   test("forwards an ordinary multi-segment suffix with encoded characters intact", async () => {
     const upstream = await startUpstream();
     const gateway = await startGateway({ backends: { cluster: `${upstream.url}/mcp` } });
@@ -663,5 +710,15 @@ describe("resolveUpstreamUrl", () => {
     ["a query-bearing suffix", "a?b"],
   ])("returns null for %s whose resolved path leaves the base path", (_name, suffix) => {
     expect(resolveUpstreamUrl(new URL("http://backend.example/mcp"), suffix, "")).toBeNull();
+  });
+  test.each([
+    ["an empty fragment marker in the suffix", "a#", ""],
+    ["a fragment marker alone as the suffix", "#", ""],
+    ["a fragment marker inside the suffix", "a#b/c", ""],
+    ["a query ending in a fragment marker", "a", "x=1#"],
+    ["a query holding a fragment", "a", "x=1#frag"],
+    ["a query that is only a fragment marker", "", "#"],
+  ])("returns null for %s", (_name, suffix, search) => {
+    expect(resolveUpstreamUrl(new URL("http://backend.example/mcp"), suffix, search)).toBeNull();
   });
 });
