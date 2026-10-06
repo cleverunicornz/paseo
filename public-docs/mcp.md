@@ -12,13 +12,13 @@ category: Orchestration
 
 ## Configuration
 
-| Setting                             | Default | Purpose                                                                                                              |
-| ----------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
-| `daemon.mcp.enabled`                | `true`  | Run the MCP server.                                                                                                  |
-| `daemon.mcp.injectIntoAgents`       | `false` | Give agents launched by Paseo access to its tools.                                                                   |
-| `daemon.mcp.gateway.backends`       | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon)              |
-| `daemon.mcp.gateway.modelBackends`  | `{}`    | Send a provider's model traffic through a gateway backend. [Model traffic](#send-model-traffic-through-the-gateway)  |
-| `daemon.mcp.gateway.envPassthrough` | `[]`    | Variables a gateway-enabled harness may inherit beyond the base set. [Harness environment](#the-harness-environment) |
+| Setting                             | Default | Purpose                                                                                                                   |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `daemon.mcp.enabled`                | `true`  | Run the MCP server.                                                                                                       |
+| `daemon.mcp.injectIntoAgents`       | `false` | Give agents launched by Paseo access to its tools.                                                                        |
+| `daemon.mcp.gateway.backends`       | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon)                   |
+| `daemon.mcp.gateway.modelBackends`  | `{}`    | Send a provider's model traffic through a gateway backend. [Model traffic](#send-model-traffic-through-the-gateway)       |
+| `daemon.mcp.gateway.envPassthrough` | `[]`    | Trusted variables a gateway-enabled harness inherits beyond the base set. [Harness environment](#the-harness-environment) |
 
 Depending on the provider, Paseo delivers tools through its native tool interface or MCP. The capabilities are the same. Start a new agent or reload an existing one after changing injection settings.
 
@@ -142,11 +142,17 @@ upstream with no `Authorization`. Unknown backend names get `404`, a missing or 
 
 ## Send model traffic through the gateway
 
-An agent can run with no model credential of its own: its harness calls the daemon's gateway with
-the agent's token, and a plugin's [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks)
-attaches the credential the backend needs. Name the backend for each provider ID in
-`daemon.mcp.gateway.modelBackends`, or replace the whole map with the
-`PASEO_MCP_GATEWAY_MODEL_BACKENDS` environment variable (a JSON object of the same shape):
+The gateway keeps three kinds of credential apart:
+
+| Credential           | Held by                                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------------------------ |
+| Provider credentials | The model proxy only (the subscription logins)                                                         |
+| The proxy client key | The daemon; a plugin's [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks) attaches it |
+| The per-agent token  | The agent; valid only at its own daemon                                                                |
+
+Name the backend for each provider ID in `daemon.mcp.gateway.modelBackends`, or replace the whole
+map with the `PASEO_MCP_GATEWAY_MODEL_BACKENDS` environment variable (a JSON object of the same
+shape):
 
 ```json
 {
@@ -165,54 +171,61 @@ attaches the credential the backend needs. Name the backend for each provider ID
 ```
 
 Keys are provider IDs, including custom providers that extend `claude` or `codex`. Each agent of a
-named provider launches against `<daemon>/mcp/backends/<backend>` with its own token:
+named provider launches against `<daemon>/mcp/backends/<backend>` with its per-agent token:
 
-| Provider    | Launch                                                                                                                                         |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code | `ANTHROPIC_BASE_URL` is the gateway URL and `ANTHROPIC_AUTH_TOKEN` the agent's token, sent as `Authorization: Bearer`.                         |
-| Codex       | A `responses` model provider whose `base_url` is the gateway URL and whose `env_key` is `PASEO_MODEL_GATEWAY_TOKEN`, set to the agent's token. |
+| Provider    | Launch                                                                                                                                           |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Claude Code | `ANTHROPIC_BASE_URL` is the gateway URL and `ANTHROPIC_AUTH_TOKEN` the per-agent token, sent as `Authorization: Bearer`.                         |
+| Codex       | A `responses` model provider whose `base_url` is the gateway URL and whose `env_key` is `PASEO_MODEL_GATEWAY_TOKEN`, set to the per-agent token. |
 
 ### The harness environment
 
-A gateway-enabled harness's environment is built, not inherited. It contains only:
+A gateway-enabled harness inherits nothing from the daemon's environment except the documented base variables. Launch values and configured pass-through are trusted configuration, passed as given apart from the refused names. Provider credentials are never inherited, and the per-agent token is valid only at the agent's own daemon.
 
-- the base variables, taken from the daemon's environment and the provider's runtime settings:
-  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, and on Windows
+The harness's environment consists of:
+
+- the base variables, from the daemon's environment and the provider's runtime settings: `PATH`,
+  `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, and on Windows
   `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP` and
   `TMP`;
-- the variables named in `daemon.mcp.gateway.envPassthrough`, from the same sources;
-- Paseo's launch values for the agent (`PASEO_AGENT_ID`, `PASEO_AGENT_CWD`, and `env` from the
-  create request and `agent.create`/`agent.session_open` hooks);
+- the configured pass-through, from the same sources;
+- launch values: `PASEO_AGENT_ID`, `PASEO_AGENT_CWD`, and `env` from the create request and
+  `agent.create`/`agent.session_open` hooks;
 - `NO_PROXY` and `no_proxy`, set to `127.0.0.1`, `localhost`, `::1` and the gateway host;
 - its gateway values from the table above.
 
-Model credentials, provider selectors and proxy variables never pass, from any source: names
-starting with `ANTHROPIC_`, `OPENAI_`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`,
-`CLOUD_ML_`, `VERTEX_`, `CLAUDE_CODE_USE_`, `CLAUDE_CODE_SKIP_`, `CLAUDE_CODE_OAUTH_`,
-`CLAUDE_CODE_API_KEY` or `CLAUDE_CODE_CLIENT_`, `CODEX_API_KEY`, and any name ending in `_PROXY`,
-in any case. Everything else the daemon or runtime settings hold is dropped. Claude Code also
-receives the variables the Claude Agent SDK sets for its own child, and a launch through the
-daemon's own executable adds `ELECTRON_RUN_AS_NODE`.
+Refused names never pass, from any source, in any case: names starting with `ANTHROPIC_`,
+`OPENAI_`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`, `CLOUD_ML_`, `VERTEX_`,
+`CLAUDE_CODE_USE_`, `CLAUDE_CODE_SKIP_`, `CLAUDE_CODE_OAUTH_`, `CLAUDE_CODE_API_KEY` or
+`CLAUDE_CODE_CLIENT_`, `CODEX_API_KEY`, and any name ending in `_PROXY`. Everything else in the
+daemon's environment or runtime settings is dropped. Claude Code also receives the variables the
+Claude Agent SDK sets for its own child, and a launch through the daemon's own executable adds
+`ELECTRON_RUN_AS_NODE`.
 
-Name what a deployment needs, such as tool configuration, in `envPassthrough`, or replace the list
-with `PASEO_MCP_GATEWAY_ENV_PASSTHROUGH` (a JSON array). Entries are variable names or prefixes
-ending in `*`:
+Launch values and the pass-through list are trusted configuration: the operator, plugins and the
+agent's creator set them, not the agent. Name what a deployment needs, such as tool configuration,
+in `daemon.mcp.gateway.envPassthrough`, or replace the list with
+`PASEO_MCP_GATEWAY_ENV_PASSTHROUGH` (a JSON array). Entries are variable names or prefixes ending
+in `*`:
 
 ```json
 {
-  "daemon": { "mcp": { "gateway": { "envPassthrough": ["IS_SANDBOX", "CODEX_HOME", "MYTOOL_*"] } } }
+  "daemon": { "mcp": { "gateway": { "envPassthrough": ["IS_SANDBOX", "MYTOOL_*"] } } }
 }
 ```
 
-The daemon refuses to start with an entry that names, or as a prefix could match, a refused
-variable. Session directories that a deployment relocates (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`)
-reach the harness only through this list.
+The daemon refuses to start with an entry that names, or as a prefix could match, a refused name,
+a prefix entry holding `_PROXY`, or a loader, Node-runtime, TLS-trust or harness
+configuration-location variable: `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`,
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. A deployment that needs one of
+these supplies it as a launch value. A name ending in `_PROXY` is dropped even when a broader prefix
+entry such as `TOOL_*` matches it.
 
 Codex appends its API paths to `base_url`, so a Codex backend URL usually ends in `/v1`; Claude Code
-adds `/v1/...` itself. The provider uses HTTP and SSE; Codex WebSockets stay off. The gateway
-values reach the provider only at launch: agent records never hold them, and the token is revoked when the agent closes. A launch
-fails when the provider cannot use the gateway (providers other than Claude Code and Codex) or the
-daemon does not listen on TCP.
+adds `/v1/...` itself. The provider uses HTTP and SSE; Codex WebSockets stay off. The gateway values
+reach the provider only at launch: agent records never hold them, and the per-agent token is revoked
+when the agent closes. A launch fails when the provider cannot use the gateway (providers other
+than Claude Code and Codex) or the daemon does not listen on TCP.
 
 ## Mental model
 
