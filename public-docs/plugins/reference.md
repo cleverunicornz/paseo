@@ -617,8 +617,7 @@ type PluginTurnOutcome =
 [MCP gateway](/docs/mcp#reach-mcp-backends-through-the-daemon). The identity fields come from the
 agent's daemon token. `url` is the configured backend URL, or `null` when the config does not name
 `backend`; set an `http` or `https` URL to serve a backend of your own. `headers` start empty and are
-added to the upstream request; `X-Paseo-*` names are ignored because Paseo sets the identity headers
-itself. Mint or cache the credential here:
+added to the upstream request; `X-Paseo-*` names are ignored; Paseo sets the identity headers itself. Mint or cache the credential here:
 
 ```ts
 server.before("mcp_gateway.upstream", async ({ request }, { signal }) => {

@@ -77,7 +77,8 @@ that can access the host through a shell.
 
 The daemon can proxy an agent's MCP traffic to a named backend and tell the backend which agent is
 calling. Name the backends in `config.json`, or replace the whole set with the
-`PASEO_MCP_GATEWAY_BACKENDS` environment variable (a JSON object of the same shape):
+`PASEO_MCP_GATEWAY_BACKENDS` environment variable (a JSON object of the same shape). Each URL is a
+complete `http://` or `https://` URL with a valid host and no credentials or fragment:
 
 ```json
 {
@@ -107,7 +108,8 @@ values. The gateway forwards every method except the CORS preflight: the daemon 
 through its CORS handling before the gateway authenticates anything. It forwards the path below the
 backend name, query, body and MCP session headers, and streams responses (including SSE) without
 buffering. Each path segment below the backend name must be a plain segment once fully
-percent-decoded: no dot segments, separators, control characters or URL schemes (`400` otherwise). It drops the
+percent-decoded: no dot segments, separators, `?` or `#`, control or format characters, or URL
+schemes (`400` otherwise). It drops the
 agent's `Authorization` and every `X-Paseo-*` header, then sets:
 
 | Header                 | Value                                            |
