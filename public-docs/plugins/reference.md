@@ -475,6 +475,28 @@ Turn ends: "out of credits"
 This sends a new message with the existing SDK. Persistent matches keep sending follow-ups;
 add limits or delays in your plugin when needed. Attachments and tool effects are not replayed.
 
+### Record every timeline item
+
+```ts
+server.on("agent.timeline_item", async (event) => {
+  await recorder.append({
+    agentId: event.agent.id,
+    sessionId: event.agent.sessionId,
+    labels: event.agent.labels,
+    epoch: event.epoch,
+    seq: event.seq,
+    item: event.item,
+  });
+});
+```
+
+The daemon emits one event per live timeline row it streams to its clients, once, in `seq` order.
+Rows loaded from provider history on resume or import are not delivered. Callbacks start in order
+but can overlap, so key records on `agent.id`, `epoch` and `seq` rather than arrival order. Delivery
+never waits for a callback and a failed delivery is not retried: a consumer that misses rows, or
+starts late, reads the agent's timeline from its last `seq` with the SDK. Internal utility agents
+emit nothing.
+
 ### Answer a permission request
 
 Using `shellCommand` from the same [helper file](https://github.com/getpaseo/paseo/blob/main/plugin-examples/lifecycle-actions/server/inspect.ts):
@@ -523,16 +545,17 @@ plans, and mode changes; requesting permission does not end the turn.
 
 ### Events
 
-| Name                         | Event fields                             | Trigger                                            |
-| ---------------------------- | ---------------------------------------- | -------------------------------------------------- |
-| `agent.created`              | `agent`                                  | Ordinary creation finishes; excludes import/resume |
-| `agent.turn_started`         | `agent`, `turnId`                        | Live turn starts                                   |
-| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, `timeline` | Live turn completes, fails, or is canceled         |
-| `agent.permission_requested` | `agent`, `request`                       | Permission or question becomes pending             |
-| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`       | Pending request is answered or cleared             |
-| `agent.archived`             | `agent`, `archivedAt`                    | Archive state is saved                             |
-| `workspace.created`          | `workspace`                              | Record created; directory available                |
-| `workspace.archived`         | `workspace`                              | Archive state is saved                             |
+| Name                         | Event fields                                           | Trigger                                            |
+| ---------------------------- | ------------------------------------------------------ | -------------------------------------------------- |
+| `agent.created`              | `agent`                                                | Ordinary creation finishes; excludes import/resume |
+| `agent.turn_started`         | `agent`, `turnId`                                      | Live turn starts                                   |
+| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, `timeline`               | Live turn completes, fails, or is canceled         |
+| `agent.timeline_item`        | `agent`, `item`, `seq`, `epoch`, `timestamp`, `turnId` | Live timeline row is recorded                      |
+| `agent.permission_requested` | `agent`, `request`                                     | Permission or question becomes pending             |
+| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`                     | Pending request is answered or cleared             |
+| `agent.archived`             | `agent`, `archivedAt`                                  | Archive state is saved                             |
+| `workspace.created`          | `workspace`                                            | Record created; directory available                |
+| `workspace.archived`         | `workspace`                                            | Archive state is saved                             |
 
 Agent events exclude internal utility agents. Archive events can precede runtime/worktree cleanup;
 `workspace.created` is not a setup barrier before agent startup.
@@ -547,6 +570,13 @@ interface PluginHookAgent {
   provider: string;
   cwd: string;
   title: string | null;
+}
+
+// agent.timeline_item's `agent`
+interface PluginTimelineItemAgent extends PluginHookAgent {
+  sessionId: string | null; // provider session (Claude session, Codex thread)
+  labels: Record<string, string>;
+  model: string | null;
 }
 
 interface PluginHookWorkspace {
@@ -567,6 +597,9 @@ type PluginTurnOutcome =
 | ------------ | ----------------------------------------------------------------------------------------------------- |
 | `turnId`     | Provider-reported `string` or `null`; can repeat after a session reopens                              |
 | `timeline`   | `readonly AgentTimelineItem[]`; complete snapshot including earlier conversation; text may span items |
+| `item`       | One `AgentTimelineItem`, after assistant and reasoning chunks are coalesced                           |
+| `seq`        | The row's timeline sequence number; increases by one per row within an `epoch`                        |
+| `epoch`      | The agent timeline's epoch; a new epoch restarts `seq`                                                |
 | `request`    | SDK `AgentPermissionRequest`; `kind` is `tool`, `plan`, `question`, `mode`, or `other`                |
 | `resolution` | SDK `AgentPermissionResponse`                                                                         |
 | `archivedAt` | Timestamp string                                                                                      |
@@ -671,11 +704,11 @@ saved; environment overrides are not persisted with it.
 
 ### Complete examples
 
-| Plugin                                                                                                 | Includes                                                                     |
-| ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| [lifecycle-logger](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-logger)       | All twelve hooks; JSON logs with environment and header values redacted      |
-| [lifecycle-actions](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-actions)     | Follow-ups, permissions, environment, provider switching, worktree selection |
-| [agent-configuration](https://github.com/getpaseo/paseo/tree/main/plugin-examples/agent-configuration) | MCP injection and Codex sandbox/approval options                             |
+| Plugin                                                                                                 | Includes                                                                                       |
+| ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| [lifecycle-logger](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-logger)       | Every hook except `agent.timeline_item`; JSON logs with environment and header values redacted |
+| [lifecycle-actions](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-actions)     | Follow-ups, permissions, environment, provider switching, worktree selection                   |
+| [agent-configuration](https://github.com/getpaseo/paseo/tree/main/plugin-examples/agent-configuration) | MCP injection and Codex sandbox/approval options                                               |
 
 Read logger output with `paseo plugin logs lifecycle-logger` or the host's `daemon.log`.
 

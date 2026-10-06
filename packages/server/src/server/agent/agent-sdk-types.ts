@@ -625,6 +625,18 @@ export interface AgentSessionConfig {
   internal?: boolean;
 }
 
+/**
+ * Where an agent's model client sends its traffic when the daemon routes model
+ * calls through its gateway: this daemon's `/mcp/backends/<backend>` URL and
+ * the agent's own per-agent token. The agent holds no model credential.
+ */
+export interface AgentModelGateway {
+  baseUrl: string;
+  token: string;
+  /** Configured names and `NAME_*` prefixes the harness may inherit beyond the base variables. */
+  envPassthrough: readonly string[];
+}
+
 export interface AgentLaunchContext {
   agentId?: string;
   env?: Record<string, string>;
@@ -633,6 +645,12 @@ export interface AgentLaunchContext {
    * AgentSessionConfig; providers may adapt it to their native tool surface.
    */
   paseoTools?: PaseoToolCatalog;
+  /**
+   * Runtime-only model gateway for this launch. Never persisted; a provider
+   * that receives it points its model client at the gateway and builds the
+   * harness environment with `buildModelGatewayEnv` instead of inheriting one.
+   */
+  modelGateway?: AgentModelGateway;
 }
 
 export interface AgentCreateSessionOptions {
@@ -743,6 +761,8 @@ export interface ResolveAgentDefaultModeInput {
 export interface AgentClient {
   readonly provider: AgentProvider;
   readonly capabilities: AgentCapabilityFlags;
+  /** The client honours `AgentLaunchContext.modelGateway`. */
+  readonly supportsModelGateway?: boolean;
   createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,

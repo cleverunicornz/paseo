@@ -493,6 +493,7 @@ function wrapClientProvider(
   return {
     provider,
     capabilities: inner.capabilities,
+    supportsModelGateway: inner.supportsModelGateway,
     createSession: async (config, launchContext) =>
       wrapSessionProvider(
         provider,

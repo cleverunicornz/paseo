@@ -31,6 +31,7 @@ import {
   type AgentResumeSessionOptions,
   type AgentFeature,
   type AgentLaunchContext,
+  type AgentModelGateway,
   type AgentSlashCommand,
   type AgentMode,
   type AgentPermissionRequest,
@@ -330,6 +331,14 @@ export interface AgentManagerOptions {
   mcpBaseUrl?: string;
   /** Shared with the daemon's HTTP routes, which resolve a caller from its token. */
   agentTokens?: AgentTokenRegistry;
+  /**
+   * The MCP gateway backend each provider's model traffic goes to, by provider
+   * id. Agents of a named provider launch against `<gateway>/<backend>` with
+   * their own token instead of a model credential.
+   */
+  mcpGatewayModelBackends?: Record<string, string>;
+  /** Names and `NAME_*` prefixes a gateway harness may inherit beyond the base variables. */
+  mcpGatewayEnvPassthrough?: readonly string[];
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
@@ -718,6 +727,18 @@ function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatc
   return patch;
 }
 
+interface ModelGatewaySettings {
+  backends: ReadonlyMap<string, string>;
+  envPassthrough: readonly string[];
+}
+
+function resolveModelGatewaySettings(options: AgentManagerOptions): ModelGatewaySettings {
+  return {
+    backends: new Map(Object.entries(options.mcpGatewayModelBackends ?? {})),
+    envPassthrough: [...(options.mcpGatewayEnvPassthrough ?? [])],
+  };
+}
+
 export class AgentManager {
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly clients = new Map<AgentProvider, AgentClient>();
@@ -745,6 +766,7 @@ export class AgentManager {
   private mcpBaseUrl: string | null;
   private mcpGatewayBaseUrl: string | null = null;
   private readonly agentTokens: AgentTokenRegistry;
+  private readonly modelGatewaySettings: ModelGatewaySettings;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -769,6 +791,7 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.agentTokens = options.agentTokens ?? new AgentTokenRegistry();
+    this.modelGatewaySettings = resolveModelGatewaySettings(options);
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
@@ -4042,11 +4065,16 @@ export class AgentManager {
         event.timestamp ? { timestamp: event.timestamp } : undefined,
       );
       if (broadcastTimeline) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.dispatchStream(
+          agent.id,
+          event,
+          {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          },
+          { fromHistory: true },
+        );
       }
     }
     this.touchUpdatedAt(agent);
@@ -4114,11 +4142,16 @@ export class AgentManager {
       if (deferredBroadcast) {
         timelineEvents.push({ event, row });
       } else if (broadcast) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.dispatchStream(
+          agent.id,
+          event,
+          {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          },
+          { fromHistory: true },
+        );
       }
     }
     agent.historyPrimed = true;
@@ -4130,11 +4163,16 @@ export class AgentManager {
       this.dispatch(event);
     }
     for (const { event, row } of timelineEvents) {
-      this.dispatchStream(agent.id, event, {
-        seq: row.seq,
-        epoch: this.timelineStore.getEpoch(agent.id),
-        timestamp: row.timestamp,
-      });
+      this.dispatchStream(
+        agent.id,
+        event,
+        {
+          seq: row.seq,
+          epoch: this.timelineStore.getEpoch(agent.id),
+          timestamp: row.timestamp,
+        },
+        { fromHistory: true },
+      );
     }
   }
 
@@ -4996,6 +5034,8 @@ export class AgentManager {
       epoch?: string;
       timestamp?: string;
     },
+    /** Rows replayed from provider history reach clients but trigger no live plugin hook. */
+    delivery?: { fromHistory?: boolean },
   ): void {
     if (event.type === "timeline") {
       event = {
@@ -5016,12 +5056,54 @@ export class AgentManager {
       "agent.manager.dispatch_stream",
     );
     this.dispatch({ type: "agent_stream", agentId, event, ...metadata });
-    if (this.pluginLifecycle && agent && !agent.internal && event.type !== "timeline") {
+    if (!this.pluginLifecycle || !agent || agent.internal) {
+      return;
+    }
+    if (event.type !== "timeline") {
       publishAgentStream(
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
         this.timelineStore.getItems(agentId),
+      );
+    } else if (metadata?.seq !== undefined && !delivery?.fromHistory) {
+      this.publishTimelineItem(this.pluginLifecycle, agent, event, {
+        seq: metadata.seq,
+        epoch: metadata.epoch ?? this.timelineStore.getEpoch(agentId),
+        timestamp: metadata.timestamp ?? new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Hands one recorded timeline row to plugins, exactly as clients received it.
+   * Plugin delivery is fire-and-forget: nothing here waits for a handler, and a
+   * delivery failure never reaches the agent's stream.
+   */
+  private publishTimelineItem(
+    lifecycle: PluginLifecycle,
+    agent: ManagedAgent,
+    event: Extract<AgentStreamEvent, { type: "timeline" }>,
+    row: { seq: number; epoch: string; timestamp: string },
+  ): void {
+    try {
+      lifecycle.emit("agent.timeline_item", {
+        agent: {
+          ...describeHookAgent({ ...agent, title: agent.config.title }),
+          sessionId: agent.persistence?.sessionId ?? agent.runtimeInfo?.sessionId ?? null,
+          labels: { ...agent.labels },
+          model: agent.runtimeInfo?.model ?? agent.config.model ?? null,
+        },
+        item: event.item,
+        seq: row.seq,
+        epoch: row.epoch,
+        timestamp: row.timestamp,
+        turnId: event.turnId ?? null,
+      });
+    } catch (error) {
+      this.logger.warn(
+        { err: error, agentId: agent.id, seq: row.seq },
+        "Failed to publish timeline item to plugins",
       );
     }
   }
@@ -5215,6 +5297,10 @@ export class AgentManager {
         PASEO_AGENT_CWD: cwd,
       },
     };
+    const modelGateway = this.resolveModelGateway(agentId, client);
+    if (modelGateway) {
+      context.modelGateway = modelGateway;
+    }
     if (
       this.paseoToolsEnabled &&
       isPaseoToolPolicyEnabled(paseoToolPolicy) &&
@@ -5227,6 +5313,33 @@ export class AgentManager {
       });
     }
     return context;
+  }
+
+  /**
+   * The gateway this agent's model client must use, when the daemon names a
+   * model backend for its provider. Launching fails rather than falling back
+   * to the provider's own credentials.
+   */
+  private resolveModelGateway(agentId: string, client: AgentClient): AgentModelGateway | undefined {
+    const backend = this.modelGatewaySettings.backends.get(client.provider);
+    if (!backend) {
+      return undefined;
+    }
+    if (!client.supportsModelGateway) {
+      throw new Error(
+        `Provider '${client.provider}' cannot send its model traffic through the model gateway`,
+      );
+    }
+    if (!this.mcpGatewayBaseUrl) {
+      throw new Error(
+        `Provider '${client.provider}' uses the model gateway, which needs the daemon to listen on TCP`,
+      );
+    }
+    return {
+      baseUrl: `${this.mcpGatewayBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(backend)}`,
+      token: this.agentTokens.issue(agentId),
+      envPassthrough: this.modelGatewaySettings.envPassthrough,
+    };
   }
 
   private resolveProviderLaunchConfig(

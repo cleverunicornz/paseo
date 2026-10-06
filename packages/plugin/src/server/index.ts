@@ -9,6 +9,8 @@ export type {
   PluginHookContext,
   PluginHookWorkspace,
   PluginHookAgent,
+  PluginTimelineItemAgent,
+  PluginTimelineItemEvent,
   PluginSessionOpenRequest,
   PluginMcpGatewayUpstreamRequest,
   PluginTurnOutcome,

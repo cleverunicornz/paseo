@@ -85,7 +85,7 @@ not retain non-Git directories.
 | `server/agent/tools/`           | Transport-neutral catalog for workspaces, agents, permissions, and automation  |
 | `server/agent/mcp-server.ts`    | Thin MCP adapter that registers the Paseo tool catalog with the MCP SDK        |
 | `server/agent/agent-tokens.ts`  | Per-agent tokens; the only source of caller identity on daemon MCP routes      |
-| `server/mcp-gateway/`           | Proxies agent MCP traffic to named backends with daemon-set identity headers   |
+| `server/mcp-gateway/`           | Proxies agent MCP and model traffic to named backends with daemon-set identity |
 | `server/agent/providers/`       | Provider adapters (see "Agent providers" below)                                |
 | `server/orchestration-skills/`  | Bundled catalog, host selection, convergence, and skill-directory transactions |
 | `server/relay-transport.ts`     | Outbound relay connection with E2E encryption                                  |
@@ -446,13 +446,15 @@ All providers:
 
 Providers that can accept native tool definitions should set `supportsNativePaseoTools` and read `launchContext.paseoTools`. The daemon then passes the shared Paseo tool catalog directly and removes the internal Paseo MCP server from that provider launch config. Providers that only support MCP continue to receive the same tools through the MCP fallback at `/mcp/agents`, authenticated by the agent's own token. The trust properties of those tokens and of the `/mcp/backends` gateway are in [SECURITY.md](../SECURITY.md#agent-identity-and-the-mcp-gateway).
 
+Providers whose harness can point its model client at another endpoint set `supportsModelGateway` and read `launchContext.modelGateway` (the gateway URL for the configured backend and the agent's token). Like `paseoTools`, it is runtime-only: it reaches the provider at launch and never enters `AgentSessionConfig` or agent records. The provider builds the harness environment from it with `buildModelGatewayEnv` (`server/agent/model-gateway-env.ts`) and launches with exactly that environment, never overlaying it on the daemon's, so provider credentials are never inherited. The property and its trust boundaries are in [SECURITY.md](../SECURITY.md#agent-identity-and-the-mcp-gateway). The daemon fails the launch when a provider named in `daemon.mcp.gateway.modelBackends` lacks support. Per-provider launch details are in [public-docs/mcp.md](../public-docs/mcp.md#send-model-traffic-through-the-gateway).
+
 ## Data flow: running an agent
 
 1. Client sends `CreateAgentRequestMessage` with config (prompt, cwd, provider, model, mode)
 2. Session routes to `AgentManager.create()`
 3. AgentManager creates a `ManagedAgent`, initializes provider session
 4. Provider runs the agent → emits `AgentStreamEvent` items
-5. Events append to the agent timeline, broadcast to all subscribed clients
+5. Events append to the agent timeline, broadcast to all subscribed clients. Assistant and reasoning chunks coalesce before a row gets its `seq`; `AgentManager.dispatchStream` then hands each live row to plugins as `agent.timeline_item` without waiting, so a slow plugin never delays the agent. Rows replayed from provider history skip the hook.
 6. Tool calls are normalized to `ToolCallDetail` (shell, read, edit, write, search, etc.)
 7. Permission requests flow: agent → server → client → user decision → server → agent
 

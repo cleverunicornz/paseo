@@ -10,6 +10,7 @@ import {
   type McpGatewayAgent,
   type McpGatewayUpstreamRequest,
 } from "./mcp-gateway.js";
+import type { McpGatewayBackend } from "./backends.js";
 
 interface RecordedRequest {
   method: string;
@@ -85,7 +86,7 @@ const AGENTS: Record<string, McpGatewayAgent> = {
 };
 
 interface GatewayOptions {
-  backends: Record<string, string>;
+  backends: Record<string, string | McpGatewayBackend>;
   resolveUpstream?: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   responseTimeoutMs?: number;
 }
@@ -95,7 +96,13 @@ async function startGateway(options: GatewayOptions): Promise<string> {
   app.use(
     "/mcp/backends",
     createMcpGatewayHandler({
-      getBackends: () => new Map(Object.entries(options.backends)),
+      getBackends: () =>
+        new Map(
+          Object.entries(options.backends).map(([name, backend]) => [
+            name,
+            typeof backend === "string" ? { url: backend } : backend,
+          ]),
+        ),
       resolveAgent: (token) => (token ? (AGENTS[token] ?? null) : null),
       serverId: "server-1",
       resolveUpstream: options.resolveUpstream ?? (async (request) => request),
@@ -128,6 +135,16 @@ function echoChunksAsTheyArrive(received: string[], onChunk: () => void): http.R
       res.writeHead(200, { "content-type": "text/plain" });
       res.end(received.join(""));
     });
+  };
+}
+
+/** An upstream that sends its response headers and body only after `delayMs`. */
+function answerAfter(delayMs: number, body: string): UpstreamHandler {
+  return (_req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(body);
+    }, delayMs);
   };
 }
 
@@ -604,6 +621,55 @@ describe("MCP gateway", () => {
 
     expect(response.status).toBe(504);
     expect(await response.json()).toEqual({ error: "MCP backend cluster did not answer" });
+  });
+
+  test("a backend's own response timeout answers 504 after that time, not the default", async () => {
+    const upstream = await startUpstream(() => {
+      // No response.
+    });
+    // No gateway-wide timeout: the default would wait 30 s.
+    const gateway = await startGateway({
+      backends: { models: { url: upstream.url, responseTimeoutMs: 150 } },
+    });
+
+    const startedAt = Date.now();
+    const response = await fetch(`${gateway}/models/v1/responses/compact`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: "{}",
+    });
+    const elapsed = Date.now() - startedAt;
+
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({ error: "MCP backend models did not answer" });
+    expect(elapsed).toBeGreaterThanOrEqual(140);
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  test("a backend's own response timeout lets a slow first byte through past the default", async () => {
+    const upstream = await startUpstream(answerAfter(400, '{"compacted":true}'));
+    const gateway = await startGateway({
+      backends: {
+        models: { url: upstream.url, responseTimeoutMs: 5_000 },
+        cluster: upstream.url,
+      },
+      responseTimeoutMs: 100,
+    });
+
+    const slow = await fetch(`${gateway}/models/v1/responses/compact`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: "{}",
+    });
+    const defaulted = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: MCP_INIT,
+    });
+
+    expect(slow.status).toBe(200);
+    expect(await slow.json()).toEqual({ compacted: true });
+    expect(defaulted.status).toBe(504);
   });
 
   test("the upstream hook's headers reach the backend; identity headers stay the daemon's", async () => {

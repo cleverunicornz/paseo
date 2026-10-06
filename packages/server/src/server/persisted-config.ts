@@ -16,7 +16,14 @@ import { PaseoServicePortAllocationSchema } from "@getpaseo/protocol/paseo-confi
 import {
   MCP_GATEWAY_BACKEND_NAME_PATTERN,
   MCP_GATEWAY_BACKEND_URL_PATTERN,
+  MCP_GATEWAY_MODEL_PROVIDER_PATTERN,
+  MCP_GATEWAY_RESPONSE_TIMEOUT_MAX_MS,
+  MCP_GATEWAY_RESPONSE_TIMEOUT_MIN_MS,
 } from "./mcp-gateway/backends.js";
+import {
+  MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE,
+  isAcceptedEnvPassthroughEntry,
+} from "./agent/model-gateway-env.js";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
 export const LogFormatSchema = z.enum(["pretty", "json"]);
@@ -250,7 +257,36 @@ export const PersistedConfigSchema = z
                 backends: z
                   .record(
                     z.string().regex(MCP_GATEWAY_BACKEND_NAME_PATTERN),
-                    z.string().regex(MCP_GATEWAY_BACKEND_URL_PATTERN),
+                    z.union([
+                      z.string().regex(MCP_GATEWAY_BACKEND_URL_PATTERN),
+                      z
+                        .object({
+                          url: z.string().regex(MCP_GATEWAY_BACKEND_URL_PATTERN),
+                          responseTimeoutMs: z
+                            .number()
+                            .int()
+                            .min(MCP_GATEWAY_RESPONSE_TIMEOUT_MIN_MS)
+                            .max(MCP_GATEWAY_RESPONSE_TIMEOUT_MAX_MS)
+                            .optional(),
+                        })
+                        .strict(),
+                    ]),
+                  )
+                  .optional(),
+                modelBackends: z
+                  .record(
+                    z.string().regex(MCP_GATEWAY_MODEL_PROVIDER_PATTERN),
+                    z.string().regex(MCP_GATEWAY_BACKEND_NAME_PATTERN),
+                  )
+                  .optional(),
+                envPassthrough: z
+                  .array(
+                    z
+                      .string()
+                      .regex(new RegExp(MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE))
+                      .refine(isAcceptedEnvPassthroughEntry, {
+                        message: "names model credentials or proxy variables",
+                      }),
                   )
                   .optional(),
               })

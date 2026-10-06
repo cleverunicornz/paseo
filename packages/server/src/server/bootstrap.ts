@@ -134,7 +134,7 @@ import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import { AgentTokenRegistry } from "./agent/agent-tokens.js";
 import { createMcpGatewayHandler } from "./mcp-gateway/mcp-gateway.js";
-import { MCP_GATEWAY_ROUTE } from "./mcp-gateway/backends.js";
+import { MCP_GATEWAY_ROUTE, type McpGatewayBackend } from "./mcp-gateway/backends.js";
 import {
   createPaseoToolCatalog,
   type PaseoToolHostDependencies,
@@ -411,7 +411,11 @@ export interface PaseoDaemonConfig {
   mcpEnabled?: boolean;
   mcpInjectIntoAgents?: boolean;
   /** Named MCP backends agents reach through `/mcp/backends/<name>`. */
-  mcpGatewayBackends?: Record<string, string>;
+  mcpGatewayBackends?: Record<string, McpGatewayBackend>;
+  /** The gateway backend each provider's model traffic goes to, by provider id. */
+  mcpGatewayModelBackends?: Record<string, string>;
+  /** Names and `NAME_*` prefixes a gateway harness may inherit beyond the base variables. */
+  mcpGatewayEnvPassthrough?: string[];
   browserToolsEnabled?: boolean;
   git?: {
     maxProcessesPerSecond: number;
@@ -957,11 +961,13 @@ export async function createPaseoDaemon(
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
     agentTokens,
+    mcpGatewayModelBackends: config.mcpGatewayModelBackends,
+    mcpGatewayEnvPassthrough: config.mcpGatewayEnvPassthrough,
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
   });
-  const mcpGatewayBackends: ReadonlyMap<string, string> = new Map(
+  const mcpGatewayBackends: ReadonlyMap<string, McpGatewayBackend> = new Map(
     Object.entries(config.mcpGatewayBackends ?? {}),
   );
   mcpGatewayRouter.use(

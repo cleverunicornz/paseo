@@ -9,8 +9,15 @@ import { loadPersistedConfig, PersistedConfigSchema } from "./persisted-config.j
 import {
   isMcpGatewayBackendUrl,
   MCP_GATEWAY_BACKEND_NAME_PATTERN,
+  MCP_GATEWAY_MODEL_PROVIDER_PATTERN,
   parseMcpGatewayBackends,
+  parseMcpGatewayModelBackends,
 } from "./mcp-gateway/backends.js";
+import {
+  MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE,
+  MCP_GATEWAY_REFUSED_ENV_PASSTHROUGH_PATTERN_SOURCE,
+  parseMcpGatewayEnvPassthrough,
+} from "./agent/model-gateway-env.js";
 
 const roots: string[] = [];
 
@@ -174,12 +181,156 @@ describe("server config", () => {
       env: { PASEO_MCP_GATEWAY_BACKENDS: '{"docs":"http://127.0.0.1:9000/mcp"}' },
     });
 
-    expect(fromFile.mcpGatewayBackends).toEqual({ cluster: "https://cluster-mcp.example/mcp" });
+    expect(fromFile.mcpGatewayBackends).toEqual({
+      cluster: { url: "https://cluster-mcp.example/mcp" },
+    });
     expect(fromFile.configReload?.overrideControlledPaths).not.toContain(
       "daemon.mcp.gateway.backends",
     );
-    expect(fromEnv.mcpGatewayBackends).toEqual({ docs: "http://127.0.0.1:9000/mcp" });
+    expect(fromEnv.mcpGatewayBackends).toEqual({ docs: { url: "http://127.0.0.1:9000/mcp" } });
     expect(fromEnv.configReload?.overrideControlledPaths).toContain("daemon.mcp.gateway.backends");
+  });
+
+  test("loads a backend's own response-header timeout from config and the environment", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-timeout-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: {
+          mcp: {
+            gateway: {
+              backends: {
+                cluster: "https://cluster-mcp.example/mcp",
+                models: { url: "https://models.example/v1", responseTimeoutMs: 600_000 },
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    const fromEnv = loadConfig(paseoHome, {
+      env: {
+        PASEO_MCP_GATEWAY_BACKENDS:
+          '{"models":{"url":"http://127.0.0.1:9000/v1","responseTimeoutMs":300000}}',
+      },
+    });
+
+    expect(fromFile.mcpGatewayBackends).toEqual({
+      cluster: { url: "https://cluster-mcp.example/mcp" },
+      models: { url: "https://models.example/v1", responseTimeoutMs: 600_000 },
+    });
+    expect(fromEnv.mcpGatewayBackends).toEqual({
+      models: { url: "http://127.0.0.1:9000/v1", responseTimeoutMs: 300_000 },
+    });
+  });
+
+  test("loads the model gateway backends per provider and lets the environment replace them", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-model-gateway-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: {
+          mcp: { gateway: { modelBackends: { claude: "anthropic", codex: "openai" } } },
+        },
+      }),
+    );
+
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    const fromEnv = loadConfig(paseoHome, {
+      env: { PASEO_MCP_GATEWAY_MODEL_BACKENDS: '{"claude-work":"anthropic"}' },
+    });
+    const absent = loadConfig(await mkdtemp(path.join(os.tmpdir(), "paseo-config-none-")), {
+      env: {},
+    });
+
+    expect(fromFile.mcpGatewayModelBackends).toEqual({ claude: "anthropic", codex: "openai" });
+    expect(fromFile.configReload?.overrideControlledPaths).not.toContain(
+      "daemon.mcp.gateway.modelBackends",
+    );
+    expect(fromEnv.mcpGatewayModelBackends).toEqual({ "claude-work": "anthropic" });
+    expect(fromEnv.configReload?.overrideControlledPaths).toContain(
+      "daemon.mcp.gateway.modelBackends",
+    );
+    expect(absent.mcpGatewayModelBackends).toEqual({});
+  });
+
+  test("loads the gateway environment pass-through list and lets the environment replace it", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-env-passthrough-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: { mcp: { gateway: { envPassthrough: ["TOOL_SETTING", "TOOLKIT_*"] } } },
+      }),
+    );
+
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    const fromEnv = loadConfig(paseoHome, {
+      env: { PASEO_MCP_GATEWAY_ENV_PASSTHROUGH: '["IS_SANDBOX"]' },
+    });
+    const absent = loadConfig(await mkdtemp(path.join(os.tmpdir(), "paseo-config-none-")), {
+      env: {},
+    });
+
+    expect(fromFile.mcpGatewayEnvPassthrough).toEqual(["TOOL_SETTING", "TOOLKIT_*"]);
+    expect(fromFile.configReload?.overrideControlledPaths).not.toContain(
+      "daemon.mcp.gateway.envPassthrough",
+    );
+    expect(fromEnv.mcpGatewayEnvPassthrough).toEqual(["IS_SANDBOX"]);
+    expect(fromEnv.configReload?.overrideControlledPaths).toContain(
+      "daemon.mcp.gateway.envPassthrough",
+    );
+    expect(absent.mcpGatewayEnvPassthrough).toEqual([]);
+  });
+
+  test.each([
+    ["non-JSON", "TOOL_SETTING"],
+    ["a non-array", '{"TOOL_SETTING":true}'],
+    ["a model credential", '["ANTHROPIC_API_KEY"]'],
+    ["a proxy variable", '["https_proxy"]'],
+    ["a prefix holding _PROXY", '["X_PROXY*"]'],
+    ["a loader variable", '["LD_PRELOAD"]'],
+    ["a harness config location", '["CODEX_HOME"]'],
+  ])("rejects %s PASEO_MCP_GATEWAY_ENV_PASSTHROUGH", async (_name, value) => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-env-passthrough-bad-"));
+    roots.push(paseoHome);
+
+    expect(() =>
+      loadConfig(paseoHome, { env: { PASEO_MCP_GATEWAY_ENV_PASSTHROUGH: value } }),
+    ).toThrow("PASEO_MCP_GATEWAY_ENV_PASSTHROUGH");
+  });
+
+  test("refuses a persisted pass-through entry naming a model credential", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-env-passthrough-file-"));
+    roots.push(paseoHome);
+    const persisted = loadPersistedConfig(paseoHome);
+
+    expect(() =>
+      resolveConfigFromPersisted(
+        paseoHome,
+        { ...persisted, daemon: { mcp: { gateway: { envPassthrough: ["AWS_*"] } } } },
+        { env: {} },
+      ),
+    ).toThrow("daemon.mcp.gateway.envPassthrough");
+  });
+
+  test.each([
+    ["non-JSON", "claude=anthropic"],
+    ["a non-object", '["anthropic"]'],
+    ["an invalid provider id", '{"Claude":"anthropic"}'],
+    ["an invalid backend name", '{"claude":"a/b"}'],
+    ["a non-string backend", '{"claude":{"url":"http://x"}}'],
+  ])("rejects %s PASEO_MCP_GATEWAY_MODEL_BACKENDS", async (_name, value) => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-model-gateway-bad-"));
+    roots.push(paseoHome);
+
+    expect(() =>
+      loadConfig(paseoHome, { env: { PASEO_MCP_GATEWAY_MODEL_BACKENDS: value } }),
+    ).toThrow("PASEO_MCP_GATEWAY_MODEL_BACKENDS");
   });
 
   test.each([
@@ -187,6 +338,9 @@ describe("server config", () => {
     ["a non-object", '["https://x"]'],
     ["a non-http URL", '{"cluster":"file:///etc/passwd"}'],
     ["an invalid backend name", '{"a/b":"https://x"}'],
+    ["a backend object without a URL", '{"cluster":{"responseTimeoutMs":1000}}'],
+    ["a backend object with an unknown key", '{"cluster":{"url":"https://x","timeout":1}}'],
+    ["a zero response timeout", '{"cluster":{"url":"https://x","responseTimeoutMs":0}}'],
   ])("rejects %s PASEO_MCP_GATEWAY_BACKENDS", async (_name, value) => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-bad-"));
     roots.push(paseoHome);
@@ -243,25 +397,35 @@ describe("server config", () => {
     "http://host/a b",
   ];
 
-  async function readPublishedBackendSchema() {
+  async function readPublishedGatewaySchema() {
     const schemaPath = path.resolve(
       import.meta.dirname,
       "../../../website/public/schemas/paseo.config.v1.json",
     );
     const schema = JSON.parse(await readFile(schemaPath, "utf8"));
     return schema.definitions.PaseoConfigV1.properties.daemon.properties.mcp.properties.gateway
-      .properties.backends;
+      .properties;
   }
 
-  function persistedSchemaAccepts(url: string): boolean {
+  async function readPublishedBackendSchema() {
+    return (await readPublishedGatewaySchema()).backends;
+  }
+
+  /** The published plain-URL form and the object form's `url` carry one pattern. */
+  async function readPublishedBackendUrlPatterns(): Promise<RegExp[]> {
+    const [plain, object] = (await readPublishedBackendSchema()).additionalProperties.anyOf;
+    return [new RegExp(plain.pattern), new RegExp(object.properties.url.pattern)];
+  }
+
+  function persistedSchemaAccepts(backend: unknown): boolean {
     return PersistedConfigSchema.safeParse({
-      daemon: { mcp: { gateway: { backends: { cluster: url } } } },
+      daemon: { mcp: { gateway: { backends: { cluster: backend } } } },
     }).success;
   }
 
-  function startupAccepts(url: string): boolean {
+  function startupAccepts(backend: unknown): boolean {
     try {
-      parseMcpGatewayBackends({ cluster: url }, "backends");
+      parseMcpGatewayBackends({ cluster: backend }, "backends");
       return true;
     } catch {
       return false;
@@ -274,13 +438,187 @@ describe("server config", () => {
   ])(
     "startup, the persisted schema and the published schema agree on backend URL %j (%s)",
     async (url, valid) => {
-      const published = await readPublishedBackendSchema();
+      const publishedPatterns = await readPublishedBackendUrlPatterns();
       expect(isMcpGatewayBackendUrl(url)).toBe(valid);
       expect(startupAccepts(url)).toBe(valid);
       expect(persistedSchemaAccepts(url)).toBe(valid);
-      expect(new RegExp(published.additionalProperties.pattern).test(url)).toBe(valid);
+      expect(startupAccepts({ url })).toBe(valid);
+      expect(persistedSchemaAccepts({ url })).toBe(valid);
+      for (const pattern of publishedPatterns) {
+        expect(pattern.test(url)).toBe(valid);
+      }
     },
   );
+
+  test.each([
+    [1, true],
+    [30_000, true],
+    [600_000, true],
+    [3_600_000, true],
+    [0, false],
+    [-1, false],
+    [1.5, false],
+    [3_600_001, false],
+    ["1000", false],
+    [null, false],
+  ] as const)(
+    "startup, the persisted schema and the published schema agree on responseTimeoutMs %j (%s)",
+    async (responseTimeoutMs, valid) => {
+      const backend = { url: "https://models.example/v1", responseTimeoutMs };
+      const published = (await readPublishedBackendSchema()).additionalProperties.anyOf[1]
+        .properties.responseTimeoutMs;
+      const publishedAccepts =
+        Number.isInteger(responseTimeoutMs) &&
+        published.type === "integer" &&
+        (responseTimeoutMs as number) >= published.minimum &&
+        (responseTimeoutMs as number) <= published.maximum;
+      expect(startupAccepts(backend)).toBe(valid);
+      expect(persistedSchemaAccepts(backend)).toBe(valid);
+      expect(publishedAccepts).toBe(valid);
+    },
+  );
+
+  const ACCEPTED_PASSTHROUGH = [
+    "TOOL_SETTING",
+    "TOOLKIT_*",
+    "IS_SANDBOX",
+    "LC_ALL",
+    "_PRIVATE",
+    "PROXYISH_SETTING",
+    "NODE_ENV",
+    "LDAP_SERVER",
+    "LDAP_*",
+  ];
+  const REFUSED_PASSTHROUGH = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_*",
+    "anthropic_api_key",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_*",
+    "CLAUDE_*",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_API_KEY",
+    "CODEX_*",
+    "AWS_PROFILE",
+    "AWS_*",
+    "A*",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CONFIG",
+    "CLOUD_ML_REGION",
+    "VERTEX_REGION_CLAUDE",
+    "AZURE_CLIENT_SECRET",
+    "HTTP_PROXY",
+    "http_proxy",
+    "Http_Proxy",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "no_proxy",
+    "FTP_PROXY",
+    "CORP_PROXY",
+    "HTTP*",
+    "N*",
+    "ANTHROPIC*",
+    "X_PROXY*",
+    "x_proxy_*",
+    "TOOL_PROXY*",
+    "LD*",
+    "LD_*",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "ld_preload",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_*",
+    "NODE_OPTIONS",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_*",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SSL*",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "",
+    "*",
+    "1BAD",
+    "BAD-NAME",
+    "TOOL_*_X",
+  ];
+
+  test.each([
+    ...ACCEPTED_PASSTHROUGH.map((entry) => [entry, true] as const),
+    ...REFUSED_PASSTHROUGH.map((entry) => [entry, false] as const),
+  ])(
+    "startup, the persisted schema and the published schema agree on pass-through entry %j (%s)",
+    async (entry, valid) => {
+      const published = (await readPublishedGatewaySchema()).envPassthrough.items;
+      const startup = (() => {
+        try {
+          parseMcpGatewayEnvPassthrough([entry], "envPassthrough");
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      expect(startup).toBe(valid);
+      expect(
+        PersistedConfigSchema.safeParse({
+          daemon: { mcp: { gateway: { envPassthrough: [entry] } } },
+        }).success,
+      ).toBe(valid);
+      expect(
+        new RegExp(published.pattern).test(entry) && !new RegExp(published.not.pattern).test(entry),
+      ).toBe(valid);
+    },
+  );
+
+  test("the published pass-through patterns are the daemon's own", async () => {
+    const published = (await readPublishedGatewaySchema()).envPassthrough.items;
+    expect(published.pattern).toBe(MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE);
+    expect(published.not.pattern).toBe(MCP_GATEWAY_REFUSED_ENV_PASSTHROUGH_PATTERN_SOURCE);
+  });
+
+  test("startup, the persisted schema and the published schema agree on model gateway entries", async () => {
+    const published = (await readPublishedGatewaySchema()).modelBackends;
+    const providerPattern = new RegExp(published.propertyNames.pattern);
+    const backendPattern = new RegExp(published.additionalProperties.pattern);
+    for (const [provider, backend, valid] of [
+      ["claude", "anthropic", true],
+      ["codex-work", "openai.v1", true],
+      ["Claude", "anthropic", false],
+      ["1claude", "anthropic", false],
+      ["claude", "-anthropic", false],
+      ["claude", "a/b", false],
+      ["claude", "", false],
+    ] as const) {
+      const startup = (() => {
+        try {
+          parseMcpGatewayModelBackends({ [provider]: backend }, "modelBackends");
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      expect(startup).toBe(valid);
+      expect(
+        PersistedConfigSchema.safeParse({
+          daemon: { mcp: { gateway: { modelBackends: { [provider]: backend } } } },
+        }).success,
+      ).toBe(valid);
+      expect(providerPattern.test(provider) && backendPattern.test(backend)).toBe(valid);
+      expect(
+        MCP_GATEWAY_MODEL_PROVIDER_PATTERN.test(provider) &&
+          MCP_GATEWAY_BACKEND_NAME_PATTERN.test(backend),
+      ).toBe(valid);
+    }
+  });
 
   test.each(VALID_BACKEND_URLS)(
     "an accepted backend URL %j parses with its host and no credentials",

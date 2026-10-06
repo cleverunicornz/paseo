@@ -6,7 +6,7 @@ import type { Logger } from "pino";
 import type { PluginMcpGatewayUpstreamRequest } from "@getpaseo/plugin/server";
 
 import { extractHttpBearerToken } from "../auth.js";
-import { MCP_GATEWAY_BACKEND_NAME_PATTERN } from "./backends.js";
+import { MCP_GATEWAY_BACKEND_NAME_PATTERN, type McpGatewayBackend } from "./backends.js";
 
 export type McpGatewayUpstreamRequest = PluginMcpGatewayUpstreamRequest;
 
@@ -17,13 +17,16 @@ export interface McpGatewayAgent {
 }
 
 export interface McpGatewayOptions {
-  getBackends: () => ReadonlyMap<string, string>;
+  getBackends: () => ReadonlyMap<string, McpGatewayBackend>;
   /** Resolves the caller from its daemon-issued bearer token; nothing else names a caller. */
   resolveAgent: (token: string | null) => McpGatewayAgent | null;
   serverId: string;
   /** Runs the `mcp_gateway.upstream` plugin hooks. */
   resolveUpstream: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
-  /** How long to wait for the backend's response headers. Streams are not limited once they start. */
+  /**
+   * How long to wait for a backend's response headers when the backend sets no
+   * `responseTimeoutMs` of its own. Streams are not limited once they start.
+   */
   responseTimeoutMs?: number;
   logger: Logger;
 }
@@ -249,7 +252,7 @@ function sendError(res: express.Response, status: number, error: string): void {
  */
 export function createMcpGatewayHandler(options: McpGatewayOptions): express.RequestHandler {
   const logger = options.logger.child({ module: "mcp-gateway" });
-  const responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+  const defaultResponseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
 
   const handle = async (req: express.Request, res: express.Response): Promise<void> => {
     const agent = options.resolveAgent(extractHttpBearerToken(req.headers.authorization));
@@ -267,6 +270,8 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       return;
     }
     const { backend } = target;
+    const configured = options.getBackends().get(backend);
+    const responseTimeoutMs = configured?.responseTimeoutMs ?? defaultResponseTimeoutMs;
 
     let upstream: McpGatewayUpstreamRequest;
     try {
@@ -275,7 +280,7 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
         agentId: agent.agentId,
         sessionId: agent.sessionId,
         workspaceId: agent.workspaceId,
-        url: options.getBackends().get(backend) ?? null,
+        url: configured?.url ?? null,
         headers: {},
       });
     } catch (error) {
