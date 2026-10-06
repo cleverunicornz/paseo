@@ -4051,11 +4051,16 @@ export class AgentManager {
         event.timestamp ? { timestamp: event.timestamp } : undefined,
       );
       if (broadcastTimeline) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.dispatchStream(
+          agent.id,
+          event,
+          {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          },
+          { fromHistory: true },
+        );
       }
     }
     this.touchUpdatedAt(agent);
@@ -4123,11 +4128,16 @@ export class AgentManager {
       if (deferredBroadcast) {
         timelineEvents.push({ event, row });
       } else if (broadcast) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.dispatchStream(
+          agent.id,
+          event,
+          {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          },
+          { fromHistory: true },
+        );
       }
     }
     agent.historyPrimed = true;
@@ -4139,11 +4149,16 @@ export class AgentManager {
       this.dispatch(event);
     }
     for (const { event, row } of timelineEvents) {
-      this.dispatchStream(agent.id, event, {
-        seq: row.seq,
-        epoch: this.timelineStore.getEpoch(agent.id),
-        timestamp: row.timestamp,
-      });
+      this.dispatchStream(
+        agent.id,
+        event,
+        {
+          seq: row.seq,
+          epoch: this.timelineStore.getEpoch(agent.id),
+          timestamp: row.timestamp,
+        },
+        { fromHistory: true },
+      );
     }
   }
 
@@ -5005,6 +5020,8 @@ export class AgentManager {
       epoch?: string;
       timestamp?: string;
     },
+    /** Rows replayed from provider history reach clients but trigger no live plugin hook. */
+    delivery?: { fromHistory?: boolean },
   ): void {
     if (event.type === "timeline") {
       event = {
@@ -5035,7 +5052,7 @@ export class AgentManager {
         event,
         this.timelineStore.getItems(agentId),
       );
-    } else if (metadata?.seq !== undefined) {
+    } else if (metadata?.seq !== undefined && !delivery?.fromHistory) {
       this.publishTimelineItem(this.pluginLifecycle, agent, event, {
         seq: metadata.seq,
         epoch: metadata.epoch ?? this.timelineStore.getEpoch(agentId),

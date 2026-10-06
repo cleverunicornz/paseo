@@ -51,6 +51,8 @@ class ScriptedSession implements AgentSession {
     private readonly config: AgentSessionConfig,
   ) {}
 
+  history: AgentStreamEvent[] = [];
+
   push(event: AgentStreamEvent): void {
     for (const callback of this.subscribers) callback(event);
   }
@@ -65,7 +67,9 @@ class ScriptedSession implements AgentSession {
     this.subscribers.add(callback);
     return () => this.subscribers.delete(callback);
   }
-  async *streamHistory(): AsyncGenerator<AgentStreamEvent> {}
+  async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    yield* this.history;
+  }
   async getRuntimeInfo() {
     return {
       provider: this.provider,
@@ -346,6 +350,31 @@ describe("agent.timeline_item", () => {
       // Later lifecycle events still go out.
       expect(lifecycle.names).toContain("agent.turn_ended");
       expect(harness.manager.getAgent(AGENT_ID)?.lifecycle).toBe("idle");
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  test("rows replayed from provider history reach clients but not the live hook", async () => {
+    const lifecycle = new RecordingLifecycle();
+    const harness = await startAgent("codex", lifecycle);
+    try {
+      harness.session.history = [
+        timeline("codex", { type: "user_message", text: "earlier", messageId: "u-0" }),
+        timeline("codex", { type: "assistant_message", text: "earlier answer" }),
+      ];
+      await harness.manager.hydrateTimelineFromProvider(AGENT_ID, {
+        force: true,
+        broadcast: true,
+      });
+      harness.session.push(timeline("codex", { type: "assistant_message", text: "live" }));
+      await drain();
+
+      const streamed = timelineStreamEvents(harness.events);
+      expect(streamed.map((event) => event.seq)).toEqual([1, 2, 3]);
+      expect(lifecycle.timelineItems.map((event) => [event.seq, event.item])).toEqual([
+        [3, { type: "assistant_message", text: "live" }],
+      ]);
     } finally {
       harness.cleanup();
     }
