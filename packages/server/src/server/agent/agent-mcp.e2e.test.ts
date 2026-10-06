@@ -372,8 +372,8 @@ describe("agent MCP end-to-end (offline)", () => {
 
     let client: McpClient | null = null;
     try {
-      // Remote auth is not weakened: a request without credentials, or with a
-      // caller claim but no token, is rejected before any MCP processing.
+      // A request without credentials, or with only a caller query parameter,
+      // gets 401 before any MCP processing.
       const unauthorized = await fetch(mcpUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -994,16 +994,16 @@ describe("agent MCP end-to-end (offline)", () => {
       }
       expect(firstLaunch.url).toBe(`http://127.0.0.1:${port}/mcp/backends/cluster`);
 
-      // Call the gateway exactly as each launched agent would, with forged
-      // identity headers that must never reach the backend.
+      // Call the gateway exactly as each launched agent would, adding
+      // caller-supplied identity headers; the backend sees the daemon's.
       const callAs = (launch: { url: string; headers?: Record<string, string> }) =>
         fetch(launch.url, {
           method: "POST",
           headers: {
             ...launch.headers,
             "content-type": "application/json",
-            "X-Paseo-Agent-ID": "forged-agent",
-            "X-Paseo-Server-ID": "forged-server",
+            "X-Paseo-Agent-ID": "caller-supplied-agent",
+            "X-Paseo-Server-ID": "caller-supplied-server",
           },
           body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
         });

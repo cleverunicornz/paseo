@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   createMcpGatewayHandler,
+  resolveUpstreamUrl,
   type McpGatewayAgent,
   type McpGatewayUpstreamRequest,
 } from "./mcp-gateway.js";
@@ -168,7 +169,7 @@ describe("MCP gateway", () => {
     expect(headers).not.toHaveProperty("x-paseo-workspace-id");
   });
 
-  test("never forwards a forged X-Paseo-* or Authorization header from the agent", async () => {
+  test("forwards only daemon-set X-Paseo-* headers and no caller Authorization", async () => {
     const upstream = await startUpstream();
     const gateway = await startGateway({ backends: { cluster: upstream.url } });
 
@@ -180,8 +181,8 @@ describe("MCP gateway", () => {
         "X-Paseo-Session-ID": "session-a",
         "X-Paseo-Workspace-ID": "workspace-a",
         "X-Paseo-Server-ID": "other-server",
-        "X-Paseo-Anything": "forged",
-        "Proxy-Authorization": "Basic forged",
+        "X-Paseo-Anything": "caller-supplied",
+        "Proxy-Authorization": "Basic caller-supplied",
       },
       body: MCP_INIT,
     });
@@ -225,7 +226,7 @@ describe("MCP gateway", () => {
     expect(upstream.requests).toHaveLength(0);
   });
 
-  test("refuses an unknown backend name and never takes a URL from the caller", async () => {
+  test("refuses an unknown backend name and takes no URL from the caller", async () => {
     const upstream = await startUpstream();
     const gateway = await startGateway({ backends: { cluster: upstream.url } });
 
@@ -288,13 +289,13 @@ describe("MCP gateway", () => {
     ["an encoded backslash", "/a%5c..%5cb"],
     ["a double-encoded backslash", "/a%255cb"],
     ["a literal backslash", "/a\\b"],
-    ["an empty leading segment", "//evil.example/mcp"],
-    ["an encoded leading double slash", "/%2F%2Fevil.example/mcp"],
-    ["a URL with a scheme", "/https://evil.example/mcp"],
-    ["an encoded URL with a scheme", "/https%3A%2F%2Fevil.example%2Fmcp"],
-    ["a double-encoded URL with a scheme", "/http%253A%252F%252Fevil.example"],
+    ["an empty leading segment", "//other.example/mcp"],
+    ["an encoded leading double slash", "/%2F%2Fother.example/mcp"],
+    ["a URL with a scheme", "/https://other.example/mcp"],
+    ["an encoded URL with a scheme", "/https%3A%2F%2Fother.example%2Fmcp"],
+    ["a double-encoded URL with a scheme", "/http%253A%252F%252Fother.example"],
     ["a scheme-only segment", "/javascript:alert"],
-    ["a URL with a scheme after other segments", "/x/http:%2f%2fevil.example"],
+    ["a URL with a scheme after other segments", "/x/http:%2f%2fother.example"],
     ["a malformed escape", "/a%zz"],
     ["a double-encoded malformed escape", "/a%25zz"],
     ["an invalid UTF-8 escape", "/a%E0%A4%A"],
@@ -305,6 +306,71 @@ describe("MCP gateway", () => {
 
     expect(await rawStatus(gateway, target)).toBe(400);
     expect(upstream.requests).toHaveLength(0);
+  });
+
+  test.each([
+    ["a literal fragment", "/messages#frag"],
+    ["an encoded fragment", "/messages%23frag"],
+    ["a double-encoded fragment", "/messages%2523frag"],
+    ["a triple-encoded fragment", "/messages%252523frag"],
+    ["a mixed-encoded fragment", "/messages%25%32%33frag"],
+    ["a fragment as a whole segment", "/%23"],
+    ["an encoded query delimiter", "/messages%3Fa=b"],
+    ["a double-encoded query delimiter", "/messages%253Fa=b"],
+    ["a triple-encoded query delimiter", "/messages%25253fa=b"],
+    ["a mixed-encoded query delimiter", "/messages%25%33%46a=b"],
+    ["a query delimiter as a whole segment", "/x/%3f"],
+  ])(
+    "refuses a suffix with %s before the hook runs or the backend is called",
+    async (_name, target) => {
+      const upstream = await startUpstream();
+      let hookCalls = 0;
+      const gateway = await startGateway({
+        backends: { cluster: `${upstream.url}/mcp` },
+        resolveUpstream: async (request) => {
+          hookCalls += 1;
+          return request;
+        },
+      });
+
+      expect(await rawStatus(gateway, target)).toBe(400);
+      expect(hookCalls).toBe(0);
+      expect(upstream.requests).toHaveLength(0);
+    },
+  );
+
+  test.each([
+    ["C0 U+0001", "%01"],
+    ["DEL U+007F", "%7F"],
+    ["C1 U+0080", "%C2%80"],
+    ["C1 U+0085", "%C2%85"],
+    ["C1 U+009F", "%C2%9F"],
+    ["zero width space U+200B", "%E2%80%8B"],
+    ["right-to-left mark U+200F", "%E2%80%8F"],
+    ["line separator U+2028", "%E2%80%A8"],
+    ["paragraph separator U+2029", "%E2%80%A9"],
+    ["left-to-right embedding U+202A", "%E2%80%AA"],
+    ["right-to-left override U+202E", "%E2%80%AE"],
+    ["word joiner U+2060", "%E2%81%A0"],
+    ["U+2065", "%E2%81%A5"],
+    ["pop directional isolate U+2069", "%E2%81%A9"],
+    ["byte order mark U+FEFF", "%EF%BB%BF"],
+    ["double-encoded C1 U+0085", "%25C2%2585"],
+    ["double-encoded line separator U+2028", "%25E2%2580%25A8"],
+  ])("refuses a suffix holding control or format character %s", async (_name, encoded) => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({ backends: { cluster: `${upstream.url}/mcp` } });
+
+    expect(await rawStatus(gateway, `/a${encoded}b`)).toBe(400);
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  test("forwards a suffix holding ordinary non-ASCII letters", async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({ backends: { cluster: `${upstream.url}/mcp` } });
+
+    expect(await rawStatus(gateway, "/caf%C3%A9")).toBe(200);
+    expect(upstream.requests.map((request) => request.url)).toEqual(["/mcp/caf%C3%A9"]);
   });
 
   test("forwards an ordinary multi-segment suffix with encoded characters intact", async () => {
@@ -476,7 +542,7 @@ describe("MCP gateway", () => {
 
   test("answers 504 when the backend does not answer in time", async () => {
     const upstream = await startUpstream(() => {
-      // Never respond.
+      // No response.
     });
     const gateway = await startGateway({
       backends: { cluster: upstream.url },
@@ -505,7 +571,7 @@ describe("MCP gateway", () => {
           headers: {
             ...request.headers,
             Authorization: `Bearer minted-for-${request.agentId}`,
-            "X-Paseo-Agent-ID": "plugin-cannot-change-identity",
+            "X-Paseo-Agent-ID": "plugin-supplied-identity",
           },
         };
       },
@@ -513,7 +579,7 @@ describe("MCP gateway", () => {
 
     await fetch(`${gateway}/cluster`, {
       method: "POST",
-      headers: { Authorization: "Bearer token-a", "X-Paseo-Agent-ID": "forged" },
+      headers: { Authorization: "Bearer token-a", "X-Paseo-Agent-ID": "caller-supplied" },
       body: MCP_INIT,
     });
 
@@ -576,5 +642,26 @@ describe("MCP gateway", () => {
       error: "MCP backend cluster upstream credentials unavailable",
     });
     expect(upstream.requests).toHaveLength(0);
+  });
+});
+
+describe("resolveUpstreamUrl", () => {
+  test("joins a plain suffix and both queries under the backend base path", () => {
+    expect(
+      resolveUpstreamUrl(new URL("http://backend.example/mcp?tenant=t1"), "a/b", "x=1")?.href,
+    ).toBe("http://backend.example/mcp/a/b?tenant=t1&x=1");
+    expect(resolveUpstreamUrl(new URL("http://backend.example"), "", "")?.href).toBe(
+      "http://backend.example/",
+    );
+  });
+
+  test.each([
+    ["a dot-dot suffix", "../admin"],
+    ["an encoded dot-dot suffix", "%2e%2e/admin"],
+    ["a suffix that leaves the base path", "../mcp-other"],
+    ["a fragment-bearing suffix", "a#b"],
+    ["a query-bearing suffix", "a?b"],
+  ])("returns null for %s whose resolved path leaves the base path", (_name, suffix) => {
+    expect(resolveUpstreamUrl(new URL("http://backend.example/mcp"), suffix, "")).toBeNull();
   });
 });

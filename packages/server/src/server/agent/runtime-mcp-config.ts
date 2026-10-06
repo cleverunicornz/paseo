@@ -86,8 +86,7 @@ export function withRuntimePaseoMcpServer(params: {
   if (Object.keys(mcpServers).length === 0) {
     return storedConfig;
   }
-  // Daemon-owned values replace launch values so a hook or environment entry
-  // cannot redirect gateway entries or substitute another token.
+  // Daemon-owned values take precedence over launch values with the same names.
   const values: Record<string, string> = { ...params.values };
   delete values.paseoMcpGatewayUrl;
   if (params.mcpGatewayBaseUrl) {

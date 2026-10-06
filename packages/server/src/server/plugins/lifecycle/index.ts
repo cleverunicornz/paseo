@@ -14,6 +14,7 @@ import type {
 } from "@getpaseo/plugin/server";
 import { WorkspaceCreateRequestSchema } from "@getpaseo/protocol/messages";
 import type { PersistedWorkspaceRecord } from "../../workspace-registry.js";
+import { MCP_GATEWAY_BACKEND_URL_PATTERN } from "../../mcp-gateway/backends.js";
 
 export const lifecycleEventNames = [
   "agent.created",
@@ -32,7 +33,7 @@ export const beforeHookNames = [
   "mcp_gateway.upstream",
 ] as const;
 
-const HttpUrlSchema = z.url({ protocol: /^https?$/ });
+const BackendUrlSchema = z.string().regex(MCP_GATEWAY_BACKEND_URL_PATTERN);
 
 const beforeSchemas = {
   "agent.create": CreateAgentRequestMessageSchema.pick({ config: true, env: true }).strict(),
@@ -54,7 +55,7 @@ const beforeSchemas = {
       agentId: z.string(),
       sessionId: z.string().nullable(),
       workspaceId: z.string().nullable(),
-      url: HttpUrlSchema.nullable(),
+      url: BackendUrlSchema.nullable(),
       headers: z.record(z.string(), z.string()),
     })
     .strict(),

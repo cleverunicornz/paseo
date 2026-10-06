@@ -96,8 +96,8 @@ function applyRuntimeSettingsToClaudeOptions(
             : providerEnvSpec),
           signal: spawnOptions.signal,
           stdio: ["pipe", "pipe", "pipe"],
-          // The command is always a resolved binary path, so shell routing is
-          // unnecessary; bypassing cmd.exe on Windows keeps quoted arguments intact.
+          // The command is always a resolved binary path; spawning without a
+          // shell keeps quoted arguments intact on Windows.
           shell: false,
         });
       } catch (error) {

@@ -1568,8 +1568,7 @@ export async function createPaseoDaemon(
           });
           return;
         }
-        // The caller is whoever the token names; nothing the request carries
-        // can claim another agent's identity.
+        // The caller is the agent its token names.
         const { server, transport } = await createAgentMcpSession(authorization.callerAgentId);
         res.on("close", () => {
           void transport.close();

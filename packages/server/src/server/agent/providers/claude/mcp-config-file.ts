@@ -17,12 +17,10 @@ function isInlineJson(value: string | undefined): value is string {
 }
 
 /**
- * MCP configuration can hold credentials (the agent's daemon token, plugin
- * headers), and process arguments are visible to every local user. The Claude
- * SDK passes MCP configuration inline after `--mcp-config`; Claude Code also
- * accepts a file path there. This writes each inline value to a file readable
- * only by the daemon user, in a directory only the daemon user can enter, and
- * passes the path instead. Call `cleanup` when the process exits.
+ * Writes each inline `--mcp-config` value to its own file and passes the file
+ * path in its place, so the returned arguments carry no MCP configuration
+ * values. Each file is owner-only (0600) inside an owner-only (0700)
+ * directory; `cleanup` removes both and is called when the process exits.
  */
 export function moveInlineMcpConfigToPrivateFiles(args: readonly string[]): PrivateMcpConfigArgs {
   let directory: string | null = null;

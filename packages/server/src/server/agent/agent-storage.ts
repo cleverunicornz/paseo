@@ -95,10 +95,9 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
 }
 
 /**
- * Providers describe persistence with the configuration they were launched
- * with, whose MCP servers hold resolved launch values such as the agent's
- * daemon token and plugin headers. A record on disk keeps the agent's MCP
- * templates instead; resume resolves them again.
+ * A record on disk carries the agent's MCP templates (placeholders unresolved)
+ * in its persistence metadata, taken from the stored configuration; resume
+ * resolves them again.
  */
 function withTemplateMcpServers(record: StoredAgentRecord): StoredAgentRecord {
   const metadata = record.persistence?.metadata;

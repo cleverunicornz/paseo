@@ -59,8 +59,10 @@ function decodeSegment(segment: string): string | null {
 
 const MAX_DECODE_ROUNDS = 8;
 const URL_SCHEME_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:/;
-// oxlint-disable-next-line no-control-regex -- control characters are what this rejects.
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+// Unicode controls (C0, DEL, C1), format characters, line and paragraph
+// separators, and the whole U+2060–U+2069 block.
+// oxlint-disable-next-line no-control-regex -- control characters are what this matches.
+const CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u2060-\u2069]/u;
 
 /**
  * Decodes until the value stops changing, so every layer of percent-encoding
@@ -80,8 +82,9 @@ function decodeCompletely(value: string): string | null {
 /**
  * A suffix segment the backend sees as one plain path segment under its base
  * path: it decodes cleanly at every layer, and its fully decoded form is not a
- * dot segment, holds no separator or control character, and is not a URL.
- * Empty segments (`//`) are allowed only as a trailing slash.
+ * dot segment, holds no separator, query or fragment delimiter, or control or
+ * format character, and is not a URL. Empty segments (`//`) are allowed only
+ * as a trailing slash.
  */
 function isPlainSuffixSegment(segment: string, isLast: boolean): boolean {
   const decoded = decodeCompletely(segment);
@@ -92,6 +95,8 @@ function isPlainSuffixSegment(segment: string, isLast: boolean): boolean {
     decoded !== ".." &&
     !decoded.includes("/") &&
     !decoded.includes("\\") &&
+    !decoded.includes("?") &&
+    !decoded.includes("#") &&
     !CONTROL_CHARACTER_PATTERN.test(decoded) &&
     !URL_SCHEME_PATTERN.test(decoded)
   );
@@ -112,7 +117,7 @@ function parseTarget(rawUrl: string): ParsedTarget {
   if (backend === null || !MCP_GATEWAY_BACKEND_NAME_PATTERN.test(backend)) {
     return { kind: "unknown" };
   }
-  if (pathname.includes("\\")) {
+  if (pathname.includes("\\") || rawUrl.includes("#")) {
     return { kind: "invalid" };
   }
   const plain = rest.every((segment, index) =>
@@ -124,12 +129,40 @@ function parseTarget(rawUrl: string): ParsedTarget {
   return { kind: "backend", backend, suffix: rest.join("/"), search };
 }
 
-function buildUpstreamPath(base: URL, suffix: string, search: string): string {
+/**
+ * Joins the base URL, the validated suffix and both queries, and returns the
+ * result only when it stays on the base origin, under the base path, with
+ * exactly the joined query and no fragment.
+ */
+export function resolveUpstreamUrl(base: URL, suffix: string, search: string): URL | null {
   const basePath = base.pathname.replace(/\/$/, "");
   const path = suffix ? `${basePath}/${suffix}` : basePath || "/";
-  const baseQuery = base.search.replace(/^\?/, "");
-  const query = [baseQuery, search].filter((part) => part.length > 0).join("&");
-  return query ? `${path}?${query}` : path;
+  const query = [base.search.replace(/^\?/, ""), search]
+    .filter((part) => part.length > 0)
+    .join("&");
+  let resolved: URL;
+  let expectedSearch = "";
+  try {
+    resolved = new URL(`${path}${query ? `?${query}` : ""}`, base.origin);
+    if (query) {
+      expectedSearch = new URL(`/?${query}`, base.origin).search;
+    }
+  } catch {
+    return null;
+  }
+  const underBasePath =
+    basePath === "" ||
+    resolved.pathname === basePath ||
+    resolved.pathname.startsWith(`${basePath}/`);
+  if (
+    resolved.origin !== base.origin ||
+    !underBasePath ||
+    resolved.hash !== "" ||
+    resolved.search !== expectedSearch
+  ) {
+    return null;
+  }
+  return resolved;
 }
 
 function connectionListedHeaders(headers: IncomingHttpHeaders): Set<string> {
@@ -156,8 +189,8 @@ function buildUpstreamHeaders(input: {
   const headers: OutgoingHttpHeaders = {};
   for (const [name, value] of Object.entries(input.incoming)) {
     if (value === undefined) continue;
-    // The agent's own credential is for the daemon, and identity headers are
-    // the daemon's to set: neither is ever forwarded from the caller.
+    // The caller's Authorization and X-Paseo-* headers stay at the daemon; the
+    // daemon sets the identity headers below.
     if (
       isHopByHop(name, connectionListed) ||
       name === "host" ||
@@ -255,6 +288,11 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
     }
 
     const base = new URL(upstream.url);
+    const upstreamUrl = resolveUpstreamUrl(base, target.suffix, target.search);
+    if (!upstreamUrl) {
+      sendError(res, 400, "Invalid MCP backend path");
+      return;
+    }
     const transport = base.protocol === "https:" ? https : http;
     let upstreamRequest: http.ClientRequest;
     try {
@@ -263,7 +301,7 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
         hostname: base.hostname.replace(/^\[(.*)\]$/, "$1"),
         port: base.port || undefined,
         method: req.method,
-        path: buildUpstreamPath(base, target.suffix, target.search),
+        path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
         headers: buildUpstreamHeaders({
           incoming: req.headers,
           pluginHeaders: upstream.headers,

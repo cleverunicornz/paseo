@@ -3,8 +3,43 @@ export const MCP_GATEWAY_ROUTE = "/mcp/backends";
 /** Backend names are a single URL path segment the agent addresses. */
 export const MCP_GATEWAY_BACKEND_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-/** Backend URLs are absolute http or https URLs; the published config schema uses the same pattern. */
-export const MCP_GATEWAY_BACKEND_URL_PATTERN = /^[Hh][Tt][Tt][Pp][Ss]?:\/\//;
+const DEC_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
+const IPV4 = `(?:${DEC_OCTET}\\.){3}${DEC_OCTET}`;
+const H16 = "[0-9A-Fa-f]{1,4}";
+const LS32 = `(?:${H16}:${H16}|${IPV4})`;
+const IPV6 = [
+  `(?:${H16}:){6}${LS32}`,
+  `::(?:${H16}:){5}${LS32}`,
+  `(?:${H16})?::(?:${H16}:){4}${LS32}`,
+  `(?:(?:${H16}:){0,1}${H16})?::(?:${H16}:){3}${LS32}`,
+  `(?:(?:${H16}:){0,2}${H16})?::(?:${H16}:){2}${LS32}`,
+  `(?:(?:${H16}:){0,3}${H16})?::${H16}:${LS32}`,
+  `(?:(?:${H16}:){0,4}${H16})?::${LS32}`,
+  `(?:(?:${H16}:){0,5}${H16})?::${H16}`,
+  `(?:(?:${H16}:){0,6}${H16})?::`,
+].join("|");
+const LABEL = "[A-Za-z0-9](?:-?[A-Za-z0-9])*";
+const TOP_LABEL = "[A-Za-z](?:-?[A-Za-z0-9])*";
+const HOST = `(?:\\[(?:${IPV6})\\]|${IPV4}|(?:${LABEL}\\.)*${TOP_LABEL})`;
+const PORT =
+  "(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}|0))?";
+const PCHAR = "(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})";
+const PATH = `(?:/${PCHAR}*)*`;
+const QUERY = `(?:\\?(?:${PCHAR}|[/?])*)?`;
+
+/**
+ * The one rule for MCP gateway backend URLs: a complete absolute `http:` or
+ * `https:` URL with a valid host (DNS name, IPv4, or bracketed IPv6), an
+ * optional port, path and query, and no credentials or fragment. Startup
+ * validation, the persisted config schema, plugin hook results and the
+ * published JSON schema all use this pattern.
+ */
+export const MCP_GATEWAY_BACKEND_URL_PATTERN_SOURCE = `^[Hh][Tt][Tt][Pp][Ss]?://${HOST}${PORT}${PATH}${QUERY}$`;
+export const MCP_GATEWAY_BACKEND_URL_PATTERN = new RegExp(MCP_GATEWAY_BACKEND_URL_PATTERN_SOURCE);
+
+export function isMcpGatewayBackendUrl(value: string): boolean {
+  return MCP_GATEWAY_BACKEND_URL_PATTERN.test(value);
+}
 
 /**
  * Validates a `{ name: url }` map of MCP gateway backends. `source` names the
@@ -22,8 +57,10 @@ export function parseMcpGatewayBackends(value: unknown, source: string): Record<
         `Invalid ${source}: backend name "${name}" must match ${MCP_GATEWAY_BACKEND_NAME_PATTERN}`,
       );
     }
-    if (typeof url !== "string" || !isHttpUrl(url)) {
-      throw new Error(`Invalid ${source}: backend "${name}" must be an http or https URL`);
+    if (typeof url !== "string" || !isMcpGatewayBackendUrl(url)) {
+      throw new Error(
+        `Invalid ${source}: backend "${name}" must be a complete http or https URL with a valid host and no credentials`,
+      );
     }
     backends[name] = url;
   }
@@ -38,16 +75,4 @@ export function parseMcpGatewayBackendsEnv(value: string, source: string): Recor
     throw new Error(`Invalid ${source}: expected a JSON object mapping backend names to URLs`);
   }
   return parseMcpGatewayBackends(parsed, source);
-}
-
-function isHttpUrl(value: string): boolean {
-  if (!MCP_GATEWAY_BACKEND_URL_PATTERN.test(value)) {
-    return false;
-  }
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
 }

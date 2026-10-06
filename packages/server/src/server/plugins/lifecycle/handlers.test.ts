@@ -133,7 +133,7 @@ test.each([
   ["backend", { backend: "another-backend" }],
   ["sessionId", { sessionId: "another-session" }],
   ["workspaceId", { workspaceId: "workspace" }],
-])("mcp_gateway.upstream hooks cannot change the caller's %s", async (_field, change) => {
+])("mcp_gateway.upstream hooks keep the caller's %s unchanged", async (_field, change) => {
   const hooks = new PluginHookHandlers(() => {});
   hooks.before("mcp_gateway.upstream", ({ request }) => ({ ...request, ...change }));
   await expect(
@@ -141,13 +141,13 @@ test.each([
   ).rejects.toThrow("mcp_gateway.upstream hooks can only change url and headers");
 });
 
-test("mcp_gateway.upstream hooks must return an http or https backend URL", async () => {
-  const hooks = new PluginHookHandlers(() => {});
-  hooks.before("mcp_gateway.upstream", ({ request }) => ({
-    ...request,
-    url: "file:///etc/passwd",
-  }));
-  await expect(
-    hooks.invoke("operation", "before", "mcp_gateway.upstream", GATEWAY_REQUEST, paseo),
-  ).rejects.toThrow();
-});
+test.each(["file:///etc/hosts", "http://", "https://[", "http:host", "http://user:pass@host/mcp"])(
+  "mcp_gateway.upstream hooks must return a backend URL the daemon config would accept, not %j",
+  async (url) => {
+    const hooks = new PluginHookHandlers(() => {});
+    hooks.before("mcp_gateway.upstream", ({ request }) => ({ ...request, url }));
+    await expect(
+      hooks.invoke("operation", "before", "mcp_gateway.upstream", GATEWAY_REQUEST, paseo),
+    ).rejects.toThrow();
+  },
+);

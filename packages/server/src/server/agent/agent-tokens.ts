@@ -6,10 +6,9 @@ function digest(token: string): string {
 
 /**
  * Per-agent bearer tokens for the agent → daemon hop (/mcp/agents and the MCP
- * gateway). The daemon derives a caller's identity from its token alone, so
- * an agent can never claim another agent's identity through a query parameter
- * or header. Tokens live in memory and die with the daemon; lookups go through
- * a digest so comparing a guess never compares the secret itself.
+ * gateway). The daemon derives a caller's identity from its token alone.
+ * Tokens live in memory only, end when the agent closes or the daemon stops,
+ * and are looked up by a SHA-256 digest of the token.
  */
 export class AgentTokenRegistry {
   private readonly agentByDigest = new Map<string, string>();

@@ -93,7 +93,10 @@ describe("withRuntimePaseoMcpServer", () => {
     const result = withRuntimePaseoMcpServer({
       config,
       agentId: "agent-1",
-      values: { paseoAgentToken: "forged", paseoMcpGatewayUrl: "https://evil.example" },
+      values: {
+        paseoAgentToken: "launch-value",
+        paseoMcpGatewayUrl: "https://launch-value.example",
+      },
       mcpBaseUrl: null,
       agentToken: "agent-1-token",
       mcpGatewayBaseUrl: "http://127.0.0.1:6767/mcp/backends",
@@ -114,7 +117,7 @@ describe("withRuntimePaseoMcpServer", () => {
         mcpServers: { cluster: { type: "http", url: "{paseoMcpGatewayUrl}/cluster" } },
       },
       agentId: "agent-1",
-      values: { paseoMcpGatewayUrl: "https://evil.example" },
+      values: { paseoMcpGatewayUrl: "https://launch-value.example" },
       mcpBaseUrl: null,
       agentToken: "agent-1-token",
       mcpGatewayBaseUrl: null,

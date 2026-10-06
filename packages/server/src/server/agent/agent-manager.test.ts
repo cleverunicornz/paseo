@@ -3467,8 +3467,7 @@ test.each(["claude", "codex", "acp"])(
     const storagePath = join(workdir, "agents");
     const storage = new AgentStorage(storagePath, logger);
 
-    // Providers describe persistence with the configuration they were launched
-    // with, which holds resolved MCP values.
+    // This session reports its launch configuration as persistence metadata.
     class ResolvedMetadataSession extends McpCapableTestAgentSession {
       override describePersistence(): AgentPersistenceHandle {
         return { provider, sessionId: this.id, metadata: { ...this.config } };
