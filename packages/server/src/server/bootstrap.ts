@@ -414,6 +414,8 @@ export interface PaseoDaemonConfig {
   mcpGatewayBackends?: Record<string, McpGatewayBackend>;
   /** The gateway backend each provider's model traffic goes to, by provider id. */
   mcpGatewayModelBackends?: Record<string, string>;
+  /** Names and `NAME_*` prefixes a gateway harness may inherit beyond the base variables. */
+  mcpGatewayEnvPassthrough?: string[];
   browserToolsEnabled?: boolean;
   git?: {
     maxProcessesPerSecond: number;
@@ -960,6 +962,7 @@ export async function createPaseoDaemon(
     },
     agentTokens,
     mcpGatewayModelBackends: config.mcpGatewayModelBackends,
+    mcpGatewayEnvPassthrough: config.mcpGatewayEnvPassthrough,
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,

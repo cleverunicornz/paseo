@@ -3559,6 +3559,7 @@ test("each agent of a provider with a model backend launches with its own token 
     logger,
     agentTokens,
     mcpGatewayModelBackends: { claude: "anthropic", codex: "openai" },
+    mcpGatewayEnvPassthrough: ["TOOL_SETTING", "TOOLKIT_*"],
   });
   manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
 
@@ -3577,6 +3578,7 @@ test("each agent of a provider with a model backend launches with its own token 
     expect(firstLaunch?.modelGateway).toEqual({
       baseUrl: "http://127.0.0.1:6767/mcp/backends/anthropic",
       token: manager.issueAgentToken(first.id),
+      envPassthrough: ["TOOL_SETTING", "TOOLKIT_*"],
     });
     expect(secondLaunch?.modelGateway?.baseUrl).toBe(
       "http://127.0.0.1:6767/mcp/backends/anthropic",
@@ -3587,6 +3589,7 @@ test("each agent of a provider with a model backend launches with its own token 
     expect(codex.launchContexts[0]?.modelGateway).toEqual({
       baseUrl: "http://127.0.0.1:6767/mcp/backends/openai",
       token: manager.issueAgentToken(third.id),
+      envPassthrough: ["TOOL_SETTING", "TOOLKIT_*"],
     });
 
     await manager.flush();
@@ -3625,6 +3628,7 @@ test("a resumed agent launches with the model gateway again", async () => {
     expect(claude.launchContexts.at(-1)?.modelGateway).toEqual({
       baseUrl: "http://127.0.0.1:6767/mcp/backends/anthropic",
       token: manager.issueAgentToken(agent.id),
+      envPassthrough: [],
     });
   } finally {
     rmSync(workdir, { recursive: true, force: true });

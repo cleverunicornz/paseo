@@ -32,6 +32,10 @@ import {
   parseMcpGatewayModelBackendsEnv,
   type McpGatewayBackend,
 } from "./mcp-gateway/backends.js";
+import {
+  parseMcpGatewayEnvPassthrough,
+  parseMcpGatewayEnvPassthroughEnv,
+} from "./agent/model-gateway-env.js";
 
 export {
   loadPersistedConfig,
@@ -116,6 +120,22 @@ function resolveMcpGatewayBackends(
   return parseMcpGatewayBackends(
     persisted.daemon?.mcp?.gateway?.backends ?? {},
     "daemon.mcp.gateway.backends",
+  );
+}
+
+function resolveMcpGatewayEnvPassthrough(
+  env: NodeJS.ProcessEnv,
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): string[] {
+  if (env.PASEO_MCP_GATEWAY_ENV_PASSTHROUGH !== undefined) {
+    return parseMcpGatewayEnvPassthroughEnv(
+      env.PASEO_MCP_GATEWAY_ENV_PASSTHROUGH,
+      "PASEO_MCP_GATEWAY_ENV_PASSTHROUGH",
+    );
+  }
+  return parseMcpGatewayEnvPassthrough(
+    persisted.daemon?.mcp?.gateway?.envPassthrough ?? [],
+    "daemon.mcp.gateway.envPassthrough",
   );
 }
 
@@ -654,6 +674,7 @@ export function resolveConfigFromPersisted(
     mcpInjectIntoAgents,
     mcpGatewayBackends: resolveMcpGatewayBackends(env, persisted),
     mcpGatewayModelBackends: resolveMcpGatewayModelBackends(env, persisted),
+    mcpGatewayEnvPassthrough: resolveMcpGatewayEnvPassthrough(env, persisted),
     browserToolsEnabled,
     git: resolveGitProcessConfig(env, persisted),
     autoArchiveAfterMerge,
@@ -751,6 +772,9 @@ function resolveCoreDaemonOverridePaths(
   if (env.PASEO_MCP_GATEWAY_BACKENDS !== undefined) paths.push("daemon.mcp.gateway.backends");
   if (env.PASEO_MCP_GATEWAY_MODEL_BACKENDS !== undefined) {
     paths.push("daemon.mcp.gateway.modelBackends");
+  }
+  if (env.PASEO_MCP_GATEWAY_ENV_PASSTHROUGH !== undefined) {
+    paths.push("daemon.mcp.gateway.envPassthrough");
   }
   // Hostname sources append instead of replacing one another, so a launch value
   // does not prevent a persisted hostname edit from taking effect.

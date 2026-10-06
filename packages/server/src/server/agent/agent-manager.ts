@@ -337,6 +337,8 @@ export interface AgentManagerOptions {
    * their own token instead of a model credential.
    */
   mcpGatewayModelBackends?: Record<string, string>;
+  /** Names and `NAME_*` prefixes a gateway harness may inherit beyond the base variables. */
+  mcpGatewayEnvPassthrough?: readonly string[];
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
@@ -725,6 +727,18 @@ function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatc
   return patch;
 }
 
+interface ModelGatewaySettings {
+  backends: ReadonlyMap<string, string>;
+  envPassthrough: readonly string[];
+}
+
+function resolveModelGatewaySettings(options: AgentManagerOptions): ModelGatewaySettings {
+  return {
+    backends: new Map(Object.entries(options.mcpGatewayModelBackends ?? {})),
+    envPassthrough: [...(options.mcpGatewayEnvPassthrough ?? [])],
+  };
+}
+
 export class AgentManager {
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly clients = new Map<AgentProvider, AgentClient>();
@@ -752,7 +766,7 @@ export class AgentManager {
   private mcpBaseUrl: string | null;
   private mcpGatewayBaseUrl: string | null = null;
   private readonly agentTokens: AgentTokenRegistry;
-  private readonly mcpGatewayModelBackends: ReadonlyMap<string, string>;
+  private readonly modelGatewaySettings: ModelGatewaySettings;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -777,7 +791,7 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.agentTokens = options.agentTokens ?? new AgentTokenRegistry();
-    this.mcpGatewayModelBackends = new Map(Object.entries(options.mcpGatewayModelBackends ?? {}));
+    this.modelGatewaySettings = resolveModelGatewaySettings(options);
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
@@ -5307,7 +5321,7 @@ export class AgentManager {
    * to the provider's own credentials.
    */
   private resolveModelGateway(agentId: string, client: AgentClient): AgentModelGateway | undefined {
-    const backend = this.mcpGatewayModelBackends.get(client.provider);
+    const backend = this.modelGatewaySettings.backends.get(client.provider);
     if (!backend) {
       return undefined;
     }
@@ -5324,6 +5338,7 @@ export class AgentManager {
     return {
       baseUrl: `${this.mcpGatewayBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(backend)}`,
       token: this.agentTokens.issue(agentId),
+      envPassthrough: this.modelGatewaySettings.envPassthrough,
     };
   }
 

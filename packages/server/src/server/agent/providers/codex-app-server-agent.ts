@@ -40,7 +40,7 @@ import {
   type ResolveAgentDefaultModeInput,
 } from "../agent-sdk-types.js";
 import type { ProcessEnvRecord } from "../../paseo-env.js";
-import { withModelGatewayEnv } from "../model-gateway-env.js";
+import { buildModelGatewayEnv } from "../model-gateway-env.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
@@ -3350,21 +3350,12 @@ function buildCodexModelGatewayConfig(
 }
 
 /**
- * The app-server's launch environment: with a model gateway, the agent's token
- * under `CODEX_MODEL_GATEWAY_TOKEN_ENV` and no model-provider variable of any
- * kind.
+ * The app-server's environment: inherited (the daemon's, with runtime settings
+ * and launch values overlaid), or, for a gateway harness, built from scratch.
  */
-function codexLaunchEnv(
-  launchContext: AgentLaunchContext | undefined,
-): ProcessEnvRecord | undefined {
-  const gateway = launchContext?.modelGateway;
-  if (!gateway) {
-    return launchContext?.env;
-  }
-  return withModelGatewayEnv(launchContext.env, {
-    [CODEX_MODEL_GATEWAY_TOKEN_ENV]: gateway.token,
-  });
-}
+type CodexLaunchEnvironment =
+  | { kind: "inherited"; launchEnv: Record<string, string> | undefined }
+  | { kind: "built"; env: Record<string, string> };
 
 interface CodexSubAgentCallState {
   callId: string;
@@ -7077,12 +7068,35 @@ export class CodexAppServerAgentClient implements AgentClient {
     private readonly deps: CodexAppServerAgentDeps = {},
   ) {}
 
-  private sessionDeps(launchContext: AgentLaunchContext | undefined): CodexAppServerAgentDeps {
+  private launchEnvironment(launchContext: AgentLaunchContext | undefined): CodexLaunchEnvironment {
+    const gateway = launchContext?.modelGateway;
+    if (!gateway) {
+      return { kind: "inherited", launchEnv: launchContext?.env };
+    }
+    return {
+      kind: "built",
+      env: buildModelGatewayEnv({
+        inherited: [process.env, this.runtimeSettings?.env],
+        launchEnv: launchContext.env,
+        baseUrl: gateway.baseUrl,
+        envPassthrough: gateway.envPassthrough,
+        gatewayValues: { [CODEX_MODEL_GATEWAY_TOKEN_ENV]: gateway.token },
+      }),
+    };
+  }
+
+  private sessionDeps(
+    launchContext: AgentLaunchContext | undefined,
+    environment: CodexLaunchEnvironment,
+  ): CodexAppServerAgentDeps {
     const gateway = launchContext?.modelGateway;
     return {
       ...this.deps,
+      // Paseo reads the same Codex home the app-server uses.
       codexHome: resolveCodexHomeDir(
-        buildCodexAppServerEnv(this.runtimeSettings, codexLaunchEnv(launchContext)),
+        environment.kind === "built"
+          ? environment.env
+          : buildCodexAppServerEnv(this.runtimeSettings, environment.launchEnv),
       ),
       customCodexConfig: gateway
         ? buildCodexModelGatewayConfig(gateway, this.deps.customProvider)
@@ -7147,7 +7161,7 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   private async spawnAppServer(
-    launchEnv?: ProcessEnvRecord,
+    environment: CodexLaunchEnvironment = { kind: "inherited", launchEnv: undefined },
     options?: { goalsEnabled?: boolean; agentId?: string },
   ): Promise<ChildProcessWithoutNullStreams> {
     const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
@@ -7167,10 +7181,12 @@ export class CodexAppServerAgentClient implements AgentClient {
     const child = spawnProcess(launchPrefix.command, args, {
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
-      ...createProviderEnvSpec({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [launchEnv],
-      }),
+      ...(environment.kind === "built"
+        ? { env: environment.env, envMode: "internal" as const }
+        : createProviderEnvSpec({
+            runtimeSettings: this.runtimeSettings,
+            overlays: [environment.launchEnv],
+          })),
     });
     assertChildWithPipes(child);
     return child;
@@ -7191,16 +7207,17 @@ export class CodexAppServerAgentClient implements AgentClient {
     const sessionConfig: AgentSessionConfig = { ...config, provider: CODEX_PROVIDER };
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
+    const environment = this.launchEnvironment(launchContext);
     const session = new CodexAppServerAgentSession(
       sessionConfig,
       null,
       this.logger,
       () =>
-        this.spawnAppServer(codexLaunchEnv(launchContext), {
+        this.spawnAppServer(environment, {
           goalsEnabled,
           agentId: launchContext?.agentId,
         }),
-      this.sessionDeps(launchContext),
+      this.sessionDeps(launchContext, environment),
       options?.persistSession === false,
       goalsEnabled,
       autoReviewEnabled,
@@ -7225,16 +7242,17 @@ export class CodexAppServerAgentClient implements AgentClient {
     };
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
+    const environment = this.launchEnvironment(launchContext);
     const session = new CodexAppServerAgentSession(
       merged,
       handle,
       this.logger,
       () =>
-        this.spawnAppServer(codexLaunchEnv(launchContext), {
+        this.spawnAppServer(environment, {
           goalsEnabled,
           agentId: launchContext?.agentId,
         }),
-      this.sessionDeps(launchContext),
+      this.sessionDeps(launchContext, environment),
       false,
       goalsEnabled,
       autoReviewEnabled,

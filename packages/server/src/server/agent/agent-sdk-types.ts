@@ -633,6 +633,8 @@ export interface AgentSessionConfig {
 export interface AgentModelGateway {
   baseUrl: string;
   token: string;
+  /** Configured names and `NAME_*` prefixes the harness may inherit beyond the base variables. */
+  envPassthrough: readonly string[];
 }
 
 export interface AgentLaunchContext {
@@ -645,8 +647,8 @@ export interface AgentLaunchContext {
   paseoTools?: PaseoToolCatalog;
   /**
    * Runtime-only model gateway for this launch. Never persisted; a provider
-   * that receives it points its model client at the gateway and drops any
-   * inherited model credential.
+   * that receives it points its model client at the gateway and builds the
+   * harness environment with `buildModelGatewayEnv` instead of inheriting one.
    */
   modelGateway?: AgentModelGateway;
 }

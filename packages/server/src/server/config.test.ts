@@ -13,6 +13,11 @@ import {
   parseMcpGatewayBackends,
   parseMcpGatewayModelBackends,
 } from "./mcp-gateway/backends.js";
+import {
+  MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE,
+  MCP_GATEWAY_REFUSED_ENV_PASSTHROUGH_PATTERN_SOURCE,
+  parseMcpGatewayEnvPassthrough,
+} from "./agent/model-gateway-env.js";
 
 const roots: string[] = [];
 
@@ -253,6 +258,63 @@ describe("server config", () => {
     expect(absent.mcpGatewayModelBackends).toEqual({});
   });
 
+  test("loads the gateway environment pass-through list and lets the environment replace it", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-env-passthrough-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: { mcp: { gateway: { envPassthrough: ["TOOL_SETTING", "TOOLKIT_*"] } } },
+      }),
+    );
+
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    const fromEnv = loadConfig(paseoHome, {
+      env: { PASEO_MCP_GATEWAY_ENV_PASSTHROUGH: '["CODEX_HOME"]' },
+    });
+    const absent = loadConfig(await mkdtemp(path.join(os.tmpdir(), "paseo-config-none-")), {
+      env: {},
+    });
+
+    expect(fromFile.mcpGatewayEnvPassthrough).toEqual(["TOOL_SETTING", "TOOLKIT_*"]);
+    expect(fromFile.configReload?.overrideControlledPaths).not.toContain(
+      "daemon.mcp.gateway.envPassthrough",
+    );
+    expect(fromEnv.mcpGatewayEnvPassthrough).toEqual(["CODEX_HOME"]);
+    expect(fromEnv.configReload?.overrideControlledPaths).toContain(
+      "daemon.mcp.gateway.envPassthrough",
+    );
+    expect(absent.mcpGatewayEnvPassthrough).toEqual([]);
+  });
+
+  test.each([
+    ["non-JSON", "TOOL_SETTING"],
+    ["a non-array", '{"TOOL_SETTING":true}'],
+    ["a model credential", '["ANTHROPIC_API_KEY"]'],
+    ["a proxy variable", '["https_proxy"]'],
+  ])("rejects %s PASEO_MCP_GATEWAY_ENV_PASSTHROUGH", async (_name, value) => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-env-passthrough-bad-"));
+    roots.push(paseoHome);
+
+    expect(() =>
+      loadConfig(paseoHome, { env: { PASEO_MCP_GATEWAY_ENV_PASSTHROUGH: value } }),
+    ).toThrow("PASEO_MCP_GATEWAY_ENV_PASSTHROUGH");
+  });
+
+  test("refuses a persisted pass-through entry naming a model credential", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-env-passthrough-file-"));
+    roots.push(paseoHome);
+    const persisted = loadPersistedConfig(paseoHome);
+
+    expect(() =>
+      resolveConfigFromPersisted(
+        paseoHome,
+        { ...persisted, daemon: { mcp: { gateway: { envPassthrough: ["AWS_*"] } } } },
+        { env: {} },
+      ),
+    ).toThrow("daemon.mcp.gateway.envPassthrough");
+  });
+
   test.each([
     ["non-JSON", "claude=anthropic"],
     ["a non-object", '["anthropic"]'],
@@ -412,6 +474,93 @@ describe("server config", () => {
       expect(publishedAccepts).toBe(valid);
     },
   );
+
+  const ACCEPTED_PASSTHROUGH = [
+    "TOOL_SETTING",
+    "TOOLKIT_*",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "_PRIVATE",
+    "PROXYISH_SETTING",
+  ];
+  const REFUSED_PASSTHROUGH = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_*",
+    "anthropic_api_key",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_*",
+    "CLAUDE_*",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_API_KEY",
+    "CODEX_*",
+    "AWS_PROFILE",
+    "AWS_*",
+    "A*",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CONFIG",
+    "CLOUD_ML_REGION",
+    "VERTEX_REGION_CLAUDE",
+    "AZURE_CLIENT_SECRET",
+    "HTTP_PROXY",
+    "http_proxy",
+    "Http_Proxy",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "no_proxy",
+    "FTP_PROXY",
+    "CORP_PROXY",
+    "HTTP*",
+    "N*",
+    "",
+    "*",
+    "1BAD",
+    "BAD-NAME",
+    "TOOL_*_X",
+  ];
+
+  test.each([
+    ...ACCEPTED_PASSTHROUGH.map((entry) => [entry, true] as const),
+    ...REFUSED_PASSTHROUGH.map((entry) => [entry, false] as const),
+  ])(
+    "startup, the persisted schema and the published schema agree on pass-through entry %j (%s)",
+    async (entry, valid) => {
+      const published = (await readPublishedGatewaySchema()).envPassthrough.items;
+      const startup = (() => {
+        try {
+          parseMcpGatewayEnvPassthrough([entry], "envPassthrough");
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      expect(startup).toBe(valid);
+      expect(
+        PersistedConfigSchema.safeParse({
+          daemon: { mcp: { gateway: { envPassthrough: [entry] } } },
+        }).success,
+      ).toBe(valid);
+      expect(
+        new RegExp(published.pattern).test(entry) && !new RegExp(published.not.pattern).test(entry),
+      ).toBe(valid);
+    },
+  );
+
+  test("the published pass-through patterns are the daemon's own", async () => {
+    const published = (await readPublishedGatewaySchema()).envPassthrough.items;
+    expect(published.pattern).toBe(MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE);
+    expect(published.not.pattern).toBe(MCP_GATEWAY_REFUSED_ENV_PASSTHROUGH_PATTERN_SOURCE);
+  });
 
   test("startup, the persisted schema and the published schema agree on model gateway entries", async () => {
     const published = (await readPublishedGatewaySchema()).modelBackends;

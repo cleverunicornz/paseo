@@ -20,6 +20,10 @@ import {
   MCP_GATEWAY_RESPONSE_TIMEOUT_MAX_MS,
   MCP_GATEWAY_RESPONSE_TIMEOUT_MIN_MS,
 } from "./mcp-gateway/backends.js";
+import {
+  MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE,
+  isAcceptedEnvPassthroughEntry,
+} from "./agent/model-gateway-env.js";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
 export const LogFormatSchema = z.enum(["pretty", "json"]);
@@ -273,6 +277,16 @@ export const PersistedConfigSchema = z
                   .record(
                     z.string().regex(MCP_GATEWAY_MODEL_PROVIDER_PATTERN),
                     z.string().regex(MCP_GATEWAY_BACKEND_NAME_PATTERN),
+                  )
+                  .optional(),
+                envPassthrough: z
+                  .array(
+                    z
+                      .string()
+                      .regex(new RegExp(MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE))
+                      .refine(isAcceptedEnvPassthroughEntry, {
+                        message: "names model credentials or proxy variables",
+                      }),
                   )
                   .optional(),
               })

@@ -100,6 +100,7 @@ import {
   type AgentFeature,
   type AgentLaunchContext,
   type AgentMetadata,
+  type AgentModelGateway,
   type AgentMode,
   type AgentModelDefinition,
   type AgentPermissionRequest,
@@ -140,8 +141,7 @@ import {
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
-import type { ProcessEnvRecord } from "../../../paseo-env.js";
-import { withModelGatewayEnv } from "../../model-gateway-env.js";
+import { buildModelGatewayEnv } from "../../model-gateway-env.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { execCommand } from "../../../../utils/spawn.js";
@@ -413,33 +413,13 @@ interface ClaudeAgentClientOptions {
   rewindSdk?: ClaudeRewindSdk;
 }
 
-/**
- * The launch environment Claude Code gets. With a model gateway it sends model
- * calls to the gateway as `Authorization: Bearer <agent token>`
- * (`ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_API_KEY` would travel as `x-api-key`,
- * which the gateway forwards), and every model-provider variable is removed
- * so the agent holds no credential. This overlay is applied last, over
- * runtime settings and plugin-supplied launch values.
- */
-function claudeLaunchEnv(
-  launchContext: AgentLaunchContext | undefined,
-): ProcessEnvRecord | undefined {
-  const gateway = launchContext?.modelGateway;
-  if (!gateway) {
-    return launchContext?.env;
-  }
-  return withModelGatewayEnv(launchContext.env, {
-    ANTHROPIC_BASE_URL: gateway.baseUrl,
-    ANTHROPIC_AUTH_TOKEN: gateway.token,
-  });
-}
-
 interface ClaudeAgentSessionOptions {
   defaults?: { agents?: Record<string, AgentDefinition> };
   runtimeSettings?: ProviderRuntimeSettings;
   handle?: AgentPersistenceHandle;
   agentId?: string;
-  launchEnv?: ProcessEnvRecord;
+  launchEnv?: Record<string, string>;
+  modelGateway?: AgentModelGateway;
   persistSession?: boolean;
   logger: Logger;
   queryFactory?: ClaudeQueryFactory;
@@ -1556,7 +1536,8 @@ export class ClaudeAgentClient implements AgentClient {
       defaults: this.defaults,
       runtimeSettings: this.runtimeSettings,
       agentId: launchContext?.agentId,
-      launchEnv: claudeLaunchEnv(launchContext),
+      launchEnv: launchContext?.env,
+      modelGateway: launchContext?.modelGateway,
       persistSession: options?.persistSession,
       logger: this.logger,
       queryFactory: this.queryFactory,
@@ -1586,7 +1567,8 @@ export class ClaudeAgentClient implements AgentClient {
       runtimeSettings: this.runtimeSettings,
       handle,
       agentId: launchContext?.agentId,
-      launchEnv: claudeLaunchEnv(launchContext),
+      launchEnv: launchContext?.env,
+      modelGateway: launchContext?.modelGateway,
       logger: this.logger,
       queryFactory: this.queryFactory,
       resolveBinary: this.resolveBinary,
@@ -2066,7 +2048,8 @@ class ClaudeAgentSession implements AgentSession {
   readonly capabilities = CLAUDE_CAPABILITIES;
 
   private readonly config: ClaudeAgentConfig;
-  private readonly launchEnv?: ProcessEnvRecord;
+  private readonly launchEnv?: Record<string, string>;
+  private readonly modelGateway?: AgentModelGateway;
   private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
   private readonly runtimeSettings?: ProviderRuntimeSettings;
@@ -2147,6 +2130,7 @@ class ClaudeAgentSession implements AgentSession {
     this.config = config;
     assertClaudeThinkingOptionSupported(config.model, config.thinkingOptionId);
     this.launchEnv = options.launchEnv;
+    this.modelGateway = options.modelGateway;
     this.agentId = options.agentId;
     this.defaults = options.defaults;
     this.runtimeSettings = options.runtimeSettings;
@@ -3184,6 +3168,7 @@ class ClaudeAgentSession implements AgentSession {
       {
         runtimeSettings: this.runtimeSettings,
         launchEnv: this.launchEnv,
+        builtEnv: this.modelGateway ? options.env : undefined,
         queryFactory: this.queryFactory,
         onChildProcess: (child) => {
           this.childProcess = child;
@@ -3277,6 +3262,21 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private buildSdkEnv(): NodeJS.ProcessEnv {
+    if (this.modelGateway) {
+      // Claude Code sends model calls to the gateway as `Authorization: Bearer
+      // <agent token>` (`ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_API_KEY` would travel
+      // as `x-api-key`, which the gateway forwards).
+      return buildModelGatewayEnv({
+        inherited: [process.env, this.runtimeSettings?.env],
+        launchEnv: this.launchEnv,
+        baseUrl: this.modelGateway.baseUrl,
+        envPassthrough: this.modelGateway.envPassthrough,
+        gatewayValues: {
+          ANTHROPIC_BASE_URL: this.modelGateway.baseUrl,
+          ANTHROPIC_AUTH_TOKEN: this.modelGateway.token,
+        },
+      });
+    }
     return createProviderEnv({
       baseEnv: process.env,
       runtimeSettings: this.runtimeSettings,

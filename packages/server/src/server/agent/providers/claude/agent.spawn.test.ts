@@ -11,17 +11,15 @@ import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import * as spawnUtils from "../../../../utils/spawn.js";
 import { ClaudeAgentClient } from "./agent.js";
 import type { ClaudeQueryInput } from "./query.js";
-
-/** Model-provider credential and endpoint variables a harness could inherit. */
-const MODEL_PROVIDER_VARIABLES = [
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_BASE_URL",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "OPENAI_API_KEY",
-  "OPENAI_BASE_URL",
-  "CODEX_API_KEY",
-];
+import {
+  LOOPBACK_NO_PROXY,
+  PASSTHROUGH,
+  credentialInputs,
+  expectedGatewayEnv,
+  inheritOnDaemonProcess,
+  paseoLaunchValues,
+  settingsInputs,
+} from "../../../test-utils/model-gateway-env-inputs.js";
 
 function createQueryMock(events: unknown[]): Query {
   let index = 0;
@@ -113,7 +111,7 @@ describe("Claude spawn override", () => {
     const spawnOptions = claudeSpawnCall?.[2];
     expect(spawnOptions?.shell).toBe(false);
   });
-  test("a node-launched Claude Code with a model gateway carries only its own gateway values", async () => {
+  test("through the daemon's own Node, a gateway harness holds only base variables, pass-through, launch values, NO_PROXY and its gateway values", async () => {
     let capturedOptions: Options | undefined;
     const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
       capturedOptions = options;
@@ -128,35 +126,34 @@ describe("Claude spawn override", () => {
       ]);
     });
     const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(createChildProcessStub());
-    const saved = Object.fromEntries(
-      MODEL_PROVIDER_VARIABLES.map((name) => [name, process.env[name]]),
-    );
-    for (const name of MODEL_PROVIDER_VARIABLES) {
-      process.env[name] = `daemon-${name.toLowerCase()}`;
-    }
-    const client = new ClaudeAgentClient({
-      logger: createTestLogger(),
-      queryFactory,
-      resolveBinary: async () => "/test/claude/bin",
-      runtimeSettings: {
-        env: Object.fromEntries(
-          MODEL_PROVIDER_VARIABLES.map((name) => [name, `settings-${name.toLowerCase()}`]),
-        ),
-      },
-    });
+    const restore = inheritOnDaemonProcess();
+    const gatewayUrl = "http://127.0.0.1:6767/mcp/backends/models";
+    let expected: Record<string, string> = {};
     try {
+      const client = new ClaudeAgentClient({
+        logger: createTestLogger(),
+        queryFactory,
+        resolveBinary: async () => "/test/claude/bin",
+        runtimeSettings: { env: settingsInputs() },
+      });
       const session = await client.createSession(
         { provider: "claude", cwd: process.cwd() },
         {
           agentId: "agent-1",
-          env: {},
-          modelGateway: { baseUrl: "http://127.0.0.1:6767/mcp/backends/models", token: "t-1" },
+          env: { ...credentialInputs("launch"), ...paseoLaunchValues("agent-1", process.cwd()) },
+          modelGateway: { baseUrl: gatewayUrl, token: "t-1", envPassthrough: PASSTHROUGH },
         },
       );
+      expected = expectedGatewayEnv({
+        daemonEnv: process.env,
+        launchValues: paseoLaunchValues("agent-1", process.cwd()),
+        noProxy: LOOPBACK_NO_PROXY,
+        gatewayValues: { ANTHROPIC_BASE_URL: gatewayUrl, ANTHROPIC_AUTH_TOKEN: "t-1" },
+      });
       try {
         await session.run("gateway");
-        expect(capturedOptions?.env?.ANTHROPIC_API_KEY).toBeUndefined();
-        expect(capturedOptions?.env?.OPENAI_API_KEY).toBeUndefined();
+        // The SDK's environment for its child is the built one.
+        expect(capturedOptions?.env).toEqual(expected);
         capturedOptions?.spawnClaudeCodeProcess?.({
           command: "node",
           args: ["claude.js"],
@@ -168,22 +165,11 @@ describe("Claude spawn override", () => {
         await session.close();
       }
     } finally {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restore();
     }
 
     const call = spawnSpy.mock.calls.find(([, args]) => args[0] === "claude.js");
-    const env = call?.[2]?.env as Record<string, string | undefined> | undefined;
-    const modelEnv = Object.fromEntries(
-      MODEL_PROVIDER_VARIABLES.flatMap((name) =>
-        env?.[name] === undefined ? [] : [[name, env[name]]],
-      ),
-    );
-    expect(modelEnv).toEqual({
-      ANTHROPIC_BASE_URL: "http://127.0.0.1:6767/mcp/backends/models",
-      ANTHROPIC_AUTH_TOKEN: "t-1",
-    });
+    // Running the daemon's own executable as Node is the only addition.
+    expect(call?.[2]?.env).toEqual({ ...expected, ELECTRON_RUN_AS_NODE: "1" });
   });
 });
