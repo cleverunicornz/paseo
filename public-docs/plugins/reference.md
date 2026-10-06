@@ -395,7 +395,9 @@ Substitution runs after session-open hooks on create, resume, refresh and import
 `{paseoMcpGatewayUrl}` the daemon's [MCP gateway](/docs/mcp#reach-mcp-backends-through-the-daemon)
 URL. The agent ID and these two values take precedence over launch values.
 Replacement is literal and single-pass; unknown placeholders remain unchanged.
-Stored configuration keeps its templates, and stdio servers are unchanged.
+Stored configuration and agent records on disk keep the templates; resolved values reach the
+provider only through its own protocol messages or a private file, never process arguments.
+Stdio servers are unchanged.
 Paseo does not read the daemon process environment for this substitution.
 
 ### Inject environment variables on every session opening

@@ -102,8 +102,12 @@ Point an agent's MCP server at the gateway with two placeholders the daemon fill
 ```
 
 `{paseoMcpGatewayUrl}` is the daemon's loopback `/mcp/backends` URL and `{paseoAgentToken}` is the
-launching agent's own token. The gateway forwards the method, path below the backend name, query,
-body and MCP session headers, and streams responses (including SSE) without buffering. It drops the
+launching agent's own token. Agent records on disk keep these placeholders, never the resolved
+values. The gateway forwards every method except the CORS preflight: the daemon answers `OPTIONS`
+through its CORS handling before the gateway authenticates anything. It forwards the path below the
+backend name, query, body and MCP session headers, and streams responses (including SSE) without
+buffering. Each path segment below the backend name must be a plain segment once fully
+percent-decoded: no dot segments, separators, control characters or URL schemes (`400` otherwise). It drops the
 agent's `Authorization` and every `X-Paseo-*` header, then sets:
 
 | Header                 | Value                                            |
