@@ -48,7 +48,7 @@ When a daemon password is configured, new relay clients send it in the encrypted
 
 By default, the daemon binds to `127.0.0.1`. With no password configured, anything that can reach the daemon socket can control the daemon. Loopback is reachable by other users on the machine and by some forwarding tools.
 
-The daemon supports an optional shared-secret password (set via `auth.password` in `config.json` or the `PASEO_PASSWORD` env var; stored bcrypt-hashed). WebSocket clients send the password in `hello`; the daemon sends no session data before admission. Direct connections still accept bearer headers and WebSocket bearer subprotocols for older clients. HTTP stays bearer-header based. Health (`GET /api/health`) and CORS preflight (`OPTIONS`) are exempt; `/api/files/download` and `/mcp/agents` use their own capability tokens.
+The daemon supports an optional shared-secret password (set via `auth.password` in `config.json` or the `PASEO_PASSWORD` env var; stored bcrypt-hashed). WebSocket clients send the password in `hello`; the daemon sends no session data before admission. Direct connections still accept bearer headers and WebSocket bearer subprotocols for older clients. HTTP stays bearer-header based. Health (`GET /api/health`) and CORS preflight (`OPTIONS`) are exempt; `/api/files/download` uses its own capability token, and `/mcp/agents` and `/mcp/backends` use per-agent tokens (see [Agent identity](#agent-identity-and-the-mcp-gateway)).
 
 The daemon writes a new `$PASEO_HOME/local-credential` on every run with mode `0600` and removes it on shutdown. The CLI and desktop main process read it only for the daemon whose PID lock `listen` matches their connection target. A same-user process can read this credential, so the password protects against network clients and other OS users, not processes running as the daemon user. Protect `$PASEO_HOME` accordingly. Relay traffic remains end-to-end encrypted independently of password admission.
 
@@ -65,6 +65,14 @@ available to anything the agents run inside the container.
 For remote access, use the relay connection. It is the supported path for reaching the daemon off-machine, and it adds end-to-end encryption plus a pairing handshake before commands are accepted.
 
 Host header validation and CORS origin checks are defense-in-depth controls for localhost exposure. They help block DNS rebinding and browser-based attacks, but they do not replace network isolation.
+
+## Agent identity and the MCP gateway
+
+Every agent gets its own random bearer token when it launches. The daemon injects it only into that agent's launch configuration (the `paseo` MCP server and the `{paseoAgentToken}` placeholder), keeps it in memory, revokes it when the agent closes, and forgets it when the daemon stops. On `/mcp/agents` and `/mcp/backends/<name>` the daemon derives the caller from the token alone: no query parameter or header the agent sends can name another agent. Without a token, `/mcp/agents` serves an anonymous caller (open with no password, otherwise the daemon password is required), and the gateway refuses the request.
+
+The gateway (`server/mcp-gateway/`) only reaches backends the daemon configuration or a plugin names; the caller supplies a name, never a URL, and dot segments in the path are refused. It strips the caller's `Authorization` and every `X-Paseo-*` header before setting the identity headers itself, so a backend sees the daemon's statement of identity. The upstream credential comes from the `mcp_gateway.upstream` plugin hook; Paseo itself stores none. A backend should accept the `X-Paseo-*` headers only on requests that carry that credential.
+
+The token separates agents that use their own configuration. It does not separate processes running as the daemon user: such a process can read another agent's launch files or memory. Run agents that must not impersonate each other under different users or daemons.
 
 ## DNS rebinding protection
 

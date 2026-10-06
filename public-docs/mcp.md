@@ -12,10 +12,11 @@ category: Orchestration
 
 ## Configuration
 
-| Setting                       | Default | Purpose                                            |
-| ----------------------------- | ------- | -------------------------------------------------- |
-| `daemon.mcp.enabled`          | `true`  | Run the MCP server.                                |
-| `daemon.mcp.injectIntoAgents` | `false` | Give agents launched by Paseo access to its tools. |
+| Setting                       | Default | Purpose                                                                                                 |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
+| `daemon.mcp.enabled`          | `true`  | Run the MCP server.                                                                                     |
+| `daemon.mcp.injectIntoAgents` | `false` | Give agents launched by Paseo access to its tools.                                                      |
+| `daemon.mcp.gateway.backends` | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon) |
 
 Depending on the provider, Paseo delivers tools through its native tool interface or MCP. The capabilities are the same. Start a new agent or reload an existing one after changing injection settings.
 
@@ -71,6 +72,52 @@ voice-only `speak` tool is separate from this policy.
 
 This setting limits the catalog presented to an agent. It is not a security boundary for an agent
 that can access the host through a shell.
+
+## Reach MCP backends through the daemon
+
+The daemon can proxy an agent's MCP traffic to a named backend and tell the backend which agent is
+calling. Name the backends in `config.json`, or replace the whole set with the
+`PASEO_MCP_GATEWAY_BACKENDS` environment variable (a JSON object of the same shape):
+
+```json
+{
+  "daemon": {
+    "mcp": {
+      "gateway": { "backends": { "cluster": "https://mcp.internal.example/mcp" } }
+    }
+  }
+}
+```
+
+Point an agent's MCP server at the gateway with two placeholders the daemon fills at launch:
+
+```json
+"mcpServers": {
+  "cluster": {
+    "type": "http",
+    "url": "{paseoMcpGatewayUrl}/cluster",
+    "headers": { "Authorization": "Bearer {paseoAgentToken}" }
+  }
+}
+```
+
+`{paseoMcpGatewayUrl}` is the daemon's loopback `/mcp/backends` URL and `{paseoAgentToken}` is the
+launching agent's own token. The gateway forwards the method, path below the backend name, query,
+body and MCP session headers, and streams responses (including SSE) without buffering. It drops the
+agent's `Authorization` and every `X-Paseo-*` header, then sets:
+
+| Header                 | Value                                            |
+| ---------------------- | ------------------------------------------------ |
+| `X-Paseo-Agent-ID`     | The agent the token was issued to                |
+| `X-Paseo-Session-ID`   | The agent's provider session ID, once it has one |
+| `X-Paseo-Workspace-ID` | The agent's workspace, when it has one           |
+| `X-Paseo-Server-ID`    | This daemon's server ID                          |
+
+Paseo holds no backend credential. A plugin supplies one per request through the
+[`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks); without one the request goes
+upstream with no `Authorization`. Unknown backend names get `404`, a missing or unknown token gets
+`401`, an unreachable backend gets `502`, and a backend that sends no response headers within 30
+seconds gets `504`. Backend responses, including errors, pass through unchanged.
 
 ## Mental model
 

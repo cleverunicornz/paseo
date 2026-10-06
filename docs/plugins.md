@@ -320,7 +320,7 @@ for the author-facing contract.
 Server entries register lifecycle observers with `server.on()` and request transforms with
 `server.before()`. The [public reference](../public-docs/plugins/reference.md#lifecycle-hooks)
 owns callback shapes, ordering, and failure behavior. `plugin-examples/lifecycle-logger` registers all
-eleven hooks; `plugin-examples/lifecycle-actions` demonstrates common automation callbacks.
+twelve hooks; `plugin-examples/lifecycle-actions` demonstrates common automation callbacks.
 
 Emit from the operation owner, not a client subscription. Provider history replay must not trigger
 live hooks. Observers must not be awaited inside agent mutations: a callback can send a prompt or
