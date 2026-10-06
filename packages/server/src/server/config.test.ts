@@ -270,7 +270,7 @@ describe("server config", () => {
 
     const fromFile = loadConfig(paseoHome, { env: {} });
     const fromEnv = loadConfig(paseoHome, {
-      env: { PASEO_MCP_GATEWAY_ENV_PASSTHROUGH: '["CODEX_HOME"]' },
+      env: { PASEO_MCP_GATEWAY_ENV_PASSTHROUGH: '["IS_SANDBOX"]' },
     });
     const absent = loadConfig(await mkdtemp(path.join(os.tmpdir(), "paseo-config-none-")), {
       env: {},
@@ -280,7 +280,7 @@ describe("server config", () => {
     expect(fromFile.configReload?.overrideControlledPaths).not.toContain(
       "daemon.mcp.gateway.envPassthrough",
     );
-    expect(fromEnv.mcpGatewayEnvPassthrough).toEqual(["CODEX_HOME"]);
+    expect(fromEnv.mcpGatewayEnvPassthrough).toEqual(["IS_SANDBOX"]);
     expect(fromEnv.configReload?.overrideControlledPaths).toContain(
       "daemon.mcp.gateway.envPassthrough",
     );
@@ -292,6 +292,9 @@ describe("server config", () => {
     ["a non-array", '{"TOOL_SETTING":true}'],
     ["a model credential", '["ANTHROPIC_API_KEY"]'],
     ["a proxy variable", '["https_proxy"]'],
+    ["a prefix holding _PROXY", '["X_PROXY*"]'],
+    ["a loader variable", '["LD_PRELOAD"]'],
+    ["a harness config location", '["CODEX_HOME"]'],
   ])("rejects %s PASEO_MCP_GATEWAY_ENV_PASSTHROUGH", async (_name, value) => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-env-passthrough-bad-"));
     roots.push(paseoHome);
@@ -478,12 +481,13 @@ describe("server config", () => {
   const ACCEPTED_PASSTHROUGH = [
     "TOOL_SETTING",
     "TOOLKIT_*",
-    "CODEX_HOME",
-    "CLAUDE_CONFIG_DIR",
+    "IS_SANDBOX",
     "LC_ALL",
-    "SSL_CERT_FILE",
     "_PRIVATE",
     "PROXYISH_SETTING",
+    "NODE_ENV",
+    "LDAP_SERVER",
+    "LDAP_*",
   ];
   const REFUSED_PASSTHROUGH = [
     "ANTHROPIC_API_KEY",
@@ -522,6 +526,25 @@ describe("server config", () => {
     "CORP_PROXY",
     "HTTP*",
     "N*",
+    "ANTHROPIC*",
+    "X_PROXY*",
+    "x_proxy_*",
+    "TOOL_PROXY*",
+    "LD*",
+    "LD_*",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "ld_preload",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_*",
+    "NODE_OPTIONS",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_*",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SSL*",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
     "",
     "*",
     "1BAD",

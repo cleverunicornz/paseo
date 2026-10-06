@@ -107,6 +107,8 @@ export const UNLISTED_INPUTS = {
   TOOLBOX: "not-a-toolkit-match",
   CLAUDE_CONFIG_DIR: "unlisted-claude-config-dir",
   CODEX_HOME: "unlisted-codex-home",
+  // Matched by the configured `TOOLKIT_*` prefix, but a proxy name never passes.
+  TOOLKIT_PROXY: "http://proxy.invalid:3128",
 };
 
 /** Paseo's own launch values for an agent: per-agent values and plugin-supplied values. */

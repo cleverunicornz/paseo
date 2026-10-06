@@ -68,6 +68,22 @@ const REFUSED_ENV_PREFIXES = [
 ];
 const PROXY_SUFFIX = "_PROXY";
 
+/**
+ * Prefixes of dynamic-loader, Node runtime, TLS trust and harness
+ * configuration-location variables. The pass-through list cannot name them;
+ * they reach a harness only as launch values, which are trusted configuration.
+ */
+const PASSTHROUGH_REFUSED_PREFIXES = [
+  "LD_",
+  "DYLD_",
+  "NODE_OPTIONS",
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
+];
+
 /** Hosts that always bypass any proxy a harness might still be told about. */
 const LOOPBACK_HOSTS = ["127.0.0.1", "localhost", "::1"];
 
@@ -76,6 +92,11 @@ export function isRefusedHarnessEnvName(name: string): boolean {
   return (
     upper.endsWith(PROXY_SUFFIX) || REFUSED_ENV_PREFIXES.some((prefix) => upper.startsWith(prefix))
   );
+}
+
+function isPassthroughRefusedName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return PASSTHROUGH_REFUSED_PREFIXES.some((prefix) => upper.startsWith(prefix));
 }
 
 function isBaseEnvName(name: string): boolean {
@@ -104,16 +125,23 @@ function leadingParts(text: string): string {
 /** A pass-through entry: a variable name, or a name prefix followed by `*`. */
 export const MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE = "^[A-Za-z_][A-Za-z0-9_]*\\*?$";
 
+const PASSTHROUGH_REFUSED = [...REFUSED_ENV_PREFIXES, ...PASSTHROUGH_REFUSED_PREFIXES];
+
 /**
  * The one rule for refused pass-through entries, shared by startup
- * validation, the persisted config schema and the published JSON schema: an
- * entry is refused when it names, or as a prefix could match, a refused
- * variable, or names a `*_PROXY` variable.
+ * validation, the persisted config schema and the published JSON schema,
+ * compared without regard to case. An entry is refused when:
+ * - it starts with a refused prefix (a name, or a prefix entry inside one);
+ * - it is a prefix entry that could match a refused prefix (`ANTHROPIC*`, `LD*`);
+ * - it names a `*_PROXY` variable, or is a prefix entry holding `_PROXY` (`X_PROXY*`).
+ * Names ending in `_PROXY` are also dropped at launch when a broader prefix
+ * entry (such as `TOOL_*`) matches them.
  */
 export const MCP_GATEWAY_REFUSED_ENV_PASSTHROUGH_PATTERN_SOURCE = [
-  `^(?:${REFUSED_ENV_PREFIXES.map(anyCase).join("|")})[A-Za-z0-9_]*\\*?$`,
-  `^(?:${REFUSED_ENV_PREFIXES.map(leadingParts).join("|")})\\*$`,
+  `^(?:${PASSTHROUGH_REFUSED.map(anyCase).join("|")})[A-Za-z0-9_]*\\*?$`,
+  `^(?:${PASSTHROUGH_REFUSED.map(leadingParts).join("|")})\\*$`,
   `^[A-Za-z0-9_]*${anyCase(PROXY_SUFFIX)}$`,
+  `^[A-Za-z0-9_]*${anyCase(PROXY_SUFFIX)}[A-Za-z0-9_]*\\*$`,
 ].join("|");
 
 const ENTRY_PATTERN = new RegExp(MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE);
@@ -185,7 +213,8 @@ export function buildModelGatewayEnv(input: ModelGatewayEnvInput): Record<string
       if (
         value !== undefined &&
         (isBaseEnvName(name) || matchesPassthrough(name, input.envPassthrough)) &&
-        !isRefusedHarnessEnvName(name)
+        !isRefusedHarnessEnvName(name) &&
+        !isPassthroughRefusedName(name)
       ) {
         env[name] = value;
       }
