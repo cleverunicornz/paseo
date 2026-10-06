@@ -10,18 +10,28 @@ import { CodexAppServerAgentClient } from "./codex-app-server-agent.js";
 
 const GATEWAY_URL = "http://127.0.0.1:6767/mcp/backends/models";
 const AGENT_TOKEN = "per-agent-token-3b9e";
-const INHERITED_KEY = "inherited-model-key-77a1";
-const INHERITED_OAUTH = "inherited-oauth-token-0c4d";
-
-const RECORDED_ENV_KEYS = [
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_AUTH_TOKEN",
+/**
+ * Model-provider credential and endpoint variables a harness could inherit.
+ * Stated here independently of the implementation's list.
+ */
+const MODEL_PROVIDER_VARIABLES = [
   "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
   "CLAUDE_CODE_OAUTH_TOKEN",
   "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
   "CODEX_API_KEY",
-  "PASEO_MODEL_GATEWAY_TOKEN",
-];
+] as const;
+
+/** One inherited value per variable and source, so any survivor is identifiable. */
+function inherited(source: "process" | "settings" | "launch"): Record<string, string> {
+  return Object.fromEntries(
+    MODEL_PROVIDER_VARIABLES.map((name) => [name, `inherited-${source}-${name.toLowerCase()}`]),
+  );
+}
+
+const RECORDED_ENV_KEYS = [...MODEL_PROVIDER_VARIABLES, "PASEO_MODEL_GATEWAY_TOKEN"];
 
 interface LaunchRecord {
   argv: string[];
@@ -29,16 +39,25 @@ interface LaunchRecord {
 }
 
 const roots: string[] = [];
-const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+const savedProcessEnv = Object.fromEntries(
+  MODEL_PROVIDER_VARIABLES.map((name) => [name, process.env[name]]),
+);
+
+/** The daemon's own environment carries every variable, as a host with model credentials would. */
+function inheritFromDaemonProcess(): void {
+  Object.assign(process.env, inherited("process"));
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
-  if (savedOauth === undefined) {
-    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  } else {
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+  for (const [name, value] of Object.entries(savedProcessEnv)) {
+    if (value === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
   }
 });
 
@@ -118,17 +137,17 @@ function launches(recordPath: string): LaunchRecord[] {
   ) as unknown as LaunchRecord[];
 }
 
-function gatewayLaunch(
-  agentId: string,
-  modelKeyVariable: string,
-  token = AGENT_TOKEN,
-): AgentLaunchContext {
+function gatewayLaunch(agentId: string, token = AGENT_TOKEN): AgentLaunchContext {
   return {
     agentId,
-    // A plugin session_open hook may hand back a model key; the gateway still wins.
-    env: { [modelKeyVariable]: INHERITED_KEY },
+    // Launch values (e.g. from an agent.session_open hook) carry every variable too.
+    env: inherited("launch"),
     modelGateway: { baseUrl: GATEWAY_URL, token },
   };
+}
+
+function plainLaunch(agentId: string): AgentLaunchContext {
+  return { agentId, env: inherited("launch") };
 }
 
 async function launchClaude(
@@ -136,10 +155,10 @@ async function launchClaude(
   launchContext: AgentLaunchContext,
 ): Promise<LaunchRecord> {
   const { binary, recordPath } = createRecordingClaudeBinary(root);
-  process.env.CLAUDE_CODE_OAUTH_TOKEN = INHERITED_OAUTH;
+  inheritFromDaemonProcess();
   const client = new ClaudeAgentClient({
     logger: createTestLogger(),
-    runtimeSettings: { env: { ANTHROPIC_API_KEY: INHERITED_KEY } },
+    runtimeSettings: { env: inherited("settings") },
     resolveBinary: async () => binary,
     resolveVersion: async () => "2.1.0",
   });
@@ -159,9 +178,10 @@ async function launchCodex(
   launchContext: AgentLaunchContext,
 ): Promise<{ launch: LaunchRecord; threadStartConfig: unknown }> {
   const { script, recordPath } = createRecordingCodexAppServer(root);
+  inheritFromDaemonProcess();
   const client = new CodexAppServerAgentClient(createTestLogger(), {
     command: { mode: "replace", argv: [process.execPath, script] },
-    env: { OPENAI_API_KEY: INHERITED_KEY, CODEX_API_KEY: INHERITED_KEY },
+    env: inherited("settings"),
   });
   const session = await client.createSession(
     { provider: "codex", cwd: root, modeId: "auto", model: "gateway-model" },
@@ -184,10 +204,10 @@ async function launchCodex(
 }
 
 describe("model traffic through the daemon's gateway", () => {
-  test("Claude Code launches against the gateway with exactly its own agent token", async () => {
+  test("Claude Code inherits no model-provider variable; only its own gateway values remain", async () => {
     const root = createRoot("claude");
 
-    const launch = await launchClaude(root, gatewayLaunch("agent-claude", "ANTHROPIC_API_KEY"));
+    const launch = await launchClaude(root, gatewayLaunch("agent-claude"));
 
     expect(launch.env).toEqual({
       ANTHROPIC_BASE_URL: GATEWAY_URL,
@@ -197,37 +217,25 @@ describe("model traffic through the daemon's gateway", () => {
   });
 
   test("a second Claude agent launches with its own, different token", async () => {
-    const first = await launchClaude(
-      createRoot("claude-a"),
-      gatewayLaunch("agent-a", "ANTHROPIC_API_KEY", "token-a"),
-    );
-    const second = await launchClaude(
-      createRoot("claude-b"),
-      gatewayLaunch("agent-b", "ANTHROPIC_API_KEY", "token-b"),
-    );
+    const first = await launchClaude(createRoot("claude-a"), gatewayLaunch("agent-a", "token-a"));
+    const second = await launchClaude(createRoot("claude-b"), gatewayLaunch("agent-b", "token-b"));
 
     expect(first.env.ANTHROPIC_AUTH_TOKEN).toBe("token-a");
     expect(second.env.ANTHROPIC_AUTH_TOKEN).toBe("token-b");
   });
 
-  test("Claude Code without a model gateway keeps its inherited credentials", async () => {
+  test("Claude Code without a model gateway keeps its inherited variables", async () => {
     const root = createRoot("claude-plain");
 
-    const launch = await launchClaude(root, { agentId: "agent-plain", env: {} });
+    const launch = await launchClaude(root, plainLaunch("agent-plain"));
 
-    expect(launch.env).toEqual({
-      ANTHROPIC_API_KEY: INHERITED_KEY,
-      CLAUDE_CODE_OAUTH_TOKEN: INHERITED_OAUTH,
-    });
+    expect(launch.env).toEqual(inherited("launch"));
   });
 
-  test("Codex launches a responses provider at the gateway keyed by its own agent token", async () => {
+  test("Codex inherits no model-provider variable; only its own gateway token remains", async () => {
     const root = createRoot("codex");
 
-    const { launch, threadStartConfig } = await launchCodex(
-      root,
-      gatewayLaunch("agent-codex", "OPENAI_API_KEY"),
-    );
+    const { launch, threadStartConfig } = await launchCodex(root, gatewayLaunch("agent-codex"));
 
     expect(launch.env).toEqual({ PASEO_MODEL_GATEWAY_TOKEN: AGENT_TOKEN });
     expect(launch.argv.join(" ")).not.toContain(AGENT_TOKEN);
@@ -247,14 +255,8 @@ describe("model traffic through the daemon's gateway", () => {
   });
 
   test("a second Codex agent launches with its own, different token", async () => {
-    const first = await launchCodex(
-      createRoot("codex-a"),
-      gatewayLaunch("agent-a", "OPENAI_API_KEY", "token-a"),
-    );
-    const second = await launchCodex(
-      createRoot("codex-b"),
-      gatewayLaunch("agent-b", "OPENAI_API_KEY", "token-b"),
-    );
+    const first = await launchCodex(createRoot("codex-a"), gatewayLaunch("agent-a", "token-a"));
+    const second = await launchCodex(createRoot("codex-b"), gatewayLaunch("agent-b", "token-b"));
 
     expect(first.launch.env.PASEO_MODEL_GATEWAY_TOKEN).toBe("token-a");
     expect(second.launch.env.PASEO_MODEL_GATEWAY_TOKEN).toBe("token-b");
@@ -263,12 +265,9 @@ describe("model traffic through the daemon's gateway", () => {
   test("Codex without a model gateway launches as before", async () => {
     const root = createRoot("codex-plain");
 
-    const { launch, threadStartConfig } = await launchCodex(root, {
-      agentId: "agent-plain",
-      env: {},
-    });
+    const { launch, threadStartConfig } = await launchCodex(root, plainLaunch("agent-plain"));
 
-    expect(launch.env).toEqual({ OPENAI_API_KEY: INHERITED_KEY, CODEX_API_KEY: INHERITED_KEY });
+    expect(launch.env).toEqual(inherited("launch"));
     expect(threadStartConfig ?? {}).not.toHaveProperty("model_provider");
     expect(threadStartConfig ?? {}).not.toHaveProperty("model_providers");
   });

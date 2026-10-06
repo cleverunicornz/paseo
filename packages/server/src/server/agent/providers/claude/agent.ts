@@ -141,6 +141,7 @@ import {
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
 import type { ProcessEnvRecord } from "../../../paseo-env.js";
+import { withModelGatewayEnv } from "../../model-gateway-env.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { execCommand } from "../../../../utils/spawn.js";
@@ -416,9 +417,9 @@ interface ClaudeAgentClientOptions {
  * The launch environment Claude Code gets. With a model gateway it sends model
  * calls to the gateway as `Authorization: Bearer <agent token>`
  * (`ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_API_KEY` would travel as `x-api-key`,
- * which the gateway forwards), and inherited model credentials are removed so
- * the agent holds none. This overlay is applied last, over runtime settings
- * and plugin-supplied launch values.
+ * which the gateway forwards), and every model-provider variable is removed
+ * so the agent holds no credential. This overlay is applied last, over
+ * runtime settings and plugin-supplied launch values.
  */
 function claudeLaunchEnv(
   launchContext: AgentLaunchContext | undefined,
@@ -427,13 +428,10 @@ function claudeLaunchEnv(
   if (!gateway) {
     return launchContext?.env;
   }
-  return {
-    ...launchContext.env,
+  return withModelGatewayEnv(launchContext.env, {
     ANTHROPIC_BASE_URL: gateway.baseUrl,
     ANTHROPIC_AUTH_TOKEN: gateway.token,
-    ANTHROPIC_API_KEY: undefined,
-    CLAUDE_CODE_OAUTH_TOKEN: undefined,
-  };
+  });
 }
 
 interface ClaudeAgentSessionOptions {

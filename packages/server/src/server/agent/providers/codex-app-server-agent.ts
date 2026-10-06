@@ -40,6 +40,7 @@ import {
   type ResolveAgentDefaultModeInput,
 } from "../agent-sdk-types.js";
 import type { ProcessEnvRecord } from "../../paseo-env.js";
+import { withModelGatewayEnv } from "../model-gateway-env.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
@@ -3350,7 +3351,8 @@ function buildCodexModelGatewayConfig(
 
 /**
  * The app-server's launch environment: with a model gateway, the agent's token
- * under `CODEX_MODEL_GATEWAY_TOKEN_ENV` and no inherited model credential.
+ * under `CODEX_MODEL_GATEWAY_TOKEN_ENV` and no model-provider variable of any
+ * kind.
  */
 function codexLaunchEnv(
   launchContext: AgentLaunchContext | undefined,
@@ -3359,12 +3361,9 @@ function codexLaunchEnv(
   if (!gateway) {
     return launchContext?.env;
   }
-  return {
-    ...launchContext.env,
+  return withModelGatewayEnv(launchContext.env, {
     [CODEX_MODEL_GATEWAY_TOKEN_ENV]: gateway.token,
-    OPENAI_API_KEY: undefined,
-    CODEX_API_KEY: undefined,
-  };
+  });
 }
 
 interface CodexSubAgentCallState {

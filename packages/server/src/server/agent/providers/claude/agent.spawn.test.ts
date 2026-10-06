@@ -12,6 +12,17 @@ import * as spawnUtils from "../../../../utils/spawn.js";
 import { ClaudeAgentClient } from "./agent.js";
 import type { ClaudeQueryInput } from "./query.js";
 
+/** Model-provider credential and endpoint variables a harness could inherit. */
+const MODEL_PROVIDER_VARIABLES = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "CODEX_API_KEY",
+];
+
 function createQueryMock(events: unknown[]): Query {
   let index = 0;
   return {
@@ -102,7 +113,7 @@ describe("Claude spawn override", () => {
     const spawnOptions = claudeSpawnCall?.[2];
     expect(spawnOptions?.shell).toBe(false);
   });
-  test("a node-launched Claude Code with a model gateway holds no inherited model credential", async () => {
+  test("a node-launched Claude Code with a model gateway carries only its own gateway values", async () => {
     let capturedOptions: Options | undefined;
     const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
       capturedOptions = options;
@@ -117,16 +128,21 @@ describe("Claude spawn override", () => {
       ]);
     });
     const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(createChildProcessStub());
-    const saved = {
-      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
-      CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
-    };
-    process.env.ANTHROPIC_API_KEY = "daemon-model-key";
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "daemon-oauth-token";
+    const saved = Object.fromEntries(
+      MODEL_PROVIDER_VARIABLES.map((name) => [name, process.env[name]]),
+    );
+    for (const name of MODEL_PROVIDER_VARIABLES) {
+      process.env[name] = `daemon-${name.toLowerCase()}`;
+    }
     const client = new ClaudeAgentClient({
       logger: createTestLogger(),
       queryFactory,
       resolveBinary: async () => "/test/claude/bin",
+      runtimeSettings: {
+        env: Object.fromEntries(
+          MODEL_PROVIDER_VARIABLES.map((name) => [name, `settings-${name.toLowerCase()}`]),
+        ),
+      },
     });
     try {
       const session = await client.createSession(
@@ -140,6 +156,7 @@ describe("Claude spawn override", () => {
       try {
         await session.run("gateway");
         expect(capturedOptions?.env?.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(capturedOptions?.env?.OPENAI_API_KEY).toBeUndefined();
         capturedOptions?.spawnClaudeCodeProcess?.({
           command: "node",
           args: ["claude.js"],
@@ -159,9 +176,14 @@ describe("Claude spawn override", () => {
 
     const call = spawnSpy.mock.calls.find(([, args]) => args[0] === "claude.js");
     const env = call?.[2]?.env as Record<string, string | undefined> | undefined;
-    expect(env?.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:6767/mcp/backends/models");
-    expect(env?.ANTHROPIC_AUTH_TOKEN).toBe("t-1");
-    expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
-    expect(env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    const modelEnv = Object.fromEntries(
+      MODEL_PROVIDER_VARIABLES.flatMap((name) =>
+        env?.[name] === undefined ? [] : [[name, env[name]]],
+      ),
+    );
+    expect(modelEnv).toEqual({
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:6767/mcp/backends/models",
+      ANTHROPIC_AUTH_TOKEN: "t-1",
+    });
   });
 });
