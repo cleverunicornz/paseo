@@ -94,6 +94,27 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
 
+/**
+ * A record on disk carries the agent's MCP templates (placeholders unresolved)
+ * in its persistence metadata, taken from the stored configuration; resume
+ * resolves them again.
+ */
+function withTemplateMcpServers(record: StoredAgentRecord): StoredAgentRecord {
+  const metadata = record.persistence?.metadata;
+  if (!metadata || !Object.hasOwn(metadata, "mcpServers")) {
+    return record;
+  }
+  const { mcpServers: _resolved, ...rest } = metadata;
+  const template = record.config?.mcpServers;
+  return {
+    ...record,
+    persistence: {
+      ...record.persistence!,
+      metadata: template ? { ...rest, mcpServers: template } : rest,
+    },
+  };
+}
+
 export class AgentStorage {
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
@@ -184,7 +205,8 @@ export class AgentStorage {
     return tracked;
   }
 
-  private async writeRecord(record: StoredAgentRecord): Promise<void> {
+  private async writeRecord(input: StoredAgentRecord): Promise<void> {
+    const record = withTemplateMcpServers(input);
     const agentId = record.id;
     const nextPath = this.buildRecordPath(record);
     const previousPath = this.pathById.get(agentId);

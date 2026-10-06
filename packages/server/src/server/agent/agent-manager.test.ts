@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -14,6 +14,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { AgentTokenRegistry } from "./agent-tokens.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -2994,7 +2995,8 @@ test("createAgent injects paseo MCP server only into provider launch config", as
   expect(client.lastConfig?.mcpServers).toEqual({
     paseo: {
       type: "http",
-      url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
+      url: "http://127.0.0.1:6767/mcp/agents",
+      headers: { Authorization: `Bearer ${manager.issueAgentToken(snapshot.id)}` },
     },
     custom: {
       type: "stdio",
@@ -3389,6 +3391,139 @@ test("createAgent passes native Paseo tools through launch context without inter
   });
 });
 
+test("each agent launches with its own token, which closing the agent revokes", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class CaptureClient extends TestAgentClient {
+    override readonly capabilities = { ...TEST_CAPABILITIES, supportsMcpServers: true };
+    readonly configs: AgentSessionConfig[] = [];
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      this.configs.push(config);
+      return new McpCapableTestAgentSession(config);
+    }
+  }
+
+  const client = new CaptureClient();
+  const agentTokens = new AgentTokenRegistry();
+  let nextId = 0;
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+    agentTokens,
+    idFactory: () => `00000000-0000-4000-8000-00000000020${nextId++}`,
+  });
+  manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+
+  const gatewayConfig: AgentSessionConfig = {
+    provider: "codex",
+    cwd: workdir,
+    mcpServers: {
+      cluster: {
+        type: "http",
+        url: "{paseoMcpGatewayUrl}/cluster",
+        headers: { Authorization: "Bearer {paseoAgentToken}" },
+      },
+    },
+  };
+  const first = await manager.createAgent(gatewayConfig, undefined, { workspaceId: undefined });
+  const second = await manager.createAgent(gatewayConfig, undefined, { workspaceId: undefined });
+
+  const bearer = (config: AgentSessionConfig | undefined, server: string) => {
+    const entry = config?.mcpServers?.[server];
+    return entry && entry.type !== "stdio" ? entry.headers?.Authorization : undefined;
+  };
+  const firstToken = bearer(client.configs[0], "paseo")?.replace(/^Bearer /, "");
+  const secondToken = bearer(client.configs[1], "paseo")?.replace(/^Bearer /, "");
+  expect(firstToken).toBeTruthy();
+  expect(secondToken).toBeTruthy();
+  expect(firstToken).not.toBe(secondToken);
+  expect(agentTokens.resolve(firstToken!)).toBe(first.id);
+  expect(agentTokens.resolve(secondToken!)).toBe(second.id);
+  expect(client.configs[0]?.mcpServers?.cluster).toEqual({
+    type: "http",
+    url: "http://127.0.0.1:6767/mcp/backends/cluster",
+    headers: { Authorization: `Bearer ${firstToken}` },
+  });
+  // Stored configuration keeps its templates; tokens never reach disk.
+  expect(manager.getAgent(first.id)?.config.mcpServers?.cluster).toEqual(
+    gatewayConfig.mcpServers?.cluster,
+  );
+
+  await manager.closeAgent(first.id);
+  expect(agentTokens.resolve(firstToken!)).toBeNull();
+  expect(agentTokens.resolve(secondToken!)).toBe(second.id);
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+test.each(["claude", "codex", "acp"])(
+  "agent records on disk hold MCP templates, never resolved launch values, for %s",
+  async (provider) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+    const storagePath = join(workdir, "agents");
+    const storage = new AgentStorage(storagePath, logger);
+
+    // This session reports its launch configuration as persistence metadata.
+    class ResolvedMetadataSession extends McpCapableTestAgentSession {
+      override describePersistence(): AgentPersistenceHandle {
+        return { provider, sessionId: this.id, metadata: { ...this.config } };
+      }
+    }
+    class CaptureClient extends TestAgentClient {
+      override readonly capabilities = { ...TEST_CAPABILITIES, supportsMcpServers: true };
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        return new ResolvedMetadataSession(config);
+      }
+    }
+
+    const agentTokens = new AgentTokenRegistry();
+    const manager = new AgentManager({
+      clients: { [provider]: new CaptureClient() },
+      registry: storage,
+      logger,
+      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+      agentTokens,
+    });
+    manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+    const template = {
+      cluster: {
+        type: "http" as const,
+        url: "{paseoMcpGatewayUrl}/cluster",
+        headers: { Authorization: "Bearer {paseoAgentToken}", "X-Tenant": "{tenant}" },
+      },
+    };
+
+    try {
+      const snapshot = await manager.createAgent(
+        { provider, cwd: workdir, mcpServers: template },
+        undefined,
+        { workspaceId: undefined, env: { tenant: "tenant-secret-value" } },
+      );
+      await manager.flush();
+      const token = manager.issueAgentToken(snapshot.id);
+
+      const files = readdirSync(storagePath, { recursive: true, encoding: "utf8" })
+        .map((entry) => join(storagePath, entry))
+        .filter((file) => file.endsWith(".json"));
+      expect(files.length).toBeGreaterThan(0);
+      const written = files.map((file) => readFileSync(file, "utf8")).join("\n");
+      expect(written).not.toContain(token);
+      expect(written).not.toContain("tenant-secret-value");
+      expect(written).not.toContain("127.0.0.1:6767/mcp/backends");
+
+      const stored = await storage.get(snapshot.id);
+      expect(stored?.config?.mcpServers).toEqual(template);
+      expect(stored?.persistence?.metadata?.mcpServers).toEqual(template);
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
 test("createAgent allows best-effort internal MCP when the provider session reports no support", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
@@ -3404,6 +3539,7 @@ test("createAgent allows best-effort internal MCP when the provider session repo
   }
 
   const client = new CaptureClient();
+  const agentTokens = new AgentTokenRegistry();
   const manager = new AgentManager({
     clients: {
       codex: client,
@@ -3411,7 +3547,7 @@ test("createAgent allows best-effort internal MCP when the provider session repo
     registry: storage,
     logger,
     mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
-    mcpAuthToken: "cap-token",
+    agentTokens,
     idFactory: () => "00000000-0000-4000-8000-000000000104",
   });
 
@@ -3424,11 +3560,12 @@ test("createAgent allows best-effort internal MCP when the provider session repo
     { workspaceId: undefined },
   );
 
-  expect(manager.getMcpAuthToken()).toBe("cap-token");
+  const token = manager.issueAgentToken(snapshot.id);
+  expect(agentTokens.resolve(token)).toBe(snapshot.id);
   expect(client.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
-    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
-    headers: { Authorization: "Bearer cap-token" },
+    url: "http://127.0.0.1:6767/mcp/agents",
+    headers: { Authorization: `Bearer ${token}` },
   });
 
   rmSync(workdir, { recursive: true, force: true });
@@ -3566,7 +3703,8 @@ test("keeps the global Paseo-tools gate outside provider policy and MCP injectio
 
   expect(enabledClient.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
-    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${enabledAgent.id}`,
+    url: "http://127.0.0.1:6767/mcp/agents",
+    headers: { Authorization: `Bearer ${enabledManager.issueAgentToken(enabledAgent.id)}` },
   });
 
   const disabledClient = new McpClient();
@@ -3635,7 +3773,8 @@ test("resumeAgentFromPersistence replaces stored internal paseo MCP with current
   expect(client.resumeOverrides[0]?.mcpServers).toEqual({
     paseo: {
       type: "http",
-      url: `http://127.0.0.1:6768/mcp/agents?callerAgentId=${snapshot.id}`,
+      url: "http://127.0.0.1:6768/mcp/agents",
+      headers: { Authorization: `Bearer ${manager.issueAgentToken(snapshot.id)}` },
     },
     custom: {
       type: "stdio",

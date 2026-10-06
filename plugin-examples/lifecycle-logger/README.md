@@ -1,8 +1,9 @@
 # Lifecycle logger
 
-Registers all eleven server lifecycle hooks and logs their data as JSON. It observes agent creation,
-session opening, turns, permissions, archive, and workspace creation/archive. Before hooks return
-the request unchanged. Environment values are redacted; prompts and timeline content are logged.
+Registers all twelve server lifecycle hooks and logs their data as JSON. It observes agent creation,
+session opening, turns, permissions, archive, workspace creation/archive, and MCP gateway requests.
+Before hooks return the request unchanged. Environment and header values are redacted; prompts and
+timeline content are logged.
 
 Install it on a daemon where plugins are enabled:
 

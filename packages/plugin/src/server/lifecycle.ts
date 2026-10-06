@@ -39,6 +39,24 @@ export interface PluginSessionOpenRequest {
   env: Record<string, string>;
 }
 
+/**
+ * One request an agent sends through the daemon's MCP gateway
+ * (`/mcp/backends/<backend>`). The identity fields come from the agent's
+ * daemon-issued token and cannot be changed. `url` is the configured backend
+ * URL, or `null` when the daemon config does not name `backend`; a hook may
+ * set it to serve a backend of its own. `headers` are added to the upstream
+ * request, e.g. an `Authorization` credential; Paseo sets the `X-Paseo-*`
+ * identity headers itself.
+ */
+export interface PluginMcpGatewayUpstreamRequest {
+  backend: string;
+  agentId: string;
+  sessionId: string | null;
+  workspaceId: string | null;
+  url: string | null;
+  headers: Record<string, string>;
+}
+
 export type PluginTurnOutcome =
   | { kind: "completed" }
   | { kind: "failed"; error: { message: string; code?: string } }
@@ -68,6 +86,7 @@ export interface PluginBeforeRequests {
   "agent.create": { config: AgentSessionConfig; env?: Record<string, string> };
   "agent.session_open": PluginSessionOpenRequest;
   "workspace.create": Omit<WorkspaceCreateRequest, "type" | "requestId">;
+  "mcp_gateway.upstream": PluginMcpGatewayUpstreamRequest;
 }
 
 export interface PluginLifecycleRegistration {

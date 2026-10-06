@@ -1,11 +1,16 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { loadConfig, resolveBundledWebUiDistDir, resolveConfigFromPersisted } from "./config.js";
-import { loadPersistedConfig } from "./persisted-config.js";
+import { loadPersistedConfig, PersistedConfigSchema } from "./persisted-config.js";
+import {
+  isMcpGatewayBackendUrl,
+  MCP_GATEWAY_BACKEND_NAME_PATTERN,
+  parseMcpGatewayBackends,
+} from "./mcp-gateway/backends.js";
 
 const roots: string[] = [];
 
@@ -150,6 +155,180 @@ describe("server config", () => {
     );
 
     expect(config.configReload?.overrideControlledPaths).toEqual(expected);
+  });
+
+  test("loads named MCP gateway backends from config and lets the environment replace them", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: {
+          mcp: { gateway: { backends: { cluster: "https://cluster-mcp.example/mcp" } } },
+        },
+      }),
+    );
+
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    const fromEnv = loadConfig(paseoHome, {
+      env: { PASEO_MCP_GATEWAY_BACKENDS: '{"docs":"http://127.0.0.1:9000/mcp"}' },
+    });
+
+    expect(fromFile.mcpGatewayBackends).toEqual({ cluster: "https://cluster-mcp.example/mcp" });
+    expect(fromFile.configReload?.overrideControlledPaths).not.toContain(
+      "daemon.mcp.gateway.backends",
+    );
+    expect(fromEnv.mcpGatewayBackends).toEqual({ docs: "http://127.0.0.1:9000/mcp" });
+    expect(fromEnv.configReload?.overrideControlledPaths).toContain("daemon.mcp.gateway.backends");
+  });
+
+  test.each([
+    ["non-JSON", "cluster=https://x"],
+    ["a non-object", '["https://x"]'],
+    ["a non-http URL", '{"cluster":"file:///etc/passwd"}'],
+    ["an invalid backend name", '{"a/b":"https://x"}'],
+  ])("rejects %s PASEO_MCP_GATEWAY_BACKENDS", async (_name, value) => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-bad-"));
+    roots.push(paseoHome);
+
+    expect(() => loadConfig(paseoHome, { env: { PASEO_MCP_GATEWAY_BACKENDS: value } })).toThrow(
+      "PASEO_MCP_GATEWAY_BACKENDS",
+    );
+  });
+
+  const VALID_BACKEND_URLS = [
+    "http://localhost",
+    "https://cluster-mcp.example/mcp",
+    "HTTPS://Cluster.Example/mcp?tenant=a&b=c",
+    "http://127.0.0.1:9000/mcp",
+    "http://10.0.0.1:65535/",
+    "https://[::1]:8443/mcp",
+    "http://[2001:db8::1]/",
+    "http://[::ffff:192.0.2.1]/mcp",
+    "http://svc.ns.svc.cluster.local:80/mcp/v1",
+    "http://a.b-c.d/x%20y",
+  ];
+  const INVALID_BACKEND_URLS = [
+    "http://",
+    "https://",
+    "https://[",
+    "http:host",
+    "http:/host",
+    "http://user:pass@host/mcp",
+    "http://user@host",
+    "http://@host",
+    "ftp://host",
+    "file:///etc/hosts",
+    "//host/mcp",
+    "host/mcp",
+    "http://host:99999",
+    "http://host:65536",
+    "http://host:port",
+    "http://ho st",
+    "http://host/mcp#frag",
+    "http://999.1.1.1",
+    "http://1.2.3.4.5",
+    "http://-host",
+    "http://host-",
+    "http://host_name",
+    "http://xn--bcher-kva.example",
+    "http://a--b.example",
+    "http://exa..mple",
+    "http://host.",
+    "http://[::g]",
+    "http://[:::]",
+    "http://[1::2::3]",
+    "http://host\\mcp",
+    " http://host",
+    "http://host/a b",
+  ];
+
+  async function readPublishedBackendSchema() {
+    const schemaPath = path.resolve(
+      import.meta.dirname,
+      "../../../website/public/schemas/paseo.config.v1.json",
+    );
+    const schema = JSON.parse(await readFile(schemaPath, "utf8"));
+    return schema.definitions.PaseoConfigV1.properties.daemon.properties.mcp.properties.gateway
+      .properties.backends;
+  }
+
+  function persistedSchemaAccepts(url: string): boolean {
+    return PersistedConfigSchema.safeParse({
+      daemon: { mcp: { gateway: { backends: { cluster: url } } } },
+    }).success;
+  }
+
+  function startupAccepts(url: string): boolean {
+    try {
+      parseMcpGatewayBackends({ cluster: url }, "backends");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  test.each([
+    ...VALID_BACKEND_URLS.map((url) => [url, true] as const),
+    ...INVALID_BACKEND_URLS.map((url) => [url, false] as const),
+  ])(
+    "startup, the persisted schema and the published schema agree on backend URL %j (%s)",
+    async (url, valid) => {
+      const published = await readPublishedBackendSchema();
+      expect(isMcpGatewayBackendUrl(url)).toBe(valid);
+      expect(startupAccepts(url)).toBe(valid);
+      expect(persistedSchemaAccepts(url)).toBe(valid);
+      expect(new RegExp(published.additionalProperties.pattern).test(url)).toBe(valid);
+    },
+  );
+
+  test.each(VALID_BACKEND_URLS)(
+    "an accepted backend URL %j parses with its host and no credentials",
+    (url) => {
+      const parsed = new URL(url);
+      expect(["http:", "https:"]).toContain(parsed.protocol);
+      expect(parsed.hostname).not.toBe("");
+      expect(parsed.username).toBe("");
+      expect(parsed.password).toBe("");
+      expect(parsed.hash).toBe("");
+    },
+  );
+
+  test("startup, the persisted schema and the published schema agree on backend names", async () => {
+    const published = await readPublishedBackendSchema();
+    const namePattern = new RegExp(published.propertyNames.pattern);
+    for (const [name, valid] of [
+      ["cluster", true],
+      ["c.1_x-y", true],
+      ["-cluster", false],
+      ["a/b", false],
+      ["", false],
+    ] as const) {
+      expect(namePattern.test(name)).toBe(valid);
+      expect(MCP_GATEWAY_BACKEND_NAME_PATTERN.test(name)).toBe(valid);
+      expect(
+        PersistedConfigSchema.safeParse({
+          daemon: { mcp: { gateway: { backends: { [name]: "http://host" } } } },
+        }).success,
+      ).toBe(valid);
+    }
+  });
+
+  test("rejects a persisted MCP gateway backend that is not an http URL", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-file-"));
+    roots.push(paseoHome);
+    const persisted = loadPersistedConfig(paseoHome);
+
+    expect(() =>
+      resolveConfigFromPersisted(
+        paseoHome,
+        {
+          ...persisted,
+          daemon: { mcp: { gateway: { backends: { cluster: "ftp://cluster.example" } } } },
+        },
+        { env: {} },
+      ),
+    ).toThrow("daemon.mcp.gateway.backends");
   });
 
   test("resolves bundled web UI path from source-tree modules", () => {

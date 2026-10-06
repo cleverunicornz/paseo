@@ -98,3 +98,56 @@ test("session-open hooks reject changes to session identity instead of silently 
     ),
   ).rejects.toThrow("agent.session_open hooks can only change env");
 });
+
+const GATEWAY_REQUEST = {
+  backend: "cluster",
+  agentId: "agent",
+  sessionId: "session",
+  workspaceId: null,
+  url: "https://mcp.example/mcp",
+  headers: {},
+};
+
+test("mcp_gateway.upstream hooks can set upstream headers and the backend URL", async () => {
+  const hooks = new PluginHookHandlers(() => {});
+  hooks.before("mcp_gateway.upstream", ({ request }) => {
+    return {
+      ...request,
+      headers: { ...request.headers, Authorization: `Bearer for-${request.agentId}` },
+    };
+  });
+  hooks.before("mcp_gateway.upstream", ({ request }) => {
+    return { ...request, url: "http://127.0.0.1:9000/mcp" };
+  });
+  expect(
+    await hooks.invoke("operation", "before", "mcp_gateway.upstream", GATEWAY_REQUEST, paseo),
+  ).toEqual({
+    ...GATEWAY_REQUEST,
+    url: "http://127.0.0.1:9000/mcp",
+    headers: { Authorization: "Bearer for-agent" },
+  });
+});
+
+test.each([
+  ["agentId", { agentId: "another-agent" }],
+  ["backend", { backend: "another-backend" }],
+  ["sessionId", { sessionId: "another-session" }],
+  ["workspaceId", { workspaceId: "workspace" }],
+])("mcp_gateway.upstream hooks keep the caller's %s unchanged", async (_field, change) => {
+  const hooks = new PluginHookHandlers(() => {});
+  hooks.before("mcp_gateway.upstream", ({ request }) => ({ ...request, ...change }));
+  await expect(
+    hooks.invoke("operation", "before", "mcp_gateway.upstream", GATEWAY_REQUEST, paseo),
+  ).rejects.toThrow("mcp_gateway.upstream hooks can only change url and headers");
+});
+
+test.each(["file:///etc/hosts", "http://", "https://[", "http:host", "http://user:pass@host/mcp"])(
+  "mcp_gateway.upstream hooks must return a backend URL the daemon config would accept, not %j",
+  async (url) => {
+    const hooks = new PluginHookHandlers(() => {});
+    hooks.before("mcp_gateway.upstream", ({ request }) => ({ ...request, url }));
+    await expect(
+      hooks.invoke("operation", "before", "mcp_gateway.upstream", GATEWAY_REQUEST, paseo),
+    ).rejects.toThrow();
+  },
+);

@@ -391,9 +391,13 @@ placeholders. Paseo substitutes the launching agent's ID and explicitly supplied
 launch environment values, including `env` returned by `agent.create` and
 `agent.session_open` hooks, before passing configuration to any provider.
 Substitution runs after session-open hooks on create, resume, refresh and import.
-The agent ID takes precedence.
+`{paseoAgentToken}` becomes the launching agent's own daemon token and
+`{paseoMcpGatewayUrl}` the daemon's [MCP gateway](/docs/mcp#reach-mcp-backends-through-the-daemon)
+URL. The agent ID and these two values take precedence over launch values.
 Replacement is literal and single-pass; unknown placeholders remain unchanged.
-Stored configuration keeps its templates, and stdio servers are unchanged.
+Stored configuration and agent records on disk keep the templates; resolved values reach the
+provider only through its own protocol messages or a private file, never process arguments.
+Stdio servers are unchanged.
 Paseo does not read the daemon process environment for this substitution.
 
 ### Inject environment variables on every session opening
@@ -569,11 +573,12 @@ type PluginTurnOutcome =
 
 ### Before hooks
 
-| Name                 | Request fields                                                          | Editable                                |
-| -------------------- | ----------------------------------------------------------------------- | --------------------------------------- |
-| `agent.create`       | `config`, optional `env`                                                | Public agent config except `cwd`; `env` |
-| `agent.session_open` | `agentId`, `workspaceId`, `provider`, `cwd`, `reason`, `purpose`, `env` | Only `env`                              |
-| `workspace.create`   | `source`, optional `title`, `firstAgentContext`                         | Entire explicit creation request        |
+| Name                   | Request fields                                                          | Editable                                |
+| ---------------------- | ----------------------------------------------------------------------- | --------------------------------------- |
+| `agent.create`         | `config`, optional `env`                                                | Public agent config except `cwd`; `env` |
+| `agent.session_open`   | `agentId`, `workspaceId`, `provider`, `cwd`, `reason`, `purpose`, `env` | Only `env`                              |
+| `workspace.create`     | `source`, optional `title`, `firstAgentContext`                         | Entire explicit creation request        |
+| `mcp_gateway.upstream` | `backend`, `agentId`, `sessionId`, `workspaceId`, `url`, `headers`      | Only `url` and `headers`                |
 
 **`agent.create.config`** uses `AgentSessionConfig`:
 
@@ -607,6 +612,25 @@ type PluginTurnOutcome =
 | `reason`      | `create`, `resume`, `refresh`, `import`                                                                                 |
 | `purpose`     | `interactive`, `history`                                                                                                |
 | `env`         | Launch override map; excludes the daemon's inherited environment. Replace the map to add, replace, or remove overrides. |
+
+**`mcp_gateway.upstream`** runs for every request an agent sends through the daemon's
+[MCP gateway](/docs/mcp#reach-mcp-backends-through-the-daemon). The identity fields come from the
+agent's daemon token. `url` is the configured backend URL, or `null` when the config does not name
+`backend`; set an `http` or `https` URL to serve a backend of your own. `headers` start empty and are
+added to the upstream request; `X-Paseo-*` names are ignored; Paseo sets the identity headers itself. Mint or cache the credential here:
+
+```ts
+server.before("mcp_gateway.upstream", async ({ request }, { signal }) => {
+  if (request.backend !== "cluster") {
+    return request;
+  }
+  const token = await credentials.forAgent(request.agentId, { signal });
+  return { ...request, headers: { ...request.headers, Authorization: `Bearer ${token}` } };
+});
+```
+
+A throwing hook fails that request with `502`; nothing reaches the backend. The hook runs once per
+HTTP request, so cache credentials rather than minting one per call.
 
 ### Ordering and returned values
 
@@ -649,7 +673,7 @@ saved; environment overrides are not persisted with it.
 
 | Plugin                                                                                                 | Includes                                                                     |
 | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| [lifecycle-logger](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-logger)       | All eleven hooks; JSON logs with environment values redacted                 |
+| [lifecycle-logger](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-logger)       | All twelve hooks; JSON logs with environment and header values redacted      |
 | [lifecycle-actions](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-actions)     | Follow-ups, permissions, environment, provider switching, worktree selection |
 | [agent-configuration](https://github.com/getpaseo/paseo/tree/main/plugin-examples/agent-configuration) | MCP injection and Codex sandbox/approval options                             |
 

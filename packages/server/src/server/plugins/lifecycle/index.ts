@@ -14,6 +14,7 @@ import type {
 } from "@getpaseo/plugin/server";
 import { WorkspaceCreateRequestSchema } from "@getpaseo/protocol/messages";
 import type { PersistedWorkspaceRecord } from "../../workspace-registry.js";
+import { MCP_GATEWAY_BACKEND_URL_PATTERN } from "../../mcp-gateway/backends.js";
 
 export const lifecycleEventNames = [
   "agent.created",
@@ -25,7 +26,14 @@ export const lifecycleEventNames = [
   "workspace.created",
   "workspace.archived",
 ] as const;
-export const beforeHookNames = ["agent.create", "agent.session_open", "workspace.create"] as const;
+export const beforeHookNames = [
+  "agent.create",
+  "agent.session_open",
+  "workspace.create",
+  "mcp_gateway.upstream",
+] as const;
+
+const BackendUrlSchema = z.string().regex(MCP_GATEWAY_BACKEND_URL_PATTERN);
 
 const beforeSchemas = {
   "agent.create": CreateAgentRequestMessageSchema.pick({ config: true, env: true }).strict(),
@@ -41,6 +49,16 @@ const beforeSchemas = {
     })
     .strict(),
   "workspace.create": WorkspaceCreateRequestSchema.omit({ type: true, requestId: true }).strict(),
+  "mcp_gateway.upstream": z
+    .object({
+      backend: z.string(),
+      agentId: z.string(),
+      sessionId: z.string().nullable(),
+      workspaceId: z.string().nullable(),
+      url: BackendUrlSchema.nullable(),
+      headers: z.record(z.string(), z.string()),
+    })
+    .strict(),
 };
 
 export interface PluginLifecycle {
@@ -147,6 +165,18 @@ export function validateBeforeResult<Name extends keyof PluginBeforeRequests>(
       previous.purpose !== next.purpose
     ) {
       throw new Error("agent.session_open hooks can only change env");
+    }
+  }
+  if (name === "mcp_gateway.upstream") {
+    const previous = beforeSchemas["mcp_gateway.upstream"].parse(input);
+    const next = beforeSchemas["mcp_gateway.upstream"].parse(result);
+    if (
+      previous.backend !== next.backend ||
+      previous.agentId !== next.agentId ||
+      previous.sessionId !== next.sessionId ||
+      previous.workspaceId !== next.workspaceId
+    ) {
+      throw new Error("mcp_gateway.upstream hooks can only change url and headers");
     }
   }
   if (name === "agent.create") {

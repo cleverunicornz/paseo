@@ -8,6 +8,7 @@ import {
 } from "../../provider-launch-config.js";
 import { buildSelfNodeCommand } from "../../../paseo-env.js";
 import { spawnProcess } from "../../../../utils/spawn.js";
+import { moveInlineMcpConfigToPrivateFiles } from "./mcp-config-file.js";
 
 // Keep the raw SDK query import in this module only. Claude process launch behavior
 // must stay shared between production and tests so Windows .cmd/.bat handling cannot
@@ -79,23 +80,32 @@ function applyRuntimeSettingsToClaudeOptions(
         runtimeSettings,
         overlays: [launchEnv],
       });
+      // MCP configuration reaches Claude Code through a private file, never argv.
+      const privateMcpConfig = moveInlineMcpConfigToPrivateFiles(resolved.args);
       const selfNodeCommand = isDefaultRuntime
-        ? buildSelfNodeCommand(resolved.args, providerEnv)
+        ? buildSelfNodeCommand(privateMcpConfig.args, providerEnv)
         : null;
       const command = selfNodeCommand?.command ?? resolved.command;
-      const args = selfNodeCommand?.args ?? resolved.args;
-      const child = spawnProcess(command, args, {
-        cwd: spawnOptions.cwd,
-        ...(selfNodeCommand
-          ? { env: selfNodeCommand.env, envMode: "internal" as const }
-          : providerEnvSpec),
-        signal: spawnOptions.signal,
-        stdio: ["pipe", "pipe", "pipe"],
-        // Bypass cmd.exe on Windows: the SDK passes --mcp-config with inline JSON
-        // containing double quotes, which cmd.exe mangles (strips quotes, breaks parsing).
-        // The command is always a resolved binary path, so shell routing is unnecessary.
-        shell: false,
-      });
+      const args = selfNodeCommand?.args ?? privateMcpConfig.args;
+      let child: ChildProcess;
+      try {
+        child = spawnProcess(command, args, {
+          cwd: spawnOptions.cwd,
+          ...(selfNodeCommand
+            ? { env: selfNodeCommand.env, envMode: "internal" as const }
+            : providerEnvSpec),
+          signal: spawnOptions.signal,
+          stdio: ["pipe", "pipe", "pipe"],
+          // The command is always a resolved binary path; spawning without a
+          // shell keeps quoted arguments intact on Windows.
+          shell: false,
+        });
+      } catch (error) {
+        privateMcpConfig.cleanup();
+        throw error;
+      }
+      child.once("exit", privateMcpConfig.cleanup);
+      child.once("error", privateMcpConfig.cleanup);
       onChildProcess?.(child);
       if (typeof options.stderr === "function") {
         child.stderr?.on("data", (chunk: Buffer | string) => {

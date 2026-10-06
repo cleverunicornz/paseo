@@ -55,13 +55,11 @@ function formatHostForHttpUrl(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
-function buildExpectedAgentMcpUrl(params: { host: string; port: number; agentId: string }): string {
-  const baseUrl = new URL(
+function buildExpectedAgentMcpUrl(params: { host: string; port: number }): string {
+  return new URL(
     "/mcp/agents",
     `http://${formatHostForHttpUrl(params.host)}:${params.port}`,
-  );
-  baseUrl.searchParams.set("callerAgentId", params.agentId);
-  return baseUrl.toString();
+  ).toString();
 }
 
 function getStructuredContent(result: McpToolResult): StructuredContent | null {
@@ -80,8 +78,13 @@ function getStructuredContent(result: McpToolResult): StructuredContent | null {
   return null;
 }
 
-async function createMcpClient(url: string): Promise<McpClient> {
-  const transport = new StreamableHTTPClientTransport(new URL(url));
+async function createMcpClient(url: string, agentToken?: string): Promise<McpClient> {
+  const transport = new StreamableHTTPClientTransport(
+    new URL(url),
+    agentToken
+      ? { requestInit: { headers: { Authorization: `Bearer ${agentToken}` } } }
+      : undefined,
+  );
   const rawClient = await experimental_createMCPClient({ transport });
   const boundCallTool: McpClient["callTool"] = Reflect.get(rawClient, "callTool").bind(rawClient);
   return { callTool: boundCallTool, close: () => rawClient.close() };
@@ -312,7 +315,8 @@ beforeAll(async () => {
   parentAgentId = str(parentPayload.agentId);
 
   agentScopedClient = await createMcpClient(
-    `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${parentAgentId}`,
+    `http://127.0.0.1:${daemonHandle.port}/mcp/agents`,
+    daemonHandle.daemon.agentManager.issueAgentToken(parentAgentId),
   );
 
   execSync("git init -b main", { cwd: worktreeRepoCwd, stdio: "pipe" });
@@ -385,7 +389,6 @@ describe("Suite A: Core Fixes", () => {
       const expectedUrl = buildExpectedAgentMcpUrl({
         host: listenTarget!.host,
         port: listenTarget!.port,
-        agentId,
       });
 
       const launchConfig = launchConfigsByProvider.claude
@@ -395,6 +398,9 @@ describe("Suite A: Core Fixes", () => {
         paseo: {
           type: "http",
           url: expectedUrl,
+          headers: {
+            Authorization: `Bearer ${daemonHandle.daemon.agentManager.issueAgentToken(agentId)}`,
+          },
         },
       });
       expect(snapshot.config.mcpServers?.paseo).toBeUndefined();
@@ -935,9 +941,8 @@ describe("Suite E: Worktree Tools", () => {
         title: "Worktree scoped parity agent",
       });
       worktreeScopedClient = await createMcpClient(
-        `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${encodeURIComponent(
-          worktreeAgentId,
-        )}`,
+        `http://127.0.0.1:${daemonHandle.port}/mcp/agents`,
+        daemonHandle.daemon.agentManager.issueAgentToken(worktreeAgentId),
       );
 
       const archived = await callToolStructured(worktreeScopedClient, "archive_worktree", {

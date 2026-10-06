@@ -8,7 +8,7 @@ import {
   extractWsBearerProtocol,
   extractWsBearerToken,
   hashDaemonPassword,
-  isAgentMcpRequestAuthorized,
+  authorizeAgentMcpRequest,
   isBearerTokenValidAsync,
   shouldBypassBearerAuth,
 } from "./auth.js";
@@ -67,8 +67,8 @@ describe("daemon bearer validator", () => {
     expect(shouldBypassBearerAuth("GET", "/api/health")).toBe(true);
     // Guarded by its own single-use download token, not the daemon password.
     expect(shouldBypassBearerAuth("GET", "/api/files/download")).toBe(true);
-    // Guarded by its own per-daemon-run capability token (see
-    // isAgentMcpRequestAuthorized), not the daemon password.
+    // Guarded by per-agent tokens (see authorizeAgentMcpRequest), not the
+    // daemon password.
     expect(shouldBypassBearerAuth("POST", "/mcp/agents")).toBe(true);
     // Everything else stays behind the daemon password.
     expect(shouldBypassBearerAuth("GET", "/api/status")).toBe(false);
@@ -77,53 +77,71 @@ describe("daemon bearer validator", () => {
 });
 
 describe("agent MCP request authorizer", () => {
-  const CAPABILITY_TOKEN = "cap-token-abc123";
+  const tokens = new Map([
+    ["agent-1-token", "agent-1"],
+    ["agent-2-token", "agent-2"],
+  ]);
+  const resolveAgentToken = (token: string | null) => (token ? (tokens.get(token) ?? null) : null);
 
-  test("allows any request when no daemon password is configured", async () => {
+  test("derives the caller from its token alone when no daemon password is configured", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorizeAgentMcpRequest({
         password: undefined,
-        capabilityToken: CAPABILITY_TOKEN,
+        resolveAgentToken,
+        authorizationHeader: "Bearer agent-1-token",
+      }),
+    ).toEqual({ authorized: true, callerAgentId: "agent-1" });
+    expect(
+      await authorizeAgentMcpRequest({
+        password: undefined,
+        resolveAgentToken,
         authorizationHeader: undefined,
       }),
-    ).toBe(true);
-  });
-
-  test("accepts the injected capability token", async () => {
+    ).toEqual({ authorized: true, callerAgentId: undefined });
     expect(
-      await isAgentMcpRequestAuthorized({
-        password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
-        authorizationHeader: `Bearer ${CAPABILITY_TOKEN}`,
+      await authorizeAgentMcpRequest({
+        password: undefined,
+        resolveAgentToken,
+        authorizationHeader: "Bearer not-a-token",
       }),
-    ).toBe(true);
+    ).toEqual({ authorized: true, callerAgentId: undefined });
   });
 
-  test("still accepts a valid daemon-password bearer", async () => {
+  test("an agent token identifies exactly its agent on a password-protected daemon", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorizeAgentMcpRequest({
         password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
+        resolveAgentToken,
+        authorizationHeader: "Bearer agent-2-token",
+      }),
+    ).toEqual({ authorized: true, callerAgentId: "agent-2" });
+  });
+
+  test("a daemon-password bearer authorizes without an agent identity", async () => {
+    expect(
+      await authorizeAgentMcpRequest({
+        password: CORRECT_PASSWORD_HASH,
+        resolveAgentToken,
         authorizationHeader: "Bearer correct-password",
       }),
-    ).toBe(true);
+    ).toEqual({ authorized: true, callerAgentId: undefined });
   });
 
-  test("rejects requests presenting neither the token nor a valid password", async () => {
+  test("rejects requests presenting neither an agent token nor a valid password", async () => {
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorizeAgentMcpRequest({
         password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
+        resolveAgentToken,
         authorizationHeader: undefined,
       }),
-    ).toBe(false);
+    ).toEqual({ authorized: false });
     expect(
-      await isAgentMcpRequestAuthorized({
+      await authorizeAgentMcpRequest({
         password: CORRECT_PASSWORD_HASH,
-        capabilityToken: CAPABILITY_TOKEN,
+        resolveAgentToken,
         authorizationHeader: "Bearer wrong-token",
       }),
-    ).toBe(false);
+    ).toEqual({ authorized: false });
   });
 });
 

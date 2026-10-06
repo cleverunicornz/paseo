@@ -31,7 +31,8 @@ describe("withRuntimePaseoMcpServer", () => {
         agentId: "agent-1",
         values: { tenant: "team-$&-{agentId}", agentId: "wrong-agent" },
         mcpBaseUrl: null,
-        mcpAuthToken: null,
+        agentToken: "agent-1-token",
+        mcpGatewayBaseUrl: null,
       });
 
       expect(result.mcpServers).toEqual({
@@ -47,32 +48,20 @@ describe("withRuntimePaseoMcpServer", () => {
     },
   );
 
-  test("injects the paseo MCP server with a bearer header when a token is provided", () => {
+  test("injects the paseo MCP server authenticated by the agent's own token", () => {
     const result = withRuntimePaseoMcpServer({
       config: BASE_CONFIG,
       agentId: "agent-1",
       mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
-      mcpAuthToken: "cap-token",
+      agentToken: "agent-1-token",
+      mcpGatewayBaseUrl: null,
     });
 
+    // Identity comes from the token alone; the URL carries no caller claim.
     expect(result.mcpServers?.paseo).toEqual({
       type: "http",
-      url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
-      headers: { Authorization: "Bearer cap-token" },
-    });
-  });
-
-  test("omits the header when no token is available", () => {
-    const result = withRuntimePaseoMcpServer({
-      config: BASE_CONFIG,
-      agentId: "agent-1",
-      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
-      mcpAuthToken: null,
-    });
-
-    expect(result.mcpServers?.paseo).toEqual({
-      type: "http",
-      url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+      url: "http://127.0.0.1:6767/mcp/agents",
+      headers: { Authorization: "Bearer agent-1-token" },
     });
   });
 
@@ -81,9 +70,62 @@ describe("withRuntimePaseoMcpServer", () => {
       config: BASE_CONFIG,
       agentId: "agent-1",
       mcpBaseUrl: null,
-      mcpAuthToken: "cap-token",
+      agentToken: "agent-1-token",
+      mcpGatewayBaseUrl: null,
     });
 
     expect(result.mcpServers).toBeUndefined();
+  });
+
+  test("resolves gateway placeholders to the daemon gateway and the agent's own token", () => {
+    const config: AgentSessionConfig = {
+      ...BASE_CONFIG,
+      mcpServers: {
+        cluster: {
+          type: "http",
+          url: "{paseoMcpGatewayUrl}/cluster",
+          headers: { Authorization: "Bearer {paseoAgentToken}" },
+        },
+      },
+    };
+    const before = structuredClone(config);
+
+    const result = withRuntimePaseoMcpServer({
+      config,
+      agentId: "agent-1",
+      values: {
+        paseoAgentToken: "launch-value",
+        paseoMcpGatewayUrl: "https://launch-value.example",
+      },
+      mcpBaseUrl: null,
+      agentToken: "agent-1-token",
+      mcpGatewayBaseUrl: "http://127.0.0.1:6767/mcp/backends",
+    });
+
+    expect(result.mcpServers?.cluster).toEqual({
+      type: "http",
+      url: "http://127.0.0.1:6767/mcp/backends/cluster",
+      headers: { Authorization: "Bearer agent-1-token" },
+    });
+    expect(config).toEqual(before);
+  });
+
+  test("leaves the gateway URL placeholder unresolved when the daemon has no TCP listener", () => {
+    const result = withRuntimePaseoMcpServer({
+      config: {
+        ...BASE_CONFIG,
+        mcpServers: { cluster: { type: "http", url: "{paseoMcpGatewayUrl}/cluster" } },
+      },
+      agentId: "agent-1",
+      values: { paseoMcpGatewayUrl: "https://launch-value.example" },
+      mcpBaseUrl: null,
+      agentToken: "agent-1-token",
+      mcpGatewayBaseUrl: null,
+    });
+
+    expect(result.mcpServers?.cluster).toEqual({
+      type: "http",
+      url: "{paseoMcpGatewayUrl}/cluster",
+    });
   });
 });

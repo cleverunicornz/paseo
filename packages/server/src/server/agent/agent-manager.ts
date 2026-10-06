@@ -81,6 +81,7 @@ import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
+import { AgentTokenRegistry } from "./agent-tokens.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
 import { isPaseoToolPolicyEnabled } from "./paseo-tool-policy.js";
@@ -327,7 +328,8 @@ export interface AgentManagerOptions {
   durableTimelineStore?: AgentTimelineStore;
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
-  mcpAuthToken?: string;
+  /** Shared with the daemon's HTTP routes, which resolve a caller from its token. */
+  agentTokens?: AgentTokenRegistry;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
@@ -741,7 +743,8 @@ export class AgentManager {
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
-  private readonly mcpAuthToken: string | null;
+  private mcpGatewayBaseUrl: string | null = null;
+  private readonly agentTokens: AgentTokenRegistry;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -765,7 +768,7 @@ export class AgentManager {
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
-    this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.agentTokens = options.agentTokens ?? new AgentTokenRegistry();
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
@@ -850,6 +853,10 @@ export class AgentManager {
     this.mcpBaseUrl = url;
   }
 
+  setMcpGatewayBaseUrl(url: string | null): void {
+    this.mcpGatewayBaseUrl = url;
+  }
+
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
   }
@@ -867,13 +874,12 @@ export class AgentManager {
   }
 
   /**
-   * Capability token the daemon's own MCP clients must present to the Agent MCP
-   * endpoint when a daemon password is configured. Read by the per-client
-   * session to authenticate its own MCP connection. Stays in the daemon — never
-   * sent to remote clients.
+   * The agent's own bearer token for the daemon's Agent MCP endpoint and MCP
+   * gateway, minted on first use and revoked when the agent closes. It is
+   * handed only to that agent's launch configuration, never to remote clients.
    */
-  getMcpAuthToken(): string | null {
-    return this.mcpAuthToken;
+  issueAgentToken(agentId: string): string {
+    return this.agentTokens.issue(agentId);
   }
 
   setAppendSystemPrompt(prompt: string | null | undefined): void {
@@ -1715,6 +1721,7 @@ export class AgentManager {
     await agent.session.close();
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
+    this.agentTokens.revoke(agentId);
 
     let persistError: unknown;
     try {
@@ -5237,7 +5244,8 @@ export class AgentManager {
         !launchContext.paseoTools
           ? this.mcpBaseUrl
           : null,
-      mcpAuthToken: this.mcpAuthToken,
+      agentToken: this.agentTokens.issue(options.agentId),
+      mcpGatewayBaseUrl: this.mcpGatewayBaseUrl,
     });
   }
 
