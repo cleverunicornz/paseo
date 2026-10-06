@@ -3,7 +3,6 @@ import express from "express";
 import { createServer as createHTTPServer, type IncomingMessage, type ServerResponse } from "http";
 import { constants, existsSync, unlinkSync } from "fs";
 import { open, rm, stat } from "fs/promises";
-import { randomUUID } from "node:crypto";
 import { hostname as getHostname } from "node:os";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -133,6 +132,9 @@ import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
+import { AgentTokenRegistry } from "./agent/agent-tokens.js";
+import { createMcpGatewayHandler } from "./mcp-gateway/mcp-gateway.js";
+import { MCP_GATEWAY_ROUTE } from "./mcp-gateway/backends.js";
 import {
   createPaseoToolCatalog,
   type PaseoToolHostDependencies,
@@ -203,7 +205,7 @@ import { withTimeout } from "../utils/promise-timeout.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
-  isAgentMcpRequestAuthorized,
+  authorizeAgentMcpRequest,
   type DaemonAuthConfig,
 } from "./auth.js";
 import { deleteLocalCredential, writeLocalCredential } from "./local-credential.js";
@@ -261,6 +263,17 @@ function createAgentMcpBaseUrl(listenTarget: ListenTarget | null): string | null
     "/mcp/agents",
     `http://${formatHostForHttpUrl(host)}:${listenTarget.port}`,
   ).toString();
+}
+
+function createLoopbackDaemonUrl(
+  listenTarget: ListenTarget | null,
+  pathname: string,
+): string | null {
+  if (!listenTarget || listenTarget.type !== "tcp") {
+    return null;
+  }
+  const host = resolveAgentMcpClientHost(listenTarget.host);
+  return new URL(pathname, `http://${formatHostForHttpUrl(host)}:${listenTarget.port}`).toString();
 }
 
 function createTerminalActivityUrl(listenTarget: ListenTarget | null): string | null {
@@ -397,6 +410,8 @@ export interface PaseoDaemonConfig {
   trustedProxies?: true | string[];
   mcpEnabled?: boolean;
   mcpInjectIntoAgents?: boolean;
+  /** Named MCP backends agents reach through `/mcp/backends/<name>`. */
+  mcpGatewayBackends?: Record<string, string>;
   browserToolsEnabled?: boolean;
   git?: {
     maxProcessesPerSecond: number;
@@ -632,14 +647,14 @@ export async function createPaseoDaemon(
     ttlMs: downloadTokenTtlMs,
   });
 
-  // Capability token authenticating the daemon's own agents to the loopback
-  // Agent MCP endpoint (/mcp/agents). Random per daemon run, injected only into
-  // local agent configs and the daemon's own MCP client — never sent to remote
-  // clients — so it cannot be replayed off-box. This lets the injected MCP
-  // authenticate even when the daemon password is set via the app (hash only,
-  // no plaintext available). Mirrors the /api/files/download capability-token
-  // pattern.
-  const agentMcpAuthToken = randomUUID();
+  // Per-agent tokens authenticating each agent to the loopback Agent MCP
+  // endpoint (/mcp/agents) and the MCP gateway (/mcp/backends). Minted at
+  // launch, injected only into that agent's config — never sent to remote
+  // clients — and kept in memory, so they die with the daemon. The daemon
+  // derives a caller's identity from its token alone. This also lets the
+  // injected MCP authenticate when the daemon password is set via the app
+  // (hash only, no plaintext available).
+  const agentTokens = new AgentTokenRegistry();
 
   const listenTarget = parseListenString(config.listen);
 
@@ -751,6 +766,13 @@ export async function createPaseoDaemon(
     }
     next();
   });
+
+  // Agent → MCP backend gateway. Authenticated by per-agent tokens instead of
+  // the daemon password, and mounted before any body parser so request and
+  // response streams pass through untouched. Handlers attach once the agent
+  // manager exists.
+  const mcpGatewayRouter = express.Router();
+  app.use(MCP_GATEWAY_ROUTE, mcpGatewayRouter);
 
   // Local, harmless, and token-gated; deliberately skips daemon auth.
   app.post(
@@ -934,11 +956,34 @@ export async function createPaseoDaemon(
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
-    mcpAuthToken: agentMcpAuthToken,
+    agentTokens,
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
   });
+  const mcpGatewayBackends: ReadonlyMap<string, string> = new Map(
+    Object.entries(config.mcpGatewayBackends ?? {}),
+  );
+  mcpGatewayRouter.use(
+    createMcpGatewayHandler({
+      getBackends: () => mcpGatewayBackends,
+      resolveAgent: (token) => {
+        const agentId = agentTokens.resolve(token);
+        const agent = agentId ? agentManager.getAgent(agentId) : null;
+        if (!agent) {
+          return null;
+        }
+        return {
+          agentId: agent.id,
+          sessionId: agent.persistence?.sessionId ?? null,
+          workspaceId: agent.workspaceId ?? null,
+        };
+      },
+      serverId,
+      resolveUpstream: (request) => pluginRuntime.before("mcp_gateway.upstream", request),
+      logger,
+    }),
+  );
   const syncPluginProviders = () => {
     agentManager.updateProviderRegistry(
       providerSnapshotManager.replacePluginProviders(pluginRuntime.getProviderRegistrations()),
@@ -1487,13 +1532,12 @@ export async function createPaseoDaemon(
       // authenticates here using the injected capability token (or a valid
       // daemon password). Without this, a password-protected daemon would be
       // wide open on its agent control plane.
-      if (
-        !(await isAgentMcpRequestAuthorized({
-          password: config.auth?.password,
-          capabilityToken: agentMcpAuthToken,
-          authorizationHeader: req.header("authorization"),
-        }))
-      ) {
+      const authorization = await authorizeAgentMcpRequest({
+        password: config.auth?.password,
+        resolveAgentToken: (token) => agentTokens.resolve(token),
+        authorizationHeader: req.header("authorization"),
+      });
+      if (!authorization.authorized) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
@@ -1524,14 +1568,9 @@ export async function createPaseoDaemon(
           });
           return;
         }
-        const callerAgentIdRaw = req.query.callerAgentId;
-        let callerAgentId: string | undefined;
-        if (typeof callerAgentIdRaw === "string") {
-          callerAgentId = callerAgentIdRaw;
-        } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
-          callerAgentId = callerAgentIdRaw[0];
-        }
-        const { server, transport } = await createAgentMcpSession(callerAgentId);
+        // The caller is whoever the token names; nothing the request carries
+        // can claim another agent's identity.
+        const { server, transport } = await createAgentMcpSession(authorization.callerAgentId);
         res.on("close", () => {
           void transport.close();
           void server.close();
@@ -1610,6 +1649,9 @@ export async function createPaseoDaemon(
             agentMcpBaseUrl =
               !mcpEnabled || config.mcpInjectIntoAgents === false ? null : mcpBaseUrl;
             agentManager.setMcpBaseUrl(agentMcpBaseUrl);
+            agentManager.setMcpGatewayBaseUrl(
+              createLoopbackDaemonUrl(boundListenTarget, MCP_GATEWAY_ROUTE),
+            );
             agentManager.setPaseoToolsEnabled(mcpEnabled && config.mcpInjectIntoAgents !== false);
             daemonConfigStore.onFieldChange("mcp.enabled", (value) => {
               mcpEnabled = value !== false;

@@ -241,6 +241,12 @@ export const PersistedConfigSchema = z
           .object({
             enabled: z.boolean().optional(),
             injectIntoAgents: z.boolean().optional(),
+            gateway: z
+              .object({
+                backends: z.record(z.string(), z.string()).optional(),
+              })
+              .strict()
+              .optional(),
           })
           .passthrough()
           .optional(),

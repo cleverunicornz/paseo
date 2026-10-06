@@ -1,3 +1,4 @@
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -202,8 +203,11 @@ class RecordingAgentClient implements AgentClient {
   }
 }
 
-function createMcpRecordingAgentClients(recorder: LaunchRecorder) {
-  const clients = createTestAgentClients();
+function createMcpRecordingAgentClients(
+  recorder: LaunchRecorder,
+  options: Parameters<typeof createTestAgentClients>[0] = {},
+) {
+  const clients = createTestAgentClients(options);
   const claude = clients.claude;
   if (!claude) {
     throw new Error("Fake Claude client is not configured");
@@ -231,6 +235,17 @@ async function assertAgentNotRunning(options: {
   if (status === "running" || status === "initializing") {
     throw new Error(`Agent still running after blocking create_agent (status=${status})`);
   }
+}
+
+function recordHeadersAndAnswer(seen: http.IncomingHttpHeaders[]): http.RequestListener {
+  return (req, res) => {
+    seen.push(req.headers);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s1" });
+      res.end('{"jsonrpc":"2.0","id":1,"result":{}}');
+    });
+  };
 }
 
 describe("agent MCP end-to-end (offline)", () => {
@@ -325,7 +340,7 @@ describe("agent MCP end-to-end (offline)", () => {
     }
   }, 30_000);
 
-  test("password-protected daemon authorizes the agent MCP via the capability token", async () => {
+  test("password-protected daemon authorizes the agent MCP via the agent's own token", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
     const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
@@ -348,45 +363,44 @@ describe("agent MCP end-to-end (offline)", () => {
     await daemon.start();
 
     const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
-    const capabilityToken = daemon.agentManager.getMcpAuthToken();
-    expect(typeof capabilityToken).toBe("string");
+    const caller = await daemon.agentManager.createAgent(
+      { provider: "claude", cwd: agentCwd, title: "Password MCP caller" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const agentToken = daemon.agentManager.issueAgentToken(caller.id);
 
-    let agentId: string | null = null;
     let client: McpClient | null = null;
     try {
-      // Remote auth is not weakened: a request without credentials is rejected
-      // before any MCP processing.
+      // Remote auth is not weakened: a request without credentials, or with a
+      // caller claim but no token, is rejected before any MCP processing.
       const unauthorized = await fetch(mcpUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: "{}",
       });
       expect(unauthorized.status).toBe(401);
+      const claimed = await fetch(`${mcpUrl}?callerAgentId=${caller.id}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(claimed.status).toBe(401);
 
-      // The injected capability token authenticates the full MCP handshake:
+      // The agent's own token authenticates the full MCP handshake:
       // creating (and connecting) the client and driving a tool call both go
       // through the password-gated /mcp/agents route. (The exact bearer header
       // injected into a child agent's config is covered by the
       // runtime-mcp-config unit test.)
-      client = await createMcpClient(mcpUrl, capabilityToken!);
+      client = await createMcpClient(mcpUrl, agentToken);
       const result = await client.callTool({
-        name: "create_agent",
-        args: {
-          cwd: agentCwd,
-          title: "Password MCP",
-          provider: "claude/claude-test-model",
-          mode: "bypassPermissions",
-          initialPrompt: "reply with done and stop",
-          background: true,
-        },
+        name: "get_agent_status",
+        args: { agentId: caller.id },
       });
-      const payload = getStructuredContent(result);
-      agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
-      expect(agentId).toBeTruthy();
+      expect(result.isError).not.toBe(true);
+      const snapshot = getStructuredContent(result)?.snapshot as StructuredContent | undefined;
+      expect(snapshot?.id).toBe(caller.id);
     } finally {
-      if (agentId) {
-        await client?.callTool({ name: "kill_agent", args: { agentId } });
-      }
       await client?.close();
       await daemon.stop();
       await rm(paseoHome, { recursive: true, force: true });
@@ -459,10 +473,14 @@ describe("agent MCP end-to-end (offline)", () => {
       agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
       expect(agentId).toBeTruthy();
 
-      expect(recorder.recordedLaunches.at(-1)?.mcpServers).toMatchObject({
+      // Utility agents (e.g. branch naming) may launch after it, so select by title.
+      expect(
+        recorder.recordedLaunches.find((launch) => launch.title === "Injected MCP")?.mcpServers,
+      ).toMatchObject({
         paseo: {
           type: "http",
-          url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
+          url: `http://127.0.0.1:${port}/mcp/agents`,
+          headers: { Authorization: `Bearer ${daemon.agentManager.issueAgentToken(agentId!)}` },
         },
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
@@ -548,10 +566,14 @@ describe("agent MCP end-to-end (offline)", () => {
       agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
       expect(agentId).toBeTruthy();
 
-      expect(recorder.recordedLaunches.at(-1)?.mcpServers).toMatchObject({
+      // Utility agents (e.g. branch naming) may launch after it, so select by title.
+      expect(
+        recorder.recordedLaunches.find((launch) => launch.title === "Wildcard MCP")?.mcpServers,
+      ).toMatchObject({
         paseo: {
           type: "http",
-          url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
+          url: `http://127.0.0.1:${port}/mcp/agents`,
+          headers: { Authorization: `Bearer ${daemon.agentManager.issueAgentToken(agentId!)}` },
         },
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
@@ -916,4 +938,115 @@ describe("agent MCP end-to-end (offline)", () => {
       await rm(repoRoot, { recursive: true, force: true });
     }
   }, 60_000);
+
+  test("agents reach a configured MCP backend through the daemon gateway as themselves", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const recorder: LaunchRecorder = { recordedLaunches: [] };
+
+    const seen: http.IncomingHttpHeaders[] = [];
+    const backend = http.createServer(recordHeadersAndAnswer(seen));
+    await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+    const backendPort = (backend.address() as net.AddressInfo).port;
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createMcpRecordingAgentClients(recorder, { supportsMcpServers: true }),
+        agentStoragePath: path.join(paseoHome, "agents"),
+        auth: { password: hashDaemonPassword("daemon-secret") },
+        mcpGatewayBackends: { cluster: `http://127.0.0.1:${backendPort}/mcp` },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+
+    try {
+      const gatewayConfig: AgentSessionConfig = {
+        provider: "claude",
+        cwd: agentCwd,
+        mcpServers: {
+          cluster: {
+            type: "http",
+            url: "{paseoMcpGatewayUrl}/cluster",
+            headers: { Authorization: "Bearer {paseoAgentToken}" },
+          },
+        },
+      };
+      const first = await daemon.agentManager.createAgent(gatewayConfig, undefined, {
+        workspaceId: undefined,
+      });
+      const firstLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
+      const second = await daemon.agentManager.createAgent(gatewayConfig, undefined, {
+        workspaceId: undefined,
+      });
+      const secondLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
+      if (firstLaunch?.type !== "http" || secondLaunch?.type !== "http") {
+        throw new Error("Gateway MCP entry was not launched as HTTP");
+      }
+      expect(firstLaunch.url).toBe(`http://127.0.0.1:${port}/mcp/backends/cluster`);
+
+      // Call the gateway exactly as each launched agent would, with forged
+      // identity headers that must never reach the backend.
+      const callAs = (launch: { url: string; headers?: Record<string, string> }) =>
+        fetch(launch.url, {
+          method: "POST",
+          headers: {
+            ...launch.headers,
+            "content-type": "application/json",
+            "X-Paseo-Agent-ID": "forged-agent",
+            "X-Paseo-Server-ID": "forged-server",
+          },
+          body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+        });
+      const firstResponse = await callAs(firstLaunch);
+      const secondResponse = await callAs(secondLaunch);
+      expect(firstResponse.status).toBe(200);
+      expect(firstResponse.headers.get("mcp-session-id")).toBe("s1");
+      expect(secondResponse.status).toBe(200);
+
+      const status = await fetch(`http://127.0.0.1:${port}/api/status`, {
+        headers: { Authorization: "Bearer daemon-secret" },
+      });
+      const { serverId } = (await status.json()) as { serverId: string };
+      expect(seen.map((headers) => headers["x-paseo-agent-id"])).toEqual([first.id, second.id]);
+      expect(seen.map((headers) => headers["x-paseo-server-id"])).toEqual([serverId, serverId]);
+      expect(seen.every((headers) => headers.authorization === undefined)).toBe(true);
+
+      // Neither the daemon password nor a missing token reaches a backend.
+      const withPassword = await fetch(firstLaunch.url, {
+        method: "POST",
+        headers: { Authorization: "Bearer daemon-secret", "X-Paseo-Agent-ID": first.id },
+        body: "{}",
+      });
+      expect(withPassword.status).toBe(401);
+      const unknownBackend = await fetch(`http://127.0.0.1:${port}/mcp/backends/other`, {
+        method: "POST",
+        headers: firstLaunch.headers,
+        body: "{}",
+      });
+      expect(unknownBackend.status).toBe(404);
+
+      // A closed agent's token stops working.
+      await daemon.agentManager.closeAgent(first.id);
+      const afterClose = await callAs(firstLaunch);
+      expect(afterClose.status).toBe(401);
+      expect(seen).toHaveLength(2);
+    } finally {
+      await daemon.stop();
+      backend.closeAllConnections();
+      await new Promise<void>((resolve) => backend.close(() => resolve()));
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+      await rm(agentCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

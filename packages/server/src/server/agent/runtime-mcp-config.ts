@@ -66,32 +66,38 @@ export function withRuntimePaseoMcpServer(params: {
   values?: Record<string, string>;
   mcpBaseUrl: string | null;
   /**
-   * Capability token authenticating the injected connection to the daemon's
-   * Agent MCP endpoint. The daemon password is gated off this route, so without
-   * this header the agent's MCP requests are rejected when a password is set.
+   * The launching agent's own bearer token. The daemon derives the caller's
+   * identity from it on the Agent MCP endpoint and the MCP gateway, so the
+   * injected connection carries no caller claim of its own.
    */
-  mcpAuthToken: string | null;
+  agentToken: string;
+  /** Base URL of the daemon's MCP gateway (`/mcp/backends`), when it listens on TCP. */
+  mcpGatewayBaseUrl: string | null;
 }): AgentSessionConfig {
   const storedConfig = stripInternalPaseoMcpServer(params.config);
   const mcpServers = { ...storedConfig.mcpServers };
   if (params.mcpBaseUrl && !mcpServers[PASEO_MCP_SERVER_NAME]) {
     mcpServers[PASEO_MCP_SERVER_NAME] = {
       type: "http",
-      url: `${params.mcpBaseUrl}?callerAgentId={agentId}`,
-      ...(params.mcpAuthToken
-        ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } }
-        : {}),
+      url: params.mcpBaseUrl,
+      headers: { Authorization: `Bearer ${params.agentToken}` },
     };
   }
   if (Object.keys(mcpServers).length === 0) {
     return storedConfig;
   }
+  // Daemon-owned values replace launch values so a hook or environment entry
+  // cannot redirect gateway entries or substitute another token.
+  const values: Record<string, string> = { ...params.values };
+  delete values.paseoMcpGatewayUrl;
+  if (params.mcpGatewayBaseUrl) {
+    values.paseoMcpGatewayUrl = params.mcpGatewayBaseUrl;
+  }
+  values.paseoAgentToken = params.agentToken;
+  values.agentId = params.agentId;
   return {
     ...storedConfig,
-    mcpServers: substituteMcpServerValues(mcpServers, {
-      ...params.values,
-      agentId: params.agentId,
-    }),
+    mcpServers: substituteMcpServerValues(mcpServers, values),
   };
 }
 

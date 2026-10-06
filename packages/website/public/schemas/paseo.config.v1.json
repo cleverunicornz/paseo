@@ -68,6 +68,20 @@
                 },
                 "injectIntoAgents": {
                   "type": "boolean"
+                },
+                "gateway": {
+                  "type": "object",
+                  "properties": {
+                    "backends": {
+                      "type": "object",
+                      "description": "Named MCP backends agents reach through the daemon at /mcp/backends/<name>.",
+                      "additionalProperties": {
+                        "type": "string",
+                        "format": "uri"
+                      }
+                    }
+                  },
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": true

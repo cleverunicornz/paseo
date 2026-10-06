@@ -49,5 +49,10 @@ export default function contribute(server: PluginServerContext) {
     logHook("agent.archived", event);
   });
 
+  server.before("mcp_gateway.upstream", ({ request }) => {
+    logHook("before mcp_gateway.upstream", { request });
+    return request;
+  });
+
   return () => {};
 }

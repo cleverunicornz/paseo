@@ -152,6 +152,62 @@ describe("server config", () => {
     expect(config.configReload?.overrideControlledPaths).toEqual(expected);
   });
 
+  test("loads named MCP gateway backends from config and lets the environment replace them", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: {
+          mcp: { gateway: { backends: { cluster: "https://cluster-mcp.example/mcp" } } },
+        },
+      }),
+    );
+
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    const fromEnv = loadConfig(paseoHome, {
+      env: { PASEO_MCP_GATEWAY_BACKENDS: '{"docs":"http://127.0.0.1:9000/mcp"}' },
+    });
+
+    expect(fromFile.mcpGatewayBackends).toEqual({ cluster: "https://cluster-mcp.example/mcp" });
+    expect(fromFile.configReload?.overrideControlledPaths).not.toContain(
+      "daemon.mcp.gateway.backends",
+    );
+    expect(fromEnv.mcpGatewayBackends).toEqual({ docs: "http://127.0.0.1:9000/mcp" });
+    expect(fromEnv.configReload?.overrideControlledPaths).toContain("daemon.mcp.gateway.backends");
+  });
+
+  test.each([
+    ["non-JSON", "cluster=https://x"],
+    ["a non-object", '["https://x"]'],
+    ["a non-http URL", '{"cluster":"file:///etc/passwd"}'],
+    ["an invalid backend name", '{"a/b":"https://x"}'],
+  ])("rejects %s PASEO_MCP_GATEWAY_BACKENDS", async (_name, value) => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-bad-"));
+    roots.push(paseoHome);
+
+    expect(() => loadConfig(paseoHome, { env: { PASEO_MCP_GATEWAY_BACKENDS: value } })).toThrow(
+      "PASEO_MCP_GATEWAY_BACKENDS",
+    );
+  });
+
+  test("rejects a persisted MCP gateway backend that is not an http URL", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-mcp-gateway-file-"));
+    roots.push(paseoHome);
+    const persisted = loadPersistedConfig(paseoHome);
+
+    expect(() =>
+      resolveConfigFromPersisted(
+        paseoHome,
+        {
+          ...persisted,
+          daemon: { mcp: { gateway: { backends: { cluster: "ftp://cluster.example" } } } },
+        },
+        { env: {} },
+      ),
+    ).toThrow("daemon.mcp.gateway.backends");
+  });
+
   test("resolves bundled web UI path from source-tree modules", () => {
     const root = path.parse(process.cwd()).root;
     expect(
