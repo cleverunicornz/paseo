@@ -12,11 +12,12 @@ category: Orchestration
 
 ## Configuration
 
-| Setting                       | Default | Purpose                                                                                                 |
-| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
-| `daemon.mcp.enabled`          | `true`  | Run the MCP server.                                                                                     |
-| `daemon.mcp.injectIntoAgents` | `false` | Give agents launched by Paseo access to its tools.                                                      |
-| `daemon.mcp.gateway.backends` | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon) |
+| Setting                            | Default | Purpose                                                                                                             |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| `daemon.mcp.enabled`               | `true`  | Run the MCP server.                                                                                                 |
+| `daemon.mcp.injectIntoAgents`      | `false` | Give agents launched by Paseo access to its tools.                                                                  |
+| `daemon.mcp.gateway.backends`      | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon)             |
+| `daemon.mcp.gateway.modelBackends` | `{}`    | Send a provider's model traffic through a gateway backend. [Model traffic](#send-model-traffic-through-the-gateway) |
 
 Depending on the provider, Paseo delivers tools through its native tool interface or MCP. The capabilities are the same. Start a new agent or reload an existing one after changing injection settings.
 
@@ -87,11 +88,21 @@ underscores, internationalised (`xn--`) labels, trailing dots and consecutive hy
 {
   "daemon": {
     "mcp": {
-      "gateway": { "backends": { "cluster": "https://mcp.internal.example/mcp" } }
+      "gateway": {
+        "backends": {
+          "cluster": "https://mcp.internal.example/mcp",
+          "models": { "url": "https://models.internal.example", "responseTimeoutMs": 600000 }
+        }
+      }
     }
   }
 }
 ```
+
+A backend is its URL, or an object with `url` and `responseTimeoutMs`: how long the gateway waits
+for the backend's response headers, from 1 to 3,600,000 milliseconds (default 30,000). Raise it for
+backends that answer slowly before their first byte, such as non-streaming model calls. Once
+headers arrive, the response streams with no limit.
 
 Point an agent's MCP server at the gateway with two placeholders the daemon fills at launch:
 
@@ -125,8 +136,47 @@ agent's `Authorization` and every `X-Paseo-*` header, then sets:
 Paseo holds no backend credential. A plugin supplies one per request through the
 [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks); without one the request goes
 upstream with no `Authorization`. Unknown backend names get `404`, a missing or unknown token gets
-`401`, an unreachable backend gets `502`, and a backend that sends no response headers within 30
-seconds gets `504`. Backend responses, including errors, pass through unchanged.
+`401`, an unreachable backend gets `502`, and a backend that sends no response headers within its
+`responseTimeoutMs` gets `504`. Backend responses, including errors, pass through unchanged.
+
+## Send model traffic through the gateway
+
+An agent can run with no model credential of its own: its harness calls the daemon's gateway with
+the agent's token, and a plugin's [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks)
+attaches the credential the backend needs. Name the backend for each provider ID in
+`daemon.mcp.gateway.modelBackends`, or replace the whole map with the
+`PASEO_MCP_GATEWAY_MODEL_BACKENDS` environment variable (a JSON object of the same shape):
+
+```json
+{
+  "daemon": {
+    "mcp": {
+      "gateway": {
+        "backends": {
+          "anthropic": { "url": "https://models.internal.example", "responseTimeoutMs": 600000 },
+          "openai": { "url": "https://models.internal.example/v1", "responseTimeoutMs": 600000 }
+        },
+        "modelBackends": { "claude": "anthropic", "codex": "openai" }
+      }
+    }
+  }
+}
+```
+
+Keys are provider IDs, including custom providers that extend `claude` or `codex`. Each agent of a
+named provider launches against `<daemon>/mcp/backends/<backend>` with its own token:
+
+| Provider    | Launch                                                                                                                                                                                           |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Claude Code | `ANTHROPIC_BASE_URL` is the gateway URL and `ANTHROPIC_AUTH_TOKEN` the agent's token, sent as `Authorization: Bearer`. `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are removed.            |
+| Codex       | A `responses` model provider whose `base_url` is the gateway URL and whose `env_key` is `PASEO_MODEL_GATEWAY_TOKEN`, set to the agent's token. `OPENAI_API_KEY` and `CODEX_API_KEY` are removed. |
+
+Codex appends its API paths to `base_url`, so a Codex backend URL usually ends in `/v1`; Claude Code
+adds `/v1/...` itself. The provider uses HTTP and SSE; Codex WebSockets stay off. These values
+override runtime settings and `agent.session_open` hook values, and reach the provider only at
+launch: agent records never hold them, and the token is revoked when the agent closes. A launch
+fails when the provider cannot use the gateway (providers other than Claude Code and Codex) or the
+daemon does not listen on TCP.
 
 ## Mental model
 

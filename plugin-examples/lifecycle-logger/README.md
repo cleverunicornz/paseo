@@ -1,7 +1,9 @@
 # Lifecycle logger
 
-Registers all twelve server lifecycle hooks and logs their data as JSON. It observes agent creation,
+Registers twelve server lifecycle hooks and logs their data as JSON. It observes agent creation,
 session opening, turns, permissions, archive, workspace creation/archive, and MCP gateway requests.
+It leaves out `agent.timeline_item`: one entry per timeline row would push everything else out of
+the bounded plugin log.
 Before hooks return the request unchanged. Environment and header values are redacted; prompts and
 timeline content are logged.
 
