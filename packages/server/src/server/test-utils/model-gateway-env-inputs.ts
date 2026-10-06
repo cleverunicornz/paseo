@@ -99,8 +99,9 @@ export const PASSTHROUGH_INPUTS = {
 } as const;
 /**
  * Inherited variables that are neither base nor configured; they are dropped.
- * The harness data directories are among them: a deployment that relocates
- * them names them in the pass-through list.
+ * The harness data directories are among them: the pass-through list cannot
+ * name them, so a deployment that relocates them supplies them as trusted
+ * launch values.
  */
 export const UNLISTED_INPUTS = {
   UNLISTED_SETTING: "unlisted",
