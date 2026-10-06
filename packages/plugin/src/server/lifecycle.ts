@@ -29,6 +29,29 @@ export interface PluginHookAgent {
   title: string | null;
 }
 
+/** The agent a timeline item belongs to, with the identity a recorder needs. */
+export interface PluginTimelineItemAgent extends PluginHookAgent {
+  /** The provider's own session id (Claude session, Codex thread), once known. */
+  sessionId: string | null;
+  labels: Record<string, string>;
+  model: string | null;
+}
+
+/**
+ * One timeline row as the daemon streams it to its clients: after assistant
+ * and reasoning chunks are coalesced, once per row, in `seq` order. Delivery to
+ * plugins is best-effort and never waits for a handler; a consumer that misses
+ * rows catches up from the agent's timeline by `seq` within `epoch`.
+ */
+export interface PluginTimelineItemEvent {
+  agent: PluginTimelineItemAgent;
+  item: AgentTimelineItem;
+  seq: number;
+  epoch: string;
+  timestamp: string;
+  turnId: string | null;
+}
+
 export interface PluginSessionOpenRequest {
   agentId: string;
   workspaceId: string | null;
@@ -78,6 +101,7 @@ export interface PluginLifecycleEvents {
   };
   "agent.archived": { agent: PluginHookAgent; archivedAt: string };
   "agent.created": { agent: PluginHookAgent };
+  "agent.timeline_item": PluginTimelineItemEvent;
   "workspace.created": { workspace: PluginHookWorkspace };
   "workspace.archived": { workspace: PluginHookWorkspace };
 }

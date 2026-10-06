@@ -25,7 +25,13 @@ import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
 import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
-import { parseMcpGatewayBackends, parseMcpGatewayBackendsEnv } from "./mcp-gateway/backends.js";
+import {
+  parseMcpGatewayBackends,
+  parseMcpGatewayBackendsEnv,
+  parseMcpGatewayModelBackends,
+  parseMcpGatewayModelBackendsEnv,
+  type McpGatewayBackend,
+} from "./mcp-gateway/backends.js";
 
 export {
   loadPersistedConfig,
@@ -103,13 +109,29 @@ function normalizeLogEnv(value: string | undefined): string | undefined {
 function resolveMcpGatewayBackends(
   env: NodeJS.ProcessEnv,
   persisted: ReturnType<typeof loadPersistedConfig>,
-): Record<string, string> {
+): Record<string, McpGatewayBackend> {
   if (env.PASEO_MCP_GATEWAY_BACKENDS !== undefined) {
     return parseMcpGatewayBackendsEnv(env.PASEO_MCP_GATEWAY_BACKENDS, "PASEO_MCP_GATEWAY_BACKENDS");
   }
   return parseMcpGatewayBackends(
     persisted.daemon?.mcp?.gateway?.backends ?? {},
     "daemon.mcp.gateway.backends",
+  );
+}
+
+function resolveMcpGatewayModelBackends(
+  env: NodeJS.ProcessEnv,
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): Record<string, string> {
+  if (env.PASEO_MCP_GATEWAY_MODEL_BACKENDS !== undefined) {
+    return parseMcpGatewayModelBackendsEnv(
+      env.PASEO_MCP_GATEWAY_MODEL_BACKENDS,
+      "PASEO_MCP_GATEWAY_MODEL_BACKENDS",
+    );
+  }
+  return parseMcpGatewayModelBackends(
+    persisted.daemon?.mcp?.gateway?.modelBackends ?? {},
+    "daemon.mcp.gateway.modelBackends",
   );
 }
 
@@ -631,6 +653,7 @@ export function resolveConfigFromPersisted(
     mcpEnabled,
     mcpInjectIntoAgents,
     mcpGatewayBackends: resolveMcpGatewayBackends(env, persisted),
+    mcpGatewayModelBackends: resolveMcpGatewayModelBackends(env, persisted),
     browserToolsEnabled,
     git: resolveGitProcessConfig(env, persisted),
     autoArchiveAfterMerge,
@@ -726,6 +749,9 @@ function resolveCoreDaemonOverridePaths(
   if (cli?.mcpEnabled !== undefined) paths.push("daemon.mcp.enabled");
   if (cli?.mcpInjectIntoAgents !== undefined) paths.push("daemon.mcp.injectIntoAgents");
   if (env.PASEO_MCP_GATEWAY_BACKENDS !== undefined) paths.push("daemon.mcp.gateway.backends");
+  if (env.PASEO_MCP_GATEWAY_MODEL_BACKENDS !== undefined) {
+    paths.push("daemon.mcp.gateway.modelBackends");
+  }
   // Hostname sources append instead of replacing one another, so a launch value
   // does not prevent a persisted hostname edit from taking effect.
   if (parseTrustedProxiesEnv(env.PASEO_TRUSTED_PROXIES) !== undefined) {

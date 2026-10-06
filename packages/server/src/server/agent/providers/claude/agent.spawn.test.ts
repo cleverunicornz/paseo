@@ -102,4 +102,66 @@ describe("Claude spawn override", () => {
     const spawnOptions = claudeSpawnCall?.[2];
     expect(spawnOptions?.shell).toBe(false);
   });
+  test("a node-launched Claude Code with a model gateway holds no inherited model credential", async () => {
+    let capturedOptions: Options | undefined;
+    const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
+      capturedOptions = options;
+      return createQueryMock([
+        { type: "system", subtype: "init", session_id: "s", permissionMode: "default" },
+        {
+          type: "result",
+          subtype: "success",
+          usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+          total_cost_usd: 0,
+        },
+      ]);
+    });
+    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(createChildProcessStub());
+    const saved = {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    };
+    process.env.ANTHROPIC_API_KEY = "daemon-model-key";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "daemon-oauth-token";
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    try {
+      const session = await client.createSession(
+        { provider: "claude", cwd: process.cwd() },
+        {
+          agentId: "agent-1",
+          env: {},
+          modelGateway: { baseUrl: "http://127.0.0.1:6767/mcp/backends/models", token: "t-1" },
+        },
+      );
+      try {
+        await session.run("gateway");
+        expect(capturedOptions?.env?.ANTHROPIC_API_KEY).toBeUndefined();
+        capturedOptions?.spawnClaudeCodeProcess?.({
+          command: "node",
+          args: ["claude.js"],
+          cwd: process.cwd(),
+          env: { ...capturedOptions?.env },
+          signal: new AbortController().signal,
+        } satisfies ClaudeSpawnOptions);
+      } finally {
+        await session.close();
+      }
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+
+    const call = spawnSpy.mock.calls.find(([, args]) => args[0] === "claude.js");
+    const env = call?.[2]?.env as Record<string, string | undefined> | undefined;
+    expect(env?.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:6767/mcp/backends/models");
+    expect(env?.ANTHROPIC_AUTH_TOKEN).toBe("t-1");
+    expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+  });
 });

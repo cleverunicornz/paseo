@@ -151,3 +151,32 @@ test.each(["file:///etc/hosts", "http://", "https://[", "http:host", "http://use
     ).rejects.toThrow();
   },
 );
+
+test("plugins register agent.timeline_item handlers and receive each event", async () => {
+  const hooks = new PluginHookHandlers(() => {});
+  const seen: unknown[] = [];
+  hooks.on("agent.timeline_item", (event) => {
+    seen.push(event);
+  });
+  const event = {
+    agent: {
+      id: "agent-1",
+      provider: "claude",
+      sessionId: "session-1",
+      parentAgentId: null,
+      labels: {},
+      workspaceId: null,
+      cwd: "/project",
+      model: null,
+      title: null,
+    },
+    item: { type: "assistant_message", text: "hello" },
+    seq: 1,
+    epoch: "epoch-1",
+    timestamp: "2026-10-06T00:00:00.000Z",
+    turnId: null,
+  };
+  expect(hooks.catalog().events).toContain("agent.timeline_item");
+  await hooks.invoke("operation", "event", "agent.timeline_item", event, paseo);
+  expect(seen).toEqual([event]);
+});

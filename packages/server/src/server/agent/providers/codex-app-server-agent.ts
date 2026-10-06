@@ -6,6 +6,7 @@ import {
   type AgentCreateSessionOptions,
   type AgentFeature,
   type AgentLaunchContext,
+  type AgentModelGateway,
   type AgentResumeSessionOptions,
   type AgentMode,
   type AgentModelDefinition,
@@ -38,6 +39,7 @@ import {
   type ProviderRefreshContext,
   type ResolveAgentDefaultModeInput,
 } from "../agent-sdk-types.js";
+import type { ProcessEnvRecord } from "../../paseo-env.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
@@ -3248,7 +3250,7 @@ function toCodexTextInput(text: string): Extract<CodexAppServerUserInput, { type
 
 export function buildCodexAppServerEnv(
   runtimeSettings?: ProviderRuntimeSettings,
-  launchEnv?: Record<string, string>,
+  launchEnv?: ProcessEnvRecord,
 ): NodeJS.ProcessEnv {
   return createProviderEnv({
     runtimeSettings,
@@ -3315,6 +3317,53 @@ function buildCodexCustomProviderConfig(
     model_providers: {
       [customProvider.id]: providerConfig,
     },
+  };
+}
+
+/** The variable Codex reads the agent's gateway token from (`env_key`), set only in its own process. */
+export const CODEX_MODEL_GATEWAY_TOKEN_ENV = "PASEO_MODEL_GATEWAY_TOKEN";
+
+/**
+ * A responses provider at the daemon's model gateway. Codex appends its API
+ * paths (`/responses`, `/responses/compact`, ...) to `base_url` and sends the
+ * agent's token from `env_key` as its bearer; WebSockets stay off because the
+ * provider does not declare them.
+ */
+function buildCodexModelGatewayConfig(
+  gateway: AgentModelGateway,
+  customProvider: CodexAppServerAgentDeps["customProvider"],
+): CodexCustomProviderConfig {
+  const providerId = customProvider?.id ?? CODEX_PROVIDER;
+  return {
+    model_provider: providerId,
+    model_providers: {
+      [providerId]: {
+        name: "Paseo model gateway",
+        base_url: gateway.baseUrl,
+        wire_api: "responses",
+        env_key: CODEX_MODEL_GATEWAY_TOKEN_ENV,
+        requires_openai_auth: false,
+      },
+    },
+  };
+}
+
+/**
+ * The app-server's launch environment: with a model gateway, the agent's token
+ * under `CODEX_MODEL_GATEWAY_TOKEN_ENV` and no inherited model credential.
+ */
+function codexLaunchEnv(
+  launchContext: AgentLaunchContext | undefined,
+): ProcessEnvRecord | undefined {
+  const gateway = launchContext?.modelGateway;
+  if (!gateway) {
+    return launchContext?.env;
+  }
+  return {
+    ...launchContext.env,
+    [CODEX_MODEL_GATEWAY_TOKEN_ENV]: gateway.token,
+    OPENAI_API_KEY: undefined,
+    CODEX_API_KEY: undefined,
   };
 }
 
@@ -7019,6 +7068,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
+  readonly supportsModelGateway = true;
   private goalsEnabledPromise: Promise<boolean> | null = null;
   private autoReviewEnabledPromise: Promise<boolean> | null = null;
 
@@ -7028,11 +7078,16 @@ export class CodexAppServerAgentClient implements AgentClient {
     private readonly deps: CodexAppServerAgentDeps = {},
   ) {}
 
-  private sessionDeps(launchEnv: Record<string, string> | undefined): CodexAppServerAgentDeps {
+  private sessionDeps(launchContext: AgentLaunchContext | undefined): CodexAppServerAgentDeps {
+    const gateway = launchContext?.modelGateway;
     return {
       ...this.deps,
-      codexHome: resolveCodexHomeDir(buildCodexAppServerEnv(this.runtimeSettings, launchEnv)),
-      customCodexConfig: this.customProviderConfig(),
+      codexHome: resolveCodexHomeDir(
+        buildCodexAppServerEnv(this.runtimeSettings, codexLaunchEnv(launchContext)),
+      ),
+      customCodexConfig: gateway
+        ? buildCodexModelGatewayConfig(gateway, this.deps.customProvider)
+        : this.customProviderConfig(),
     };
   }
 
@@ -7093,7 +7148,7 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   private async spawnAppServer(
-    launchEnv?: Record<string, string>,
+    launchEnv?: ProcessEnvRecord,
     options?: { goalsEnabled?: boolean; agentId?: string },
   ): Promise<ChildProcessWithoutNullStreams> {
     const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
@@ -7142,8 +7197,11 @@ export class CodexAppServerAgentClient implements AgentClient {
       null,
       this.logger,
       () =>
-        this.spawnAppServer(launchContext?.env, { goalsEnabled, agentId: launchContext?.agentId }),
-      this.sessionDeps(launchContext?.env),
+        this.spawnAppServer(codexLaunchEnv(launchContext), {
+          goalsEnabled,
+          agentId: launchContext?.agentId,
+        }),
+      this.sessionDeps(launchContext),
       options?.persistSession === false,
       goalsEnabled,
       autoReviewEnabled,
@@ -7173,8 +7231,11 @@ export class CodexAppServerAgentClient implements AgentClient {
       handle,
       this.logger,
       () =>
-        this.spawnAppServer(launchContext?.env, { goalsEnabled, agentId: launchContext?.agentId }),
-      this.sessionDeps(launchContext?.env),
+        this.spawnAppServer(codexLaunchEnv(launchContext), {
+          goalsEnabled,
+          agentId: launchContext?.agentId,
+        }),
+      this.sessionDeps(launchContext),
       false,
       goalsEnabled,
       autoReviewEnabled,

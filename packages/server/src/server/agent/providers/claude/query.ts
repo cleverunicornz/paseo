@@ -6,7 +6,7 @@ import {
   createProviderEnvSpec,
   type ProviderRuntimeSettings,
 } from "../../provider-launch-config.js";
-import { buildSelfNodeCommand } from "../../../paseo-env.js";
+import { buildSelfNodeCommand, type ProcessEnvRecord } from "../../../paseo-env.js";
 import { spawnProcess } from "../../../../utils/spawn.js";
 import { moveInlineMcpConfigToPrivateFiles } from "./mcp-config-file.js";
 
@@ -20,7 +20,7 @@ export type ClaudeQueryFactory = (input: ClaudeQueryInput) => Query;
 
 export interface ClaudeQueryContext {
   runtimeSettings?: ProviderRuntimeSettings;
-  launchEnv?: Record<string, string>;
+  launchEnv?: ProcessEnvRecord;
   queryFactory?: ClaudeQueryFactory;
   /** Called with the spawned child process so the caller can tree-kill it on close. */
   onChildProcess?: (child: ChildProcess) => void;
@@ -75,11 +75,16 @@ function applyRuntimeSettingsToClaudeOptions(
         runtimeSettings,
         overlays: [launchEnv],
       });
-      const providerEnv = createProviderEnv({
+      const providerEnv: ProcessEnvRecord = createProviderEnv({
         baseEnv: spawnOptions.env,
         runtimeSettings,
         overlays: [launchEnv],
       });
+      // The self-node launch starts from the daemon's own environment, so a
+      // variable the launch removes must be removed there explicitly.
+      for (const [key, value] of Object.entries(launchEnv ?? {})) {
+        if (value === undefined) providerEnv[key] = undefined;
+      }
       // MCP configuration reaches Claude Code through a private file, never argv.
       const privateMcpConfig = moveInlineMcpConfigToPrivateFiles(resolved.args);
       const selfNodeCommand = isDefaultRuntime

@@ -140,6 +140,7 @@ import {
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
+import type { ProcessEnvRecord } from "../../../paseo-env.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { execCommand } from "../../../../utils/spawn.js";
@@ -411,12 +412,36 @@ interface ClaudeAgentClientOptions {
   rewindSdk?: ClaudeRewindSdk;
 }
 
+/**
+ * The launch environment Claude Code gets. With a model gateway it sends model
+ * calls to the gateway as `Authorization: Bearer <agent token>`
+ * (`ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_API_KEY` would travel as `x-api-key`,
+ * which the gateway forwards), and inherited model credentials are removed so
+ * the agent holds none. This overlay is applied last, over runtime settings
+ * and plugin-supplied launch values.
+ */
+function claudeLaunchEnv(
+  launchContext: AgentLaunchContext | undefined,
+): ProcessEnvRecord | undefined {
+  const gateway = launchContext?.modelGateway;
+  if (!gateway) {
+    return launchContext?.env;
+  }
+  return {
+    ...launchContext.env,
+    ANTHROPIC_BASE_URL: gateway.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: gateway.token,
+    ANTHROPIC_API_KEY: undefined,
+    CLAUDE_CODE_OAUTH_TOKEN: undefined,
+  };
+}
+
 interface ClaudeAgentSessionOptions {
   defaults?: { agents?: Record<string, AgentDefinition> };
   runtimeSettings?: ProviderRuntimeSettings;
   handle?: AgentPersistenceHandle;
   agentId?: string;
-  launchEnv?: Record<string, string>;
+  launchEnv?: ProcessEnvRecord;
   persistSession?: boolean;
   logger: Logger;
   queryFactory?: ClaudeQueryFactory;
@@ -1497,6 +1522,7 @@ export function readEventIdentifiers(message: SDKMessage): EventIdentifiers {
 export class ClaudeAgentClient implements AgentClient {
   readonly provider = "claude" as const;
   readonly capabilities = CLAUDE_CAPABILITIES;
+  readonly supportsModelGateway = true;
 
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
   private readonly logger: Logger;
@@ -1532,7 +1558,7 @@ export class ClaudeAgentClient implements AgentClient {
       defaults: this.defaults,
       runtimeSettings: this.runtimeSettings,
       agentId: launchContext?.agentId,
-      launchEnv: launchContext?.env,
+      launchEnv: claudeLaunchEnv(launchContext),
       persistSession: options?.persistSession,
       logger: this.logger,
       queryFactory: this.queryFactory,
@@ -1562,7 +1588,7 @@ export class ClaudeAgentClient implements AgentClient {
       runtimeSettings: this.runtimeSettings,
       handle,
       agentId: launchContext?.agentId,
-      launchEnv: launchContext?.env,
+      launchEnv: claudeLaunchEnv(launchContext),
       logger: this.logger,
       queryFactory: this.queryFactory,
       resolveBinary: this.resolveBinary,
@@ -2042,7 +2068,7 @@ class ClaudeAgentSession implements AgentSession {
   readonly capabilities = CLAUDE_CAPABILITIES;
 
   private readonly config: ClaudeAgentConfig;
-  private readonly launchEnv?: Record<string, string>;
+  private readonly launchEnv?: ProcessEnvRecord;
   private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
   private readonly runtimeSettings?: ProviderRuntimeSettings;

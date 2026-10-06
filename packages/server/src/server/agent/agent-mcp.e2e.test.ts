@@ -963,7 +963,7 @@ describe("agent MCP end-to-end (offline)", () => {
         agentClients: createMcpRecordingAgentClients(recorder, { supportsMcpServers: true }),
         agentStoragePath: path.join(paseoHome, "agents"),
         auth: { password: hashDaemonPassword("daemon-secret") },
-        mcpGatewayBackends: { cluster: `http://127.0.0.1:${backendPort}/mcp` },
+        mcpGatewayBackends: { cluster: { url: `http://127.0.0.1:${backendPort}/mcp` } },
       },
       pino({ level: "silent" }),
     );

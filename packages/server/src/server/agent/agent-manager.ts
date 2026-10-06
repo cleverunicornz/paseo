@@ -31,6 +31,7 @@ import {
   type AgentResumeSessionOptions,
   type AgentFeature,
   type AgentLaunchContext,
+  type AgentModelGateway,
   type AgentSlashCommand,
   type AgentMode,
   type AgentPermissionRequest,
@@ -330,6 +331,12 @@ export interface AgentManagerOptions {
   mcpBaseUrl?: string;
   /** Shared with the daemon's HTTP routes, which resolve a caller from its token. */
   agentTokens?: AgentTokenRegistry;
+  /**
+   * The MCP gateway backend each provider's model traffic goes to, by provider
+   * id. Agents of a named provider launch against `<gateway>/<backend>` with
+   * their own token instead of a model credential.
+   */
+  mcpGatewayModelBackends?: Record<string, string>;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
@@ -745,6 +752,7 @@ export class AgentManager {
   private mcpBaseUrl: string | null;
   private mcpGatewayBaseUrl: string | null = null;
   private readonly agentTokens: AgentTokenRegistry;
+  private readonly mcpGatewayModelBackends: ReadonlyMap<string, string>;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -769,6 +777,7 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.agentTokens = options.agentTokens ?? new AgentTokenRegistry();
+    this.mcpGatewayModelBackends = new Map(Object.entries(options.mcpGatewayModelBackends ?? {}));
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
@@ -5016,12 +5025,54 @@ export class AgentManager {
       "agent.manager.dispatch_stream",
     );
     this.dispatch({ type: "agent_stream", agentId, event, ...metadata });
-    if (this.pluginLifecycle && agent && !agent.internal && event.type !== "timeline") {
+    if (!this.pluginLifecycle || !agent || agent.internal) {
+      return;
+    }
+    if (event.type !== "timeline") {
       publishAgentStream(
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
         this.timelineStore.getItems(agentId),
+      );
+    } else if (metadata?.seq !== undefined) {
+      this.publishTimelineItem(this.pluginLifecycle, agent, event, {
+        seq: metadata.seq,
+        epoch: metadata.epoch ?? this.timelineStore.getEpoch(agentId),
+        timestamp: metadata.timestamp ?? new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Hands one recorded timeline row to plugins, exactly as clients received it.
+   * Plugin delivery is fire-and-forget: nothing here waits for a handler, and a
+   * delivery failure never reaches the agent's stream.
+   */
+  private publishTimelineItem(
+    lifecycle: PluginLifecycle,
+    agent: ManagedAgent,
+    event: Extract<AgentStreamEvent, { type: "timeline" }>,
+    row: { seq: number; epoch: string; timestamp: string },
+  ): void {
+    try {
+      lifecycle.emit("agent.timeline_item", {
+        agent: {
+          ...describeHookAgent({ ...agent, title: agent.config.title }),
+          sessionId: agent.persistence?.sessionId ?? agent.runtimeInfo?.sessionId ?? null,
+          labels: { ...agent.labels },
+          model: agent.runtimeInfo?.model ?? agent.config.model ?? null,
+        },
+        item: event.item,
+        seq: row.seq,
+        epoch: row.epoch,
+        timestamp: row.timestamp,
+        turnId: event.turnId ?? null,
+      });
+    } catch (error) {
+      this.logger.warn(
+        { err: error, agentId: agent.id, seq: row.seq },
+        "Failed to publish timeline item to plugins",
       );
     }
   }
@@ -5215,6 +5266,10 @@ export class AgentManager {
         PASEO_AGENT_CWD: cwd,
       },
     };
+    const modelGateway = this.resolveModelGateway(agentId, client);
+    if (modelGateway) {
+      context.modelGateway = modelGateway;
+    }
     if (
       this.paseoToolsEnabled &&
       isPaseoToolPolicyEnabled(paseoToolPolicy) &&
@@ -5227,6 +5282,32 @@ export class AgentManager {
       });
     }
     return context;
+  }
+
+  /**
+   * The gateway this agent's model client must use, when the daemon names a
+   * model backend for its provider. Launching fails rather than falling back
+   * to the provider's own credentials.
+   */
+  private resolveModelGateway(agentId: string, client: AgentClient): AgentModelGateway | undefined {
+    const backend = this.mcpGatewayModelBackends.get(client.provider);
+    if (!backend) {
+      return undefined;
+    }
+    if (!client.supportsModelGateway) {
+      throw new Error(
+        `Provider '${client.provider}' cannot send its model traffic through the model gateway`,
+      );
+    }
+    if (!this.mcpGatewayBaseUrl) {
+      throw new Error(
+        `Provider '${client.provider}' uses the model gateway, which needs the daemon to listen on TCP`,
+      );
+    }
+    return {
+      baseUrl: `${this.mcpGatewayBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(backend)}`,
+      token: this.agentTokens.issue(agentId),
+    };
   }
 
   private resolveProviderLaunchConfig(

@@ -3524,6 +3524,173 @@ test.each(["claude", "codex", "acp"])(
   },
 );
 
+class ModelGatewayCaptureClient extends TestAgentClient {
+  readonly supportsModelGateway = true;
+  readonly launchContexts: Array<AgentLaunchContext | undefined> = [];
+
+  override async createSession(
+    config: AgentSessionConfig,
+    launchContext?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    this.launchContexts.push(launchContext);
+    return super.createSession(config);
+  }
+
+  override async resumeSession(
+    handle: AgentPersistenceHandle,
+    config?: Partial<AgentSessionConfig>,
+    launchContext?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    this.launchContexts.push(launchContext);
+    return super.resumeSession(handle, config, launchContext);
+  }
+}
+
+test("each agent of a provider with a model backend launches with its own token and gateway URL", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const claude = new ModelGatewayCaptureClient("claude");
+  const codex = new ModelGatewayCaptureClient("codex");
+  const agentTokens = new AgentTokenRegistry();
+  const manager = new AgentManager({
+    clients: { claude, codex },
+    registry: storage,
+    logger,
+    agentTokens,
+    mcpGatewayModelBackends: { claude: "anthropic", codex: "openai" },
+  });
+  manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+
+  try {
+    const first = await manager.createAgent({ provider: "claude", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const second = await manager.createAgent({ provider: "claude", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const third = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const [firstLaunch, secondLaunch] = claude.launchContexts;
+    expect(firstLaunch?.modelGateway).toEqual({
+      baseUrl: "http://127.0.0.1:6767/mcp/backends/anthropic",
+      token: manager.issueAgentToken(first.id),
+    });
+    expect(secondLaunch?.modelGateway?.baseUrl).toBe(
+      "http://127.0.0.1:6767/mcp/backends/anthropic",
+    );
+    expect(secondLaunch?.modelGateway?.token).not.toBe(firstLaunch?.modelGateway?.token);
+    expect(agentTokens.resolve(firstLaunch?.modelGateway?.token)).toBe(first.id);
+    expect(agentTokens.resolve(secondLaunch?.modelGateway?.token)).toBe(second.id);
+    expect(codex.launchContexts[0]?.modelGateway).toEqual({
+      baseUrl: "http://127.0.0.1:6767/mcp/backends/openai",
+      token: manager.issueAgentToken(third.id),
+    });
+
+    await manager.flush();
+    const files = readdirSync(storagePath, { recursive: true, encoding: "utf8" })
+      .map((entry) => join(storagePath, entry))
+      .filter((file) => file.endsWith(".json"));
+    expect(files.length).toBeGreaterThan(0);
+    const written = files.map((file) => readFileSync(file, "utf8")).join("\n");
+    for (const launch of [...claude.launchContexts, ...codex.launchContexts]) {
+      expect(written).not.toContain(launch!.modelGateway!.token);
+    }
+    expect(written).not.toContain("/mcp/backends/");
+
+    await manager.closeAgent(first.id);
+    expect(agentTokens.resolve(firstLaunch?.modelGateway?.token)).toBeNull();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a resumed agent launches with the model gateway again", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const claude = new ModelGatewayCaptureClient("claude");
+  const manager = new AgentManager({
+    clients: { claude },
+    logger,
+    mcpGatewayModelBackends: { claude: "anthropic" },
+  });
+  manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+
+  try {
+    const agent = await manager.resumeAgentFromPersistence(
+      { provider: "claude", sessionId: "resumed-session" },
+      { cwd: workdir },
+    );
+    expect(claude.launchContexts.at(-1)?.modelGateway).toEqual({
+      baseUrl: "http://127.0.0.1:6767/mcp/backends/anthropic",
+      token: manager.issueAgentToken(agent.id),
+    });
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("without a model backend for its provider an agent launches as before", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const claude = new ModelGatewayCaptureClient("claude");
+  const codex = new ModelGatewayCaptureClient("codex");
+  const manager = new AgentManager({
+    clients: { claude, codex },
+    logger,
+    mcpGatewayModelBackends: { claude: "anthropic" },
+  });
+  const unconfigured = new AgentManager({ clients: { claude }, logger });
+  manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+  unconfigured.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await unconfigured.createAgent({ provider: "claude", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    expect(codex.launchContexts[0]).toBeDefined();
+    expect(codex.launchContexts[0]).not.toHaveProperty("modelGateway");
+    expect(claude.launchContexts[0]).toBeDefined();
+    expect(claude.launchContexts[0]).not.toHaveProperty("modelGateway");
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an agent whose model backend cannot be honoured is not launched", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const unsupported = new TestAgentClient("opencode");
+  const claude = new ModelGatewayCaptureClient("claude");
+  const manager = new AgentManager({
+    clients: { opencode: unsupported, claude },
+    logger,
+    mcpGatewayModelBackends: { opencode: "openai", claude: "anthropic" },
+  });
+
+  try {
+    // No gateway URL: the daemon is not listening on TCP.
+    await expect(
+      manager.createAgent({ provider: "claude", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toThrow("model gateway");
+    expect(claude.launchContexts).toHaveLength(0);
+
+    manager.setMcpGatewayBaseUrl("http://127.0.0.1:6767/mcp/backends");
+    await expect(
+      manager.createAgent({ provider: "opencode", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toThrow("model gateway");
+    expect(unsupported.createdConfigs).toHaveLength(0);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("createAgent allows best-effort internal MCP when the provider session reports no support", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");

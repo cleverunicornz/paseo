@@ -41,38 +41,141 @@ export function isMcpGatewayBackendUrl(value: string): boolean {
   return MCP_GATEWAY_BACKEND_URL_PATTERN.test(value);
 }
 
+/** Bounds of a backend's `responseTimeoutMs`: model backends may wait minutes for a first byte. */
+export const MCP_GATEWAY_RESPONSE_TIMEOUT_MIN_MS = 1;
+export const MCP_GATEWAY_RESPONSE_TIMEOUT_MAX_MS = 3_600_000;
+
 /**
- * Validates a `{ name: url }` map of MCP gateway backends. `source` names the
- * config key or environment variable in the error so a bad value is easy to
- * find at startup.
+ * Provider ids a model backend is named for: the same rule as configured
+ * provider ids (`agents.providers`), so custom providers can be named too.
  */
-export function parseMcpGatewayBackends(value: unknown, source: string): Record<string, string> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+export const MCP_GATEWAY_MODEL_PROVIDER_PATTERN = /^[a-z][a-z0-9-]*$/;
+
+/** A configured backend: its URL and, optionally, how long to wait for its response headers. */
+export interface McpGatewayBackend {
+  url: string;
+  responseTimeoutMs?: number;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isResponseTimeoutMs(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= MCP_GATEWAY_RESPONSE_TIMEOUT_MIN_MS &&
+    value <= MCP_GATEWAY_RESPONSE_TIMEOUT_MAX_MS
+  );
+}
+
+function parseBackend(name: string, value: unknown, source: string): McpGatewayBackend {
+  const urlError = new Error(
+    `Invalid ${source}: backend "${name}" must be a complete http or https URL with a valid host and no credentials`,
+  );
+  if (typeof value === "string") {
+    if (!isMcpGatewayBackendUrl(value)) throw urlError;
+    return { url: value };
+  }
+  if (!isPlainObject(value)) {
+    throw new Error(
+      `Invalid ${source}: backend "${name}" must be a URL or an object with url and responseTimeoutMs`,
+    );
+  }
+  const unknownKeys = Object.keys(value).filter(
+    (key) => key !== "url" && key !== "responseTimeoutMs",
+  );
+  if (unknownKeys.length > 0) {
+    throw new Error(
+      `Invalid ${source}: backend "${name}" has unknown keys: ${unknownKeys.join(", ")}`,
+    );
+  }
+  if (typeof value.url !== "string" || !isMcpGatewayBackendUrl(value.url)) throw urlError;
+  if (value.responseTimeoutMs === undefined) {
+    return { url: value.url };
+  }
+  if (!isResponseTimeoutMs(value.responseTimeoutMs)) {
+    throw new Error(
+      `Invalid ${source}: backend "${name}" responseTimeoutMs must be an integer from ${MCP_GATEWAY_RESPONSE_TIMEOUT_MIN_MS} to ${MCP_GATEWAY_RESPONSE_TIMEOUT_MAX_MS}`,
+    );
+  }
+  return { url: value.url, responseTimeoutMs: value.responseTimeoutMs };
+}
+
+/**
+ * Validates a map of MCP gateway backends. Each value is a URL, or
+ * `{ url, responseTimeoutMs? }`. `source` names the config key or environment
+ * variable in the error so a bad value is easy to find at startup.
+ */
+export function parseMcpGatewayBackends(
+  value: unknown,
+  source: string,
+): Record<string, McpGatewayBackend> {
+  if (!isPlainObject(value)) {
     throw new Error(`Invalid ${source}: expected an object mapping backend names to URLs`);
   }
-  const backends: Record<string, string> = {};
-  for (const [name, url] of Object.entries(value)) {
+  const backends: Record<string, McpGatewayBackend> = {};
+  for (const [name, backend] of Object.entries(value)) {
     if (!MCP_GATEWAY_BACKEND_NAME_PATTERN.test(name)) {
       throw new Error(
         `Invalid ${source}: backend name "${name}" must match ${MCP_GATEWAY_BACKEND_NAME_PATTERN}`,
       );
     }
-    if (typeof url !== "string" || !isMcpGatewayBackendUrl(url)) {
-      throw new Error(
-        `Invalid ${source}: backend "${name}" must be a complete http or https URL with a valid host and no credentials`,
-      );
-    }
-    backends[name] = url;
+    backends[name] = parseBackend(name, backend, source);
   }
   return backends;
 }
 
-export function parseMcpGatewayBackendsEnv(value: string, source: string): Record<string, string> {
-  let parsed: unknown;
+function parseJsonEnv(value: string, source: string, expected: string): unknown {
   try {
-    parsed = JSON.parse(value);
+    return JSON.parse(value);
   } catch {
-    throw new Error(`Invalid ${source}: expected a JSON object mapping backend names to URLs`);
+    throw new Error(`Invalid ${source}: expected a JSON object mapping ${expected}`);
   }
-  return parseMcpGatewayBackends(parsed, source);
+}
+
+export function parseMcpGatewayBackendsEnv(
+  value: string,
+  source: string,
+): Record<string, McpGatewayBackend> {
+  return parseMcpGatewayBackends(parseJsonEnv(value, source, "backend names to URLs"), source);
+}
+
+/**
+ * Validates the `{ providerId: backendName }` map naming the gateway backend
+ * each provider's model traffic goes to.
+ */
+export function parseMcpGatewayModelBackends(
+  value: unknown,
+  source: string,
+): Record<string, string> {
+  if (!isPlainObject(value)) {
+    throw new Error(`Invalid ${source}: expected an object mapping provider ids to backend names`);
+  }
+  const modelBackends: Record<string, string> = {};
+  for (const [provider, backend] of Object.entries(value)) {
+    if (!MCP_GATEWAY_MODEL_PROVIDER_PATTERN.test(provider)) {
+      throw new Error(
+        `Invalid ${source}: provider id "${provider}" must match ${MCP_GATEWAY_MODEL_PROVIDER_PATTERN}`,
+      );
+    }
+    if (typeof backend !== "string" || !MCP_GATEWAY_BACKEND_NAME_PATTERN.test(backend)) {
+      throw new Error(
+        `Invalid ${source}: backend for provider "${provider}" must be a backend name matching ${MCP_GATEWAY_BACKEND_NAME_PATTERN}`,
+      );
+    }
+    modelBackends[provider] = backend;
+  }
+  return modelBackends;
+}
+
+export function parseMcpGatewayModelBackendsEnv(
+  value: string,
+  source: string,
+): Record<string, string> {
+  return parseMcpGatewayModelBackends(
+    parseJsonEnv(value, source, "provider ids to backend names"),
+    source,
+  );
 }
