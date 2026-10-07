@@ -64,6 +64,148 @@ const FIXTURE: ToolTreeServer[] = [
   },
 ];
 
+/** Strict TypeScript diagnostics for files of a tree, compiled as an agent's script would be. */
+function typecheck(rootNames: string[]): string[] {
+  const program = ts.createProgram(rootNames, {
+    strict: true,
+    noEmit: true,
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    allowImportingTsExtensions: true,
+    verbatimModuleSyntax: true,
+    // The tree needs no type packages: an agent's script runs it as-is.
+    types: [],
+  });
+  return ts.getPreEmitDiagnostics(program).map((d) => {
+    const where = d.file ? `${path.basename(d.file.fileName)}: ` : "";
+    return `${where}${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`;
+  });
+}
+
+const AWKWARD_TOOL_NAMES = [
+  "index",
+  "INDEX",
+  "call_tool",
+  "callTool",
+  "ToolContent",
+  "client",
+  "read-file",
+  "read_file",
+  "readFile",
+  "ReadFile",
+  "Read.File",
+  "read_file_2",
+  "foo",
+  "foo_input",
+  "FooInput",
+  "class",
+  "123go",
+  "",
+  "$",
+  "a/b",
+  "../up",
+  "constructor",
+  "__proto__",
+  "café",
+  "日本",
+];
+
+const AWKWARD: ToolTreeServer[] = [
+  {
+    name: "paseo",
+    tools: AWKWARD_TOOL_NAMES.map((name) => ({
+      name,
+      inputSchema: { type: "object", properties: { value: { type: "string" } } },
+      outputSchema: { type: "object", properties: { ok: { type: "boolean" } } },
+    })),
+  },
+  ...["a.b", "a_b", "A_B", "x/../y", ""].map((name) => ({
+    name,
+    tools: [{ name: "index", inputSchema: { type: "object", properties: {} } }],
+  })),
+];
+
+const OBJECT_A = {
+  type: "object",
+  properties: { kind: { const: "a" }, a: { type: "string" } },
+  required: ["kind", "a"],
+};
+const OBJECT_B = {
+  type: "object",
+  properties: { kind: { const: "b" }, b: { type: "number" } },
+  required: ["kind", "b"],
+};
+
+const COMPOSED: ToolTreeServer[] = [
+  {
+    name: "shapes",
+    tools: [
+      {
+        name: "one_of",
+        inputSchema: { oneOf: [OBJECT_A, OBJECT_B] },
+        outputSchema: { anyOf: [OBJECT_A, { type: "null" }] },
+      },
+      {
+        name: "all_of",
+        inputSchema: {
+          allOf: [OBJECT_A, { type: "object", properties: { extra: { type: "boolean" } } }],
+        },
+        outputSchema: {
+          allOf: [
+            { anyOf: [OBJECT_A, OBJECT_B] },
+            { type: "object", properties: { id: { type: "string" } } },
+          ],
+        },
+      },
+      { name: "empty_all_of", inputSchema: { type: "object", properties: { x: { allOf: [] } } } },
+      {
+        name: "refs",
+        inputSchema: {
+          type: "object",
+          properties: {
+            point: { $ref: "#/$defs/Point" },
+            tree: { $ref: "#/$defs/Node" },
+            remote: { $ref: "https://example.invalid/s.json" },
+          },
+          required: ["point"],
+          $defs: {
+            Point: {
+              type: "object",
+              properties: { x: { type: "number" }, y: { type: "number" } },
+              required: ["x", "y"],
+            },
+            Node: {
+              type: "object",
+              properties: { children: { type: "array", items: { $ref: "#/$defs/Node" } } },
+            },
+          },
+        },
+      },
+      {
+        name: "nested",
+        inputSchema: {
+          type: "object",
+          properties: {
+            outer: {
+              type: "object",
+              properties: {
+                inner: { type: "object", properties: { deep: { type: ["string", "null"] } } },
+              },
+            },
+            list: { type: "array", items: { anyOf: [OBJECT_A, { type: "null" }] } },
+            map: { type: "object", additionalProperties: { oneOf: [OBJECT_A, OBJECT_B] } },
+            literal: { const: { nested: [1, "two", null] } },
+            mixed: { enum: ["x", 1, true, null] },
+          },
+          required: ["list"],
+        },
+        outputSchema: { type: "array", items: { oneOf: [OBJECT_A, OBJECT_B] } },
+      },
+    ],
+  },
+];
+
 describe("tool tree generator", () => {
   let dir: string;
 
@@ -89,7 +231,7 @@ describe("tool tree generator", () => {
     ]);
 
     const exec = files.get("servers/paseo/exec.ts")!;
-    expect(exec).toContain('import { callTool } from "../../client.ts";');
+    expect(exec).toContain('import * as $client from "../../client.ts";');
     expect(exec).toContain("export interface ExecInput {");
     expect(exec).toContain("  /** Argv. */\n  command: string[];");
     expect(exec).toContain("  cwd?: string;");
@@ -98,11 +240,13 @@ describe("tool tree generator", () => {
     expect(exec).toContain('  "odd-key"?: string | null;');
     expect(exec).toContain(" * Run a command in your workspace.\n * Returns its output.");
     expect(exec).toContain("export function exec(input: ExecInput): Promise<ExecOutput> {");
-    expect(exec).toContain('  return callTool("paseo", "exec", input) as Promise<ExecOutput>;');
+    expect(exec).toContain(
+      '  return $client.callTool("paseo", "exec", input) as Promise<ExecOutput>;',
+    );
 
     const pods = files.get("servers/cluster/get_pods.ts")!;
     expect(pods).toContain(
-      "export function getPods(input: GetPodsInput = {}): Promise<ToolContent> {",
+      "export function getPods(input: GetPodsInput = {}): Promise<$client.ToolContent> {",
     );
     expect(pods).toContain('callTool("cluster", "get-pods", input)');
     expect(pods).toContain("labels?: Record<string, string>;");
@@ -133,24 +277,93 @@ describe("tool tree generator", () => {
       'import { exec } from "./servers/paseo/exec.ts";\nawait exec({ command: "ls" });\nexport {};\n',
     );
 
-    const diagnostics = (rootName: string) => {
-      const program = ts.createProgram([path.join(dir, rootName)], {
-        strict: true,
-        noEmit: true,
-        target: ts.ScriptTarget.ES2022,
-        module: ts.ModuleKind.NodeNext,
-        moduleResolution: ts.ModuleResolutionKind.NodeNext,
-        allowImportingTsExtensions: true,
-        verbatimModuleSyntax: true,
-        // The tree needs no type packages: an agent's script runs it as-is.
-        types: [],
-      });
-      return ts
-        .getPreEmitDiagnostics(program)
-        .map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n"));
-    };
+    const diagnostics = (rootName: string) => typecheck([path.join(dir, rootName)]);
     expect(diagnostics("use.ts")).toEqual([]);
     expect(diagnostics("misuse.ts").join("\n")).toMatch(/not assignable to type 'string\[\]'/);
+  });
+
+  test("every valid tool name gets its own file and a unique export, and the tree typechecks", async () => {
+    const files = renderToolTree(AWKWARD);
+    const servers = new Map<string, string>();
+    for (const server of AWKWARD) {
+      for (const tool of server.tools) {
+        const call = `callTool(${JSON.stringify(server.name)}, ${JSON.stringify(tool.name)}, input)`;
+        const owners = [...files.entries()].filter(([, content]) => content.includes(call));
+        expect(
+          owners.map(([file]) => file),
+          `${server.name}/${tool.name}`,
+        ).toHaveLength(1);
+        const [file, content] = owners[0]!;
+        expect(file).toMatch(/^servers\/[A-Za-z0-9_-]+\/[A-Za-z0-9_]+\.ts$/);
+        expect(path.basename(file)).not.toBe("index.ts");
+        const dirName = path.dirname(file);
+        expect(servers.get(dirName) ?? server.name, file).toBe(server.name);
+        servers.set(dirName, server.name);
+        expect(content).toMatch(/export function [A-Za-z_$][\w$]*\(/);
+      }
+    }
+    // A tool whose clean name no other tool contests keeps it.
+    const kept = files.get("servers/paseo/constructor.ts");
+    expect(kept).toContain('callTool("paseo", "constructor", input)');
+    expect(kept).toContain("export function constructor(");
+    // No two files differ only in case, so the tree survives a case-insensitive disk.
+    const lowered = [...files.keys()].map((file) => file.toLowerCase());
+    expect(new Set(lowered).size).toBe(lowered.length);
+
+    await writeToolTree(dir, AWKWARD);
+    // Each server's barrel re-exports every tool's function under its own name.
+    const imports: string[] = [];
+    const uses: string[] = [];
+    [...files.entries()]
+      .filter(([file]) => file.startsWith("servers/") && !file.endsWith("/index.ts"))
+      .forEach(([file, content], index) => {
+        const name = /export function ([A-Za-z_$][\w$]*)\(/.exec(content)![1]!;
+        imports.push(`import * as m${index} from "./${path.dirname(file)}/index.ts";`);
+        uses.push(`m${index}.${name}`);
+      });
+    await writeFile(
+      path.join(dir, "use-all.ts"),
+      `${imports.join("\n")}\nexport const all: Array<(input?: never) => Promise<unknown>> = [${uses.join(", ")}];\n`,
+    );
+    const roots = [...files.keys()]
+      .filter((file) => file.endsWith(".ts"))
+      .map((file) => path.join(dir, file));
+    expect(typecheck([...roots, path.join(dir, "use-all.ts")])).toEqual([]);
+  });
+
+  test("composed and referenced schemas render as valid, precise types", async () => {
+    await writeToolTree(dir, COMPOSED);
+    await writeFile(
+      path.join(dir, "use.ts"),
+      [
+        'import { oneOf, allOf, emptyAllOf, refs, nested } from "./servers/shapes/index.ts";',
+        'const one = await oneOf({ kind: "b", b: 1 });',
+        'const kind: "a" | undefined = one?.kind;',
+        'const all = await allOf({ kind: "a", a: "x", extra: true });',
+        "const id: string | undefined = all.id;",
+        "await emptyAllOf({ x: 1 });",
+        "await refs({ point: { x: 1, y: 2 }, tree: { children: [{ children: [] }] }, remote: 1 });",
+        'const items = await nested({ list: [null, { kind: "a", a: "x" }], map: { k: { kind: "b", b: 2 } }, mixed: "x", literal: { nested: [1, "two", null] }, outer: { inner: { deep: null } } });',
+        'const first: { kind: "a" } | { kind: "b" } | undefined = items[0];',
+        "export { kind, id, first };",
+      ].join("\n"),
+    );
+    await writeFile(
+      path.join(dir, "misuse.ts"),
+      [
+        'import { oneOf, refs, nested } from "./servers/shapes/index.ts";',
+        'await oneOf({ kind: "a", b: 1 });',
+        "await refs({ point: { x: 1 } });",
+        "await nested({ list: [1] });",
+        "export {};",
+      ].join("\n"),
+    );
+    const roots = [...renderToolTree(COMPOSED).keys()]
+      .filter((file) => file.endsWith(".ts"))
+      .map((file) => path.join(dir, file));
+    expect(typecheck([...roots, path.join(dir, "use.ts")])).toEqual([]);
+    const misuse = typecheck([path.join(dir, "misuse.ts")]);
+    expect(misuse).toHaveLength(3);
   });
 
   test("rewrites the tree only when the rendered tool list changes", async () => {

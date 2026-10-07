@@ -194,13 +194,19 @@ function asSchema(value: unknown): JsonSchema | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonSchema) : null;
 }
 
+/** Code-unit order, so the layout never depends on the host's locale. */
+function byCodeUnit(a: string, b: string): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
 function sanitizeName(name: string): string {
   const cleaned = name.replace(/[^A-Za-z0-9_]/g, "_");
   return /^[0-9]/.test(cleaned) ? `_${cleaned}` : cleaned || "_";
 }
 
-function camelCase(name: string): string {
-  const parts = sanitizeName(name).split("_").filter(Boolean);
+function camelCase(stem: string): string {
+  const parts = stem.split("_").filter(Boolean);
   const joined = parts
     .map((part, index) => (index === 0 ? part : part[0]!.toUpperCase() + part.slice(1)))
     .join("");
@@ -208,8 +214,8 @@ function camelCase(name: string): string {
   return RESERVED_WORDS.has(identifier) ? `${identifier}Tool` : identifier;
 }
 
-function pascalCase(name: string): string {
-  const joined = sanitizeName(name)
+function pascalCase(stem: string): string {
+  const joined = stem
     .split("_")
     .filter(Boolean)
     .map((part) => part[0]!.toUpperCase() + part.slice(1))
@@ -232,50 +238,89 @@ function docComment(text: string | undefined, indent: string): string {
   return `${indent}/**\n${lines.map((line) => `${indent} *${line ? ` ${line}` : ""}`).join("\n")}\n${indent} */\n`;
 }
 
+/** The schema a type is rendered from and the document its local `$ref`s point into. */
+interface SchemaScope {
+  root: JsonSchema;
+  indent: string;
+  depth: number;
+}
+
+function deeper(scope: SchemaScope, indent = scope.indent): SchemaScope {
+  return { root: scope.root, indent, depth: scope.depth + 1 };
+}
+
+/** A `#/...` JSON pointer into the root schema; anything else is not resolved. */
+function resolveRef(ref: unknown, root: JsonSchema): JsonSchema | null {
+  if (ref === "#") return root;
+  if (typeof ref !== "string" || !ref.startsWith("#/")) return null;
+  let target: unknown = root;
+  for (const raw of ref.slice(2).split("/")) {
+    let segment: string;
+    try {
+      segment = decodeURIComponent(raw).replaceAll("~1", "/").replaceAll("~0", "~");
+    } catch {
+      return null;
+    }
+    const container = asSchema(target) ?? (Array.isArray(target) ? target : null);
+    if (!container || !Object.hasOwn(container, segment)) return null;
+    target = (container as Record<string, unknown>)[segment];
+  }
+  return asSchema(target);
+}
+
 function unionOf(members: string[]): string {
   const unique = [...new Set(members)];
   if (unique.includes("unknown")) return "unknown";
   return unique.join(" | ") || "never";
 }
 
-function wrapForArray(type: string): string {
-  return /[|&]/.test(type) && !type.startsWith("{") ? `(${type})` : type;
+function intersectionOf(members: string[]): string {
+  // `unknown` is the identity of an intersection.
+  const known = [...new Set(members)].filter((member) => member !== "unknown");
+  if (known.length === 0) return "unknown";
+  if (known.length === 1) return known[0]!;
+  return known.map((member) => `(${member})`).join(" & ");
 }
 
-function objectBody(schema: JsonSchema, indent: string, depth: number): string {
+function arrayOf(type: string): string {
+  return /^[A-Za-z_$][\w$]*$/.test(type) ? `${type}[]` : `Array<${type}>`;
+}
+
+function objectBody(schema: JsonSchema, scope: SchemaScope): string {
   const properties = asSchema(schema.properties) ?? {};
   const required = new Set(Array.isArray(schema.required) ? (schema.required as string[]) : []);
-  const inner = `${indent}  `;
+  const inner = `${scope.indent}  `;
   const lines = Object.entries(properties).map(([key, value]) => {
     const property = asSchema(value) ?? {};
     const description = typeof property.description === "string" ? property.description : undefined;
     const optional = required.has(key) ? "" : "?";
-    return `${docComment(description, inner)}${inner}${propertyKey(key)}${optional}: ${typeOf(property, inner, depth + 1)};`;
+    return `${docComment(description, inner)}${inner}${propertyKey(key)}${optional}: ${typeOf(property, deeper(scope, inner))};`;
   });
-  return lines.length === 0 ? "{}" : `{\n${lines.join("\n")}\n${indent}}`;
+  return lines.length === 0 ? "{}" : `{\n${lines.join("\n")}\n${scope.indent}}`;
 }
 
 /** The type of a schema built from other schemas (const, enum, anyOf, oneOf, allOf, a type list). */
-function composedTypeOf(schema: JsonSchema, indent: string, depth: number): string | null {
+function composedTypeOf(schema: JsonSchema, scope: SchemaScope): string | null {
   if (schema.const !== undefined) return JSON.stringify(schema.const);
   if (Array.isArray(schema.enum)) return unionOf(schema.enum.map((value) => JSON.stringify(value)));
   const alternatives = Array.isArray(schema.anyOf) ? schema.anyOf : schema.oneOf;
   if (Array.isArray(alternatives)) {
-    return unionOf(alternatives.map((member) => typeOf(asSchema(member), indent, depth + 1)));
+    return unionOf(alternatives.map((member) => typeOf(asSchema(member), deeper(scope))));
   }
   if (Array.isArray(schema.allOf)) {
-    const members = schema.allOf.map((member) => typeOf(asSchema(member), indent, depth + 1));
-    return members.includes("unknown") ? "unknown" : members.join(" & ");
+    return intersectionOf(schema.allOf.map((member) => typeOf(asSchema(member), deeper(scope))));
   }
   if (Array.isArray(schema.type)) {
-    return unionOf(schema.type.map((type) => typeOf({ ...schema, type }, indent, depth + 1)));
+    return unionOf(schema.type.map((type) => typeOf({ ...schema, type }, deeper(scope))));
   }
   return null;
 }
 
-function typeOf(schema: JsonSchema | null, indent: string, depth: number): string {
-  if (!schema || depth > MAX_SCHEMA_DEPTH || schema.$ref !== undefined) return "unknown";
-  const composed = composedTypeOf(schema, indent, depth);
+/** The TypeScript type of a schema; `unknown` where no precise type can be given. */
+function typeOf(schema: JsonSchema | null, scope: SchemaScope): string {
+  if (!schema || scope.depth > MAX_SCHEMA_DEPTH) return "unknown";
+  if (schema.$ref !== undefined) return typeOf(resolveRef(schema.$ref, scope.root), deeper(scope));
+  const composed = composedTypeOf(schema, scope);
   if (composed !== null) return composed;
   switch (schema.type) {
     case "string":
@@ -287,15 +332,13 @@ function typeOf(schema: JsonSchema | null, indent: string, depth: number): strin
       return "boolean";
     case "null":
       return "null";
-    case "array": {
-      const items = asSchema(schema.items);
-      return `${wrapForArray(typeOf(items, indent, depth + 1))}[]`;
-    }
+    case "array":
+      return arrayOf(typeOf(asSchema(schema.items), deeper(scope)));
     case "object":
     case undefined: {
-      if (asSchema(schema.properties)) return objectBody(schema, indent, depth);
+      if (asSchema(schema.properties)) return objectBody(schema, scope);
       const additional = asSchema(schema.additionalProperties);
-      if (additional) return `Record<string, ${typeOf(additional, indent, depth + 1)}>`;
+      if (additional) return `Record<string, ${typeOf(additional, deeper(scope))}>`;
       return schema.type === "object" ? "Record<string, unknown>" : "unknown";
     }
     default:
@@ -303,55 +346,151 @@ function typeOf(schema: JsonSchema | null, indent: string, depth: number): strin
   }
 }
 
-function declareType(name: string, schema: JsonSchema | null): string {
-  const type = typeOf(schema, "", 0);
-  return type.startsWith("{")
+/** An object schema with listed properties and nothing composed: it renders as an interface. */
+function isPlainObjectSchema(schema: JsonSchema): boolean {
+  return (
+    schema.$ref === undefined &&
+    schema.const === undefined &&
+    !Array.isArray(schema.enum) &&
+    !Array.isArray(schema.anyOf) &&
+    !Array.isArray(schema.oneOf) &&
+    !Array.isArray(schema.allOf) &&
+    (schema.type === "object" || schema.type === undefined) &&
+    asSchema(schema.properties) !== null
+  );
+}
+
+function declareType(name: string, schema: JsonSchema): string {
+  const type = typeOf(schema, { root: schema, indent: "", depth: 0 });
+  return isPlainObjectSchema(schema)
     ? `export interface ${name} ${type}\n`
     : `export type ${name} = ${type};\n`;
 }
 
-function hasRequiredInput(schema: JsonSchema | null): boolean {
-  return Array.isArray(schema?.required) && (schema.required as unknown[]).length > 0;
+/** Whether a call may leave the input out: the input type takes `{}`. */
+function acceptsEmptyInput(schema: JsonSchema): boolean {
+  if (isPlainObjectSchema(schema)) {
+    return !Array.isArray(schema.required) || schema.required.length === 0;
+  }
+  const type = typeOf(schema, { root: schema, indent: "", depth: 0 });
+  return type === "unknown" || type.startsWith("Record<string, ");
 }
 
-function renderToolFile(server: string, tool: ToolTreeTool): string {
-  const functionName = camelCase(tool.name);
-  const typeName = pascalCase(tool.name);
+/**
+ * The client module's name inside a tool file. Generated names hold only
+ * letters, digits and `_`, so no tool can collide with it.
+ */
+const CLIENT = "$client";
+
+interface ToolLayout {
+  tool: ToolTreeTool;
+  /** File name in the server's directory. */
+  file: string;
+  functionName: string;
+  /** Prefix of the tool's `Input` and `Output` types. */
+  typeName: string;
+}
+
+interface ServerLayout {
+  server: ToolTreeServer;
+  /** Directory name under `servers/`. */
+  dir: string;
+  tools: ToolLayout[];
+}
+
+/** The first of `base`, `base_2`, `base_3`, ... that `isFree` accepts. */
+function allocate(base: string, isFree: (candidate: string) => boolean): string {
+  for (let suffix = 1; ; suffix += 1) {
+    const candidate = suffix === 1 ? base : `${base}_${suffix}`;
+    if (isFree(candidate)) return candidate;
+  }
+}
+
+function layoutTools(tools: ToolTreeTool[]): ToolLayout[] {
+  // File names are compared without case so the tree survives a case-insensitive disk.
+  const usedFiles = new Set(["index"]);
+  // Every name a server's barrel re-exports.
+  const usedExports = new Set<string>();
+  // Tools whose names are already clean claim them first; the rest take what is left.
+  const isClean = (tool: ToolTreeTool) => sanitizeName(tool.name) === tool.name;
+  const byName = (a: ToolTreeTool, b: ToolTreeTool) => byCodeUnit(a.name, b.name);
+  return [...tools.filter(isClean).sort(byName), ...tools.filter((t) => !isClean(t)).sort(byName)]
+    .map((tool) => {
+      const stem = allocate(sanitizeName(tool.name), (candidate) => {
+        const typeName = pascalCase(candidate);
+        return (
+          !usedFiles.has(candidate.toLowerCase()) &&
+          ![camelCase(candidate), `${typeName}Input`, `${typeName}Output`].some((name) =>
+            usedExports.has(name),
+          )
+        );
+      });
+      const layout: ToolLayout = {
+        tool,
+        file: `${stem}.ts`,
+        functionName: camelCase(stem),
+        typeName: pascalCase(stem),
+      };
+      usedFiles.add(stem.toLowerCase());
+      usedExports.add(layout.functionName);
+      usedExports.add(`${layout.typeName}Input`);
+      usedExports.add(`${layout.typeName}Output`);
+      return layout;
+    })
+    .sort((a, b) => byName(a.tool, b.tool));
+}
+
+/**
+ * Where every server and tool goes and what each is called: deterministic for
+ * a tool list, one directory per server and one file per tool, with no two
+ * names alike (`paseo` keeps its own name).
+ */
+function layoutToolTree(servers: ToolTreeServer[]): ServerLayout[] {
+  const usedDirs = new Set<string>();
+  return [...servers]
+    .sort((a, b) => {
+      if (a.name === PASEO_TOOL_TREE_SERVER || b.name === PASEO_TOOL_TREE_SERVER) {
+        return a.name === PASEO_TOOL_TREE_SERVER ? -1 : 1;
+      }
+      return byCodeUnit(a.name, b.name);
+    })
+    .map((server) => {
+      const base = /^[A-Za-z0-9_-]+$/.test(server.name) ? server.name : sanitizeName(server.name);
+      const dir = allocate(base, (candidate) => !usedDirs.has(candidate.toLowerCase()));
+      usedDirs.add(dir.toLowerCase());
+      return { server, dir, tools: layoutTools(server.tools) };
+    });
+}
+
+function renderToolFile(server: string, layout: ToolLayout): string {
+  const { tool, functionName, typeName } = layout;
   const inputSchema = asSchema(tool.inputSchema) ?? { type: "object", properties: {} };
   const outputSchema = asSchema(tool.outputSchema);
   const inputType = `${typeName}Input`;
-  const outputType = outputSchema ? `${typeName}Output` : "ToolContent";
+  const outputType = outputSchema ? `${typeName}Output` : `${CLIENT}.ToolContent`;
   const parts = [
-    `// Generated by Paseo from the tool list of "${server}". Regenerated when it changes; do not edit.\n`,
-    outputSchema
-      ? 'import { callTool } from "../../client.ts";\n'
-      : 'import { callTool, type ToolContent } from "../../client.ts";\n',
+    `// Generated by Paseo from the tool list of ${JSON.stringify(server)}. Regenerated when it changes; do not edit.\n`,
+    `import * as ${CLIENT} from "../../client.ts";\n`,
     "\n",
     declareType(inputType, inputSchema),
   ];
   if (outputSchema) {
     parts.push("\n", declareType(outputType, outputSchema));
   }
-  const parameter = hasRequiredInput(inputSchema)
-    ? `input: ${inputType}`
-    : `input: ${inputType} = {}`;
+  const parameter = acceptsEmptyInput(inputSchema)
+    ? `input: ${inputType} = {}`
+    : `input: ${inputType}`;
   parts.push(
     "\n",
     docComment(tool.description || tool.name, ""),
     `export function ${functionName}(${parameter}): Promise<${outputType}> {\n`,
-    `  return callTool(${JSON.stringify(server)}, ${JSON.stringify(tool.name)}, input) as Promise<${outputType}>;\n`,
+    `  return ${CLIENT}.callTool(${JSON.stringify(server)}, ${JSON.stringify(tool.name)}, input) as Promise<${outputType}>;\n`,
     "}\n",
   );
   return parts.join("");
 }
 
-function serverDirName(name: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(name) ? name : sanitizeName(name);
-}
-
-function renderReadme(
-  entries: Array<{ server: string; files: Array<{ file: string; tool: string }> }>,
-): string {
+function renderReadme(layouts: ServerLayout[]): string {
   const lines = [
     "# Your tools",
     "",
@@ -367,10 +506,12 @@ function renderReadme(
     "Run it with `node --experimental-strip-types script.ts` (or `bun script.ts`).",
     "",
   ];
-  for (const entry of entries) {
-    lines.push(`## ${entry.server}`, "");
-    for (const file of entry.files) {
-      lines.push(`- \`servers/${serverDirName(entry.server)}/${file.file}\` — ${file.tool}`);
+  for (const layout of layouts) {
+    lines.push(`## ${layout.server.name}`, "");
+    for (const tool of layout.tools) {
+      lines.push(
+        `- \`servers/${layout.dir}/${tool.file}\` — \`${tool.functionName}\` calls ${JSON.stringify(tool.tool.name)}`,
+      );
     }
     lines.push("");
   }
@@ -382,36 +523,28 @@ export function renderToolTree(servers: ToolTreeServer[]): Map<string, string> {
   const files = new Map<string, string>();
   files.set("client.ts", CLIENT_SOURCE);
   files.set("package.json", '{ "type": "module" }\n');
-  const readme: Array<{ server: string; files: Array<{ file: string; tool: string }> }> = [];
-  for (const server of [...servers].sort((a, b) => a.name.localeCompare(b.name))) {
-    const dir = `servers/${serverDirName(server.name)}`;
-    const used = new Set<string>();
-    const listed: Array<{ file: string; tool: string }> = [];
-    for (const tool of [...server.tools].sort((a, b) => a.name.localeCompare(b.name))) {
-      const base = sanitizeName(tool.name);
-      let file = `${base}.ts`;
-      for (let suffix = 2; used.has(file); suffix += 1) file = `${base}_${suffix}.ts`;
-      used.add(file);
-      files.set(`${dir}/${file}`, renderToolFile(server.name, tool));
-      listed.push({ file, tool: tool.name });
+  const layouts = layoutToolTree(servers);
+  for (const layout of layouts) {
+    const dir = `servers/${layout.dir}`;
+    for (const tool of layout.tools) {
+      files.set(`${dir}/${tool.file}`, renderToolFile(layout.server.name, tool));
     }
     files.set(
       `${dir}/index.ts`,
-      listed
-        .map((entry) => entry.file)
-        .sort()
+      layout.tools
+        .map((tool) => tool.file)
+        .sort(byCodeUnit)
         .map((file) => `export * from "./${file}";\n`)
         .join(""),
     );
-    readme.push({ server: server.name, files: listed });
   }
-  files.set("README.md", renderReadme(readme));
+  files.set("README.md", renderReadme(layouts));
   return files;
 }
 
 function digestOf(files: Map<string, string>): string {
   const hash = createHash("sha256");
-  for (const [file, content] of [...files.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+  for (const [file, content] of [...files.entries()].sort(([a], [b]) => byCodeUnit(a, b))) {
     hash.update(file).update("\0").update(content).update("\0");
   }
   return hash.digest("hex");
