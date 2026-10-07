@@ -40,23 +40,38 @@ afterAll(async () => {
 });
 
 test("the web UI loads under /s/x/ behind a prefix-preserving proxy and connects its websocket there", async () => {
-  const origin = `http://127.0.0.1:${proxy.port}`;
+  // The app names a loopback host `localhost`, so the page uses that origin too.
+  const origin = `http://localhost:${proxy.port}`;
   const page = await browser.newPage();
   const requested: string[] = [];
   const failed: string[] = [];
+  const diagnostics: string[] = [];
   page.on("request", (request) => requested.push(request.url()));
+  page.on("requestfailed", (request) => diagnostics.push(`failed ${request.url()}`));
+  page.on("console", (message) => diagnostics.push(`console.${message.type()} ${message.text()}`));
+  page.on("pageerror", (error) => diagnostics.push(`pageerror ${error.message}`));
+  page.on("websocket", (ws) => diagnostics.push(`websocket ${ws.url()}`));
   page.on("response", (response) => {
     if (response.url().startsWith(origin) && response.status() >= 400) {
       failed.push(`${response.status()} ${response.url()}`);
     }
   });
   const socket = page.waitForEvent("websocket", {
-    predicate: (ws) => ws.url() === `ws://127.0.0.1:${proxy.port}/s/x/ws`,
+    predicate: (ws) => {
+      const url = new URL(ws.url());
+      return url.port === String(proxy.port) && url.pathname === "/s/x/ws";
+    },
     timeout: 60_000,
   });
 
   await page.goto(`${origin}/s/x/`);
-  await socket;
+  try {
+    await socket;
+  } catch (error) {
+    throw new Error(`No websocket under /s/x/: ${diagnostics.slice(-40).join("\n")}`, {
+      cause: error,
+    });
+  }
 
   // The app reached its connected shell, and its router stays under the prefix.
   await page.getByTestId("sidebar-settings").waitFor({ timeout: 60_000 });
