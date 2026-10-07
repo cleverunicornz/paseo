@@ -73,7 +73,9 @@ Shutdown first closes every agent. Plugins keep running until both of these fini
 - every `agent.timeline_item` delivery not yet acknowledged; items whose handler threw are offered once more first;
 - the provider's `drain`.
 
-Only then does the daemon stop plugins.
+Only then does the daemon stop plugins. Until then a plugin can still send what it holds through
+[`server.mcp.callTool()`](/docs/plugins/reference#gateway-calls) on behalf of the agents this
+shutdown closed, with their identity, for example when its backend came back during the drain.
 
 When something is left unfinished:
 
