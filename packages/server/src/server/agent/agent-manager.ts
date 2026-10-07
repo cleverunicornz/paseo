@@ -341,6 +341,8 @@ export interface AgentManagerOptions {
   mcpGatewayEnvPassthrough?: readonly string[];
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
+  /** The agent's tool tree; its harness gets the location as `PASEO_TOOL_TREE`. */
+  resolveToolTreeDir?: (agentId: string) => string | null;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
@@ -765,6 +767,7 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private mcpGatewayBaseUrl: string | null = null;
+  private readonly resolveToolTreeDir: (agentId: string) => string | null;
   private readonly agentTokens: AgentTokenRegistry;
   private readonly modelGatewaySettings: ModelGatewaySettings;
   private paseoToolsEnabled = true;
@@ -790,6 +793,7 @@ export class AgentManager {
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
+    this.resolveToolTreeDir = options.resolveToolTreeDir ?? (() => null);
     this.agentTokens = options.agentTokens ?? new AgentTokenRegistry();
     this.modelGatewaySettings = resolveModelGatewaySettings(options);
     this.configurePaseoTools(options);
@@ -5289,12 +5293,14 @@ export class AgentManager {
       const transformed = await this.pluginLifecycle.before("agent.session_open", request);
       env = transformed.env;
     }
+    const toolTreeDir = this.resolveToolTreeDir(agentId);
     const context: AgentLaunchContext = {
       agentId,
       env: {
         ...env,
         PASEO_AGENT_ID: agentId,
         PASEO_AGENT_CWD: cwd,
+        ...(toolTreeDir ? { PASEO_TOOL_TREE: toolTreeDir } : {}),
       },
     };
     const modelGateway = this.resolveModelGateway(agentId, client);

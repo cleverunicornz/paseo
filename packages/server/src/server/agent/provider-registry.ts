@@ -285,7 +285,12 @@ function getProviderClientFactory(provider: string): ProviderClientFactory {
 }
 
 function toRuntimeSettings(override?: ProviderOverride): ProviderRuntimeSettings | undefined {
-  if (!override?.command && !override?.env && !override?.disallowedTools) {
+  if (
+    !override?.command &&
+    !override?.env &&
+    !override?.disallowedTools &&
+    !override?.builtinTools
+  ) {
     return undefined;
   }
 
@@ -298,6 +303,7 @@ function toRuntimeSettings(override?: ProviderOverride): ProviderRuntimeSettings
       : undefined,
     env: override.env,
     disallowedTools: override.disallowedTools,
+    builtinTools: override.builtinTools,
   };
 }
 
@@ -318,11 +324,19 @@ function mergeRuntimeSettings(
             ...override?.env,
           }
         : undefined,
-    disallowedTools:
-      base?.disallowedTools || override?.disallowedTools
-        ? [...(base?.disallowedTools ?? []), ...(override?.disallowedTools ?? [])]
-        : undefined,
+    disallowedTools: mergeDisallowedTools(base, override),
+    builtinTools: override?.builtinTools ?? base?.builtinTools,
   };
+}
+
+function mergeDisallowedTools(
+  base: ProviderRuntimeSettings | undefined,
+  override: ProviderRuntimeSettings | undefined,
+): string[] | undefined {
+  if (!base?.disallowedTools && !override?.disallowedTools) {
+    return undefined;
+  }
+  return [...(base?.disallowedTools ?? []), ...(override?.disallowedTools ?? [])];
 }
 
 function applyOverrideToDefinition(

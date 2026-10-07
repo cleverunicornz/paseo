@@ -89,6 +89,7 @@ import {
   createPaseoWorktreeCommand,
 } from "../../worktree/commands.js";
 import { registerBrowserTools } from "../../browser-tools/tools.js";
+import { registerLocalTools, type LocalToolsHost } from "../../local-tools/local-tools.js";
 import type { BrowserToolsBroker } from "../../browser-tools/broker.js";
 import type {
   PaseoToolCatalog,
@@ -135,6 +136,8 @@ export interface PaseoToolHostDependencies {
   ) => Promise<string>;
   browserToolsEnabled?: boolean;
   browserToolsBroker?: BrowserToolsBroker | null;
+  /** The local tools' executor and run environment; absent, the local tools are off. */
+  localTools?: LocalToolsHost | null;
   paseoToolPolicy?: ProviderPaseoToolsPolicy;
   paseoHome?: string;
   worktreesRoot?: string;
@@ -1230,6 +1233,18 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       broker: options.browserToolsBroker,
       callerAgentId,
       resolveCallerAgent,
+    });
+  }
+
+  if (options.localTools) {
+    registerLocalTools({
+      registerTool,
+      host: options.localTools,
+      callerAgentId,
+      resolveCallerAgent: () => {
+        const agent = callerAgentId ? agentManager.getAgent(callerAgentId) : null;
+        return agent ? { id: agent.id, cwd: agent.cwd } : null;
+      },
     });
   }
 

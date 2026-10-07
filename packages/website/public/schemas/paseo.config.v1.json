@@ -130,6 +130,39 @@
                     }
                   },
                   "additionalProperties": false
+                },
+                "localTools": {
+                  "type": "object",
+                  "description": "The Codex executable the daemon runs, with no model and no login, as the executor of the agents' local tools (exec, files, patches, processes, search, git) on /mcp/agents. Absent, the local tools are off. PASEO_LOCAL_TOOLS_CODEX_PATH replaces codexPath.",
+                  "properties": {
+                    "codexPath": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Absolute path of the Codex executable."
+                    },
+                    "codexHome": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "The executor's own Codex home. Defaults to $PASEO_HOME/local-tools/codex-home."
+                    }
+                  },
+                  "required": ["codexPath"],
+                  "additionalProperties": false
+                },
+                "toolTree": {
+                  "type": "object",
+                  "description": "A per-agent directory of TypeScript files, one per tool the agent is rendered (Paseo's and every MCP backend's), that the agent's code can import and call. Its harness gets the location as PASEO_TOOL_TREE.",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "dir": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Parent directory of the per-agent trees. Defaults to $PASEO_HOME/tool-trees."
+                    }
+                  },
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": true
@@ -387,6 +420,11 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "builtinTools": {
+                    "type": "string",
+                    "enum": ["on", "off"],
+                    "description": "off: the harness runs without its built-in tools (Claude Code: --tools \"\" and --strict-mcp-config; Codex: shell_tool and unified_exec disabled), leaving the agent Paseo's MCP tools. Defaults to on."
                   },
                   "paseoTools": {
                     "type": "object",

@@ -7064,6 +7064,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 }
 
+const CODEX_BUILTIN_TOOLS_OFF_ARGS = ["--disable", "shell_tool", "--disable", "unified_exec"];
+
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
@@ -7202,6 +7204,11 @@ export class CodexAppServerAgentClient implements AgentClient {
     const args = [...launchPrefix.args, "app-server"];
     if (options?.goalsEnabled) {
       args.push("--enable", "goals");
+    }
+    if (this.runtimeSettings?.builtinTools === "off") {
+      // The agent runs commands through Paseo's tools. apply_patch stays: Codex
+      // registers it per model and offers no switch for it.
+      args.push(...CODEX_BUILTIN_TOOLS_OFF_ARGS);
     }
     this.logger.trace(
       {

@@ -181,6 +181,7 @@ describe.skipIf(!codexPath)("local tools through /mcp/agents (real Codex app ser
       const cwd = path.join(root, `workspace-${name}`);
       await mkdir(cwd);
       await writeFile(path.join(cwd, "marker.txt"), `workspace ${name}\n`);
+      await writeFile(path.join(cwd, "whose.txt"), `workspace ${name}\n`);
       const agent = await daemon.agentManager.createAgent(
         { provider: "claude", cwd, title: `Local tools ${name}` },
         undefined,
@@ -281,6 +282,7 @@ describe.skipIf(!codexPath)("local tools through /mcp/agents (real Codex app ser
 
   test("file tools refuse paths that leave the workspace", async () => {
     await symlink(outsideDir, path.join(a.cwd, "escape-link"));
+    await symlink(path.join(outsideDir, "nothing-yet"), path.join(a.cwd, "dangling-link"));
 
     expect(await a.error("read_file", { path: "../outside/secret.txt" })).toMatch(/outside/);
     expect(await a.error("read_file", { path: path.join(outsideDir, "secret.txt") })).toMatch(
@@ -296,6 +298,12 @@ describe.skipIf(!codexPath)("local tools through /mcp/agents (real Codex app ser
     expect(await a.error("list_dir", { path: "escape-link" })).toMatch(/outside/);
     expect(await a.error("read_file", { path: path.join(b.cwd, "marker.txt") })).toMatch(/outside/);
 
+    expect(await a.error("write_file", { path: "dangling-link", content: "x" })).toMatch(/outside/);
+    expect(await a.error("write_file", { path: "dangling-link/x.txt", content: "x" })).toMatch(
+      /outside/,
+    );
+
+    expect(existsSync(path.join(outsideDir, "nothing-yet"))).toBe(false);
     expect(existsSync(path.join(outsideDir, "new.txt"))).toBe(false);
     expect(existsSync(path.join(outsideDir, "deeper"))).toBe(false);
   });
@@ -452,7 +460,7 @@ describe.skipIf(!codexPath)("local tools through /mcp/agents (real Codex app ser
         return { session: res.headers.get("mcp-session-id"), message: JSON.parse(data || text) };
       };
       const init = await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "script", version: "1" } } });
-      const call = await post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "read_file", arguments: { path: "marker.txt" } } }, init.session);
+      const call = await post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "read_file", arguments: { path: "whose.txt" } } }, init.session);
       process.stdout.write(call.message.result.structuredContent.content);
     `;
     await a.ok("write_file", { path: "call-paseo.mjs", content: script });

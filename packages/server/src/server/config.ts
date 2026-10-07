@@ -36,6 +36,11 @@ import {
   parseMcpGatewayEnvPassthrough,
   parseMcpGatewayEnvPassthroughEnv,
 } from "./agent/model-gateway-env.js";
+import {
+  LOCAL_TOOLS_CODEX_PATH_ENV,
+  resolveLocalToolsConfig,
+  resolveToolTreeConfig,
+} from "./local-tools/config.js";
 
 export {
   loadPersistedConfig,
@@ -137,6 +142,17 @@ function resolveMcpGatewayEnvPassthrough(
     persisted.daemon?.mcp?.gateway?.envPassthrough ?? [],
     "daemon.mcp.gateway.envPassthrough",
   );
+}
+
+function resolveLocalToolsSettings(
+  env: NodeJS.ProcessEnv,
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): Pick<PaseoDaemonConfig, "localTools" | "toolTree"> {
+  const mcp = persisted.daemon?.mcp;
+  return {
+    localTools: resolveLocalToolsConfig(env, mcp?.localTools),
+    toolTree: resolveToolTreeConfig(mcp?.toolTree),
+  };
 }
 
 function resolveMcpGatewayModelBackends(
@@ -675,6 +691,7 @@ export function resolveConfigFromPersisted(
     mcpGatewayBackends: resolveMcpGatewayBackends(env, persisted),
     mcpGatewayModelBackends: resolveMcpGatewayModelBackends(env, persisted),
     mcpGatewayEnvPassthrough: resolveMcpGatewayEnvPassthrough(env, persisted),
+    ...resolveLocalToolsSettings(env, persisted),
     browserToolsEnabled,
     git: resolveGitProcessConfig(env, persisted),
     autoArchiveAfterMerge,
@@ -775,6 +792,9 @@ function resolveCoreDaemonOverridePaths(
   }
   if (env.PASEO_MCP_GATEWAY_ENV_PASSTHROUGH !== undefined) {
     paths.push("daemon.mcp.gateway.envPassthrough");
+  }
+  if (env[LOCAL_TOOLS_CODEX_PATH_ENV] !== undefined) {
+    paths.push("daemon.mcp.localTools.codexPath");
   }
   // Hostname sources append instead of replacing one another, so a launch value
   // does not prevent a persisted hostname edit from taking effect.

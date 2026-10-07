@@ -3438,6 +3438,12 @@ class ClaudeAgentSession implements AgentSession {
         ...this.runtimeSettings.disallowedTools,
       ];
     }
+    if (this.runtimeSettings?.builtinTools === "off") {
+      // No built-in tool, and no MCP server beyond the ones Paseo passes: the
+      // agent works through Paseo's tools only.
+      base.tools = [];
+      base.strictMcpConfig = true;
+    }
     return base;
   }
 

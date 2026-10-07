@@ -207,7 +207,8 @@ async function serveFixtureServer(
     void mcp.close();
   });
   await mcp.connect(transport);
-  await transport.handleRequest(req, res, JSON.parse(Buffer.concat(chunks).toString("utf8")));
+  const body = Buffer.concat(chunks).toString("utf8");
+  await transport.handleRequest(req, res, body ? JSON.parse(body) : undefined);
 }
 
 describe("generated client", () => {
