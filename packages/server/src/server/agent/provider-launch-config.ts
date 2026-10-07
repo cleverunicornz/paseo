@@ -8,6 +8,7 @@ import {
   type ProcessEnvRecord,
   type ExternalProcessEnv,
 } from "../paseo-env.js";
+import type { SpawnEnvOptions } from "../../utils/spawn.js";
 export {
   AgentProviderRuntimeSettingsMapSchema,
   ProviderCommandSchema,
@@ -64,8 +65,8 @@ function normalizeLaunchDefault(
   return defaultBinary;
 }
 
-async function resolveLaunchPath(command: string): Promise<string | null> {
-  const found = await findExecutable(command);
+async function resolveLaunchPath(command: string, env?: SpawnEnvOptions): Promise<string | null> {
+  const found = await findExecutable(command, undefined, env);
   if (found) {
     return found;
   }
@@ -77,10 +78,11 @@ async function resolveLaunchPath(command: string): Promise<string | null> {
 
 async function resolveDefaultLaunchPath(
   defaultBinary: ProviderLaunchDefault,
+  env?: SpawnEnvOptions,
 ): Promise<string | null> {
   return defaultBinary.resolvePath
     ? await defaultBinary.resolvePath()
-    : await resolveLaunchPath(defaultBinary.command);
+    : await resolveLaunchPath(defaultBinary.command, env);
 }
 
 export interface ResolveProviderLaunchOptions {
@@ -113,14 +115,19 @@ export async function resolveProviderLaunch({
   };
 }
 
+/**
+ * Resolves and probes the launch command. `env` is the probe's spawn
+ * environment; a `defaultBinary.resolvePath` that probes applies its own.
+ */
 export async function checkProviderLaunchAvailable(
   launch: ResolvedProviderLaunch,
   defaultBinary?: ProviderLaunchDefault,
+  env?: SpawnEnvOptions,
 ): Promise<ProviderLaunchAvailability> {
   const resolvedPath =
     defaultBinary && launch.source !== "override"
-      ? await resolveDefaultLaunchPath(defaultBinary)
-      : await resolveLaunchPath(launch.command);
+      ? await resolveDefaultLaunchPath(defaultBinary, env)
+      : await resolveLaunchPath(launch.command, env);
   return {
     available: resolvedPath !== null,
     resolvedPath,

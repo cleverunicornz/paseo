@@ -11,16 +11,16 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-interface ExternalEnvOptions {
+export interface SpawnEnvOptions {
   baseEnv?: ProcessEnvRecord;
   envMode?: "external" | "internal";
   env?: ProcessEnvRecord;
   envOverlay?: ProcessEnvRecord;
 }
 
-export type SpawnProcessOptions = Omit<SpawnOptions, "env"> & ExternalEnvOptions;
+export type SpawnProcessOptions = Omit<SpawnOptions, "env"> & SpawnEnvOptions;
 
-interface ExecCommandOptions extends ExternalEnvOptions {
+export interface ExecCommandOptions extends SpawnEnvOptions {
   cwd?: string;
   encoding?: BufferEncoding;
   killSignal?: NodeJS.Signals;

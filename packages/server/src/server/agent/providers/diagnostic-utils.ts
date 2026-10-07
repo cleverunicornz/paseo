@@ -8,7 +8,7 @@ import {
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../provider-launch-config.js";
-import { execCommand } from "../../../utils/spawn.js";
+import { execCommand, type SpawnEnvOptions } from "../../../utils/spawn.js";
 
 export interface DiagnosticEntry {
   label: string;
@@ -138,10 +138,11 @@ export function toDiagnosticErrorMessage(error: unknown): string {
 export async function resolveBinaryVersion(
   binaryPath: string,
   signal?: AbortSignal,
+  env: SpawnEnvOptions = createProviderEnvSpec(),
 ): Promise<string> {
   try {
     const { stdout } = await execCommand(binaryPath, ["--version"], {
-      ...createProviderEnvSpec(),
+      ...env,
       timeout: 5_000,
       signal,
     });
@@ -160,6 +161,8 @@ export interface BinaryDiagnosticVersionCommand {
 export interface BinaryDiagnosticRowsOptions {
   binaryLabel?: string;
   versionCommand?: BinaryDiagnosticVersionCommand;
+  /** The version command's spawn environment, replacing the one built from `versionCommand.env`. */
+  versionEnv?: SpawnEnvOptions;
 }
 
 export interface CommandResolutionDiagnosticRowsOptions {
@@ -388,10 +391,13 @@ export async function buildCommandResolutionDiagnosticRows(
   ];
 }
 
-async function resolveCommandVersion(invocation: BinaryDiagnosticVersionCommand): Promise<string> {
+async function resolveCommandVersion(
+  invocation: BinaryDiagnosticVersionCommand,
+  env: SpawnEnvOptions = createProviderEnvSpec({ runtimeSettings: { env: invocation.env } }),
+): Promise<string> {
   try {
     const { stdout, stderr } = await execCommand(invocation.command, invocation.args, {
-      ...createProviderEnvSpec({ runtimeSettings: { env: invocation.env } }),
+      ...env,
       timeout: 5_000,
     });
     return stdout.trim() || stderr.trim() || "unknown";
@@ -409,12 +415,15 @@ export async function buildBinaryDiagnosticRows(
   const binaryLabel = options.binaryLabel ?? defaultBinaryLabel;
   let version = "unknown";
   if (options.versionCommand && availability.available) {
-    version = await resolveCommandVersion(options.versionCommand);
+    version = await resolveCommandVersion(options.versionCommand, options.versionEnv);
   } else if (availability.available) {
-    version = await resolveCommandVersion({
-      command: availability.resolvedPath ?? launch.command,
-      args: [...launch.args, "--version"],
-    });
+    version = await resolveCommandVersion(
+      {
+        command: availability.resolvedPath ?? launch.command,
+        args: [...launch.args, "--version"],
+      },
+      options.versionEnv,
+    );
   }
   return [
     {

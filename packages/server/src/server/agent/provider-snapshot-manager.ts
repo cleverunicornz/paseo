@@ -122,6 +122,10 @@ export interface ProviderSnapshotManagerOptions {
   refreshTimeoutMs?: number;
   diagnosticTimeoutMs?: number;
   openCodeBridge?: OpenCodeBridge;
+  /** The MCP gateway backend each provider's model traffic goes to, by provider id. */
+  mcpGatewayModelBackends?: Readonly<Record<string, string>>;
+  /** Names and `NAME_*` prefixes a gateway provider's harness may inherit beyond the base variables. */
+  mcpGatewayEnvPassthrough?: readonly string[];
 }
 
 interface ProviderSnapshotRefreshOptions {
@@ -247,6 +251,8 @@ export class ProviderSnapshotManager {
   private readonly workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   private readonly managedProcesses?: ManagedProcessRegistry;
   private readonly openCodeBridge?: OpenCodeBridge;
+  private readonly mcpGatewayModelBackends?: Readonly<Record<string, string>>;
+  private readonly mcpGatewayEnvPassthrough?: readonly string[];
   private readonly isDev: boolean;
   private readonly extraClients: Partial<Record<AgentProvider, AgentClient>>;
   private runtimeSettings: AgentProviderRuntimeSettingsMap | undefined;
@@ -265,6 +271,8 @@ export class ProviderSnapshotManager {
     this.workspaceGitService = options.workspaceGitService;
     this.managedProcesses = options.managedProcesses;
     this.openCodeBridge = options.openCodeBridge;
+    this.mcpGatewayModelBackends = options.mcpGatewayModelBackends;
+    this.mcpGatewayEnvPassthrough = options.mcpGatewayEnvPassthrough;
     this.isDev = options.isDev === true;
     this.extraClients = options.extraClients ?? {};
     this.runtimeSettings = options.runtimeSettings;
@@ -692,6 +700,8 @@ export class ProviderSnapshotManager {
       workspaceGitService: this.workspaceGitService,
       managedProcesses: this.managedProcesses,
       openCodeBridge: this.openCodeBridge,
+      mcpGatewayModelBackends: this.mcpGatewayModelBackends,
+      mcpGatewayEnvPassthrough: this.mcpGatewayEnvPassthrough,
       isDev: this.isDev,
     });
 

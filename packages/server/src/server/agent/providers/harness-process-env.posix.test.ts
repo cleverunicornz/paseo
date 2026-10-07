@@ -300,6 +300,10 @@ async function runPath(
   return { root, records: readProcessRecords(fake.recordPath) };
 }
 
+function isProbe(record: ProcessRecord): boolean {
+  return record.argv[0] === "--version" || record.argv[0] === "auth";
+}
+
 function expectPathRan(path: HarnessPath, records: ProcessRecord[]): void {
   const started = records.map((record) => record.argv.join(" "));
   for (const start of path.starts) {
@@ -315,15 +319,16 @@ describe("every harness process of a gateway provider starts from the allowliste
     const { root, records } = await runPath(path, ALLOWLIST);
 
     expectPathRan(path, records);
-    const expected = expectedAllowlistedEnv({
-      daemonEnv: process.env,
-      launchValues: path.launchValues?.(root),
-    });
     records.forEach((record, index) => {
       expect(
         withoutClaudeSdkChildVariables(record.env),
         `${path.name}: process ${index} (${record.argv.join(" ")})`,
-      ).toEqual(expected);
+      ).toEqual(
+        expectedAllowlistedEnv({
+          daemonEnv: process.env,
+          launchValues: isProbe(record) ? undefined : path.launchValues?.(root),
+        }),
+      );
     });
   });
 });

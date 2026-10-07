@@ -62,7 +62,6 @@ import {
 import { readClaudeWorkflowResultFile } from "./subagents/workflow-output.js";
 import { buildClaudeFeatures, claudeModelSupportsFastMode } from "./feature-definitions.js";
 import {
-  buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
   formatProviderDiagnostic,
   formatProviderDiagnosticError,
@@ -134,17 +133,27 @@ import {
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
 import {
-  checkProviderLaunchAvailable,
   createProviderEnv,
   createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
-import { buildModelGatewayEnv } from "../../model-gateway-env.js";
+import {
+  buildAllowlistedHarnessEnv,
+  INHERITED_HARNESS_ENVIRONMENT,
+  resolveHarnessSpawnEnv,
+  type HarnessEnvironment,
+  type HarnessSpawnEnv,
+} from "../../model-gateway-env.js";
+import {
+  buildHarnessBinaryDiagnosticRows,
+  checkHarnessLaunchAvailable,
+  execHarnessCommand,
+} from "../../harness-process.js";
+import type { SpawnEnvOptions } from "../../../../utils/spawn.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
-import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
 const fsPromises = promises;
@@ -411,6 +420,8 @@ interface ClaudeAgentClientOptions {
   resolveBinary?: () => Promise<string>;
   resolveVersion?: (signal?: AbortSignal) => Promise<string>;
   rewindSdk?: ClaudeRewindSdk;
+  /** How every process started from the Claude Code binary gets its environment. */
+  harnessEnvironment?: HarnessEnvironment;
 }
 
 interface ClaudeAgentSessionOptions {
@@ -420,6 +431,7 @@ interface ClaudeAgentSessionOptions {
   agentId?: string;
   launchEnv?: Record<string, string>;
   modelGateway?: AgentModelGateway;
+  harnessEnvironment: HarnessEnvironment;
   persistSession?: boolean;
   logger: Logger;
   queryFactory?: ClaudeQueryFactory;
@@ -1509,16 +1521,20 @@ export class ClaudeAgentClient implements AgentClient {
   private readonly resolveBinary: () => Promise<string>;
   private readonly resolveVersion: (signal?: AbortSignal) => Promise<string>;
   private readonly rewindSdk: ClaudeRewindSdk;
+  private readonly harnessEnvironment: HarnessEnvironment;
 
   constructor(options: ClaudeAgentClientOptions) {
     this.defaults = options.defaults;
     this.logger = options.logger.child({ module: "agent", provider: "claude" });
     this.runtimeSettings = options.runtimeSettings;
     this.queryFactory = options.queryFactory;
-    this.resolveBinary = options.resolveBinary ?? (() => resolveClaudeBinary(this.runtimeSettings));
+    this.harnessEnvironment = options.harnessEnvironment ?? INHERITED_HARNESS_ENVIRONMENT;
+    this.resolveBinary =
+      options.resolveBinary ??
+      (() => resolveClaudeBinary(this.runtimeSettings, this.harnessEnvironment));
     this.resolveVersion =
       options.resolveVersion ??
-      ((signal) => resolveClaudeCodeVersion(this.runtimeSettings, signal));
+      ((signal) => resolveClaudeCodeVersion(this.runtimeSettings, signal, this.harnessEnvironment));
     this.rewindSdk = options.rewindSdk ?? realClaudeRewindSdk;
   }
 
@@ -1538,6 +1554,7 @@ export class ClaudeAgentClient implements AgentClient {
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       modelGateway: launchContext?.modelGateway,
+      harnessEnvironment: this.harnessEnvironment,
       persistSession: options?.persistSession,
       logger: this.logger,
       queryFactory: this.queryFactory,
@@ -1569,6 +1586,7 @@ export class ClaudeAgentClient implements AgentClient {
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       modelGateway: launchContext?.modelGateway,
+      harnessEnvironment: this.harnessEnvironment,
       logger: this.logger,
       queryFactory: this.queryFactory,
       resolveBinary: this.resolveBinary,
@@ -1662,7 +1680,10 @@ export class ClaudeAgentClient implements AgentClient {
       commandConfig: this.runtimeSettings?.command,
       defaultBinary: "claude",
     });
-    const availability = await checkProviderLaunchAvailable(launch);
+    const availability = await checkHarnessLaunchAvailable(
+      launch,
+      claudeProbeEnv(this.harnessEnvironment, this.runtimeSettings, {}),
+    );
     return availability.available;
   }
 
@@ -1672,9 +1693,17 @@ export class ClaudeAgentClient implements AgentClient {
         commandConfig: this.runtimeSettings?.command,
         defaultBinary: "claude",
       });
-      const availability = await checkProviderLaunchAvailable(launch);
+      const availability = await checkHarnessLaunchAvailable(
+        launch,
+        claudeProbeEnv(this.harnessEnvironment, this.runtimeSettings, {}),
+      );
       const auth = availability.available
-        ? await resolveClaudeAuth(launch, availability, this.runtimeSettings)
+        ? await resolveClaudeAuth(
+            launch,
+            availability,
+            this.runtimeSettings,
+            this.harnessEnvironment,
+          )
         : null;
 
       return {
@@ -1682,7 +1711,11 @@ export class ClaudeAgentClient implements AgentClient {
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["claude"],
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          ...(await buildHarnessBinaryDiagnosticRows(
+            launch,
+            availability,
+            claudeProbeEnv(this.harnessEnvironment, this.runtimeSettings, createProviderEnvSpec()),
+          )),
           ...(auth ? [{ label: "Auth", value: auth }] : []),
         ]),
       };
@@ -1708,12 +1741,31 @@ export class ClaudeAgentClient implements AgentClient {
   }
 }
 
-async function resolveClaudeBinary(runtimeSettings?: ProviderRuntimeSettings): Promise<string> {
+/**
+ * A Claude Code probe's spawn environment: `inherited` is what the probe has
+ * always used; under the allowlist it is built from the daemon's environment
+ * and the runtime settings, with no launch values and no gateway values.
+ */
+function claudeProbeEnv(
+  environment: HarnessEnvironment,
+  runtimeSettings: ProviderRuntimeSettings | undefined,
+  inherited: SpawnEnvOptions,
+): HarnessSpawnEnv {
+  return resolveHarnessSpawnEnv(environment, { inherited, settingsEnv: runtimeSettings?.env });
+}
+
+async function resolveClaudeBinary(
+  runtimeSettings: ProviderRuntimeSettings | undefined,
+  environment: HarnessEnvironment,
+): Promise<string> {
   const launch = await resolveProviderLaunch({
     commandConfig: runtimeSettings?.command,
     defaultBinary: "claude",
   });
-  const availability = await checkProviderLaunchAvailable(launch);
+  const availability = await checkHarnessLaunchAvailable(
+    launch,
+    claudeProbeEnv(environment, runtimeSettings, {}),
+  );
   if (availability.available) {
     return availability.resolvedPath ?? launch.command;
   }
@@ -1725,21 +1777,26 @@ async function resolveClaudeBinary(runtimeSettings?: ProviderRuntimeSettings): P
 export async function resolveClaudeCodeVersion(
   runtimeSettings?: ProviderRuntimeSettings,
   signal?: AbortSignal,
+  environment: HarnessEnvironment = INHERITED_HARNESS_ENVIRONMENT,
 ): Promise<string> {
   const launch = await resolveProviderLaunch({
     commandConfig: runtimeSettings?.command,
     defaultBinary: "claude",
   });
-  const availability = await checkProviderLaunchAvailable(launch);
+  const availability = await checkHarnessLaunchAvailable(
+    launch,
+    claudeProbeEnv(environment, runtimeSettings, {}),
+  );
   if (!availability.available) {
     throw new Error("Claude binary not found while resolving Claude Code version");
   }
   const executable = availability.resolvedPath ?? launch.command;
-  const { stdout, stderr } = await execCommand(executable, [...launch.args, "--version"], {
-    ...createProviderEnvSpec({ runtimeSettings }),
-    timeout: 5_000,
-    signal,
-  });
+  const { stdout, stderr } = await execHarnessCommand(
+    executable,
+    [...launch.args, "--version"],
+    claudeProbeEnv(environment, runtimeSettings, createProviderEnvSpec({ runtimeSettings })),
+    { timeout: 5_000, signal },
+  );
   const version = parseClaudeCodeVersion(`${stdout}\n${stderr}`);
   if (!version) {
     throw new Error("Unable to parse Claude Code version from --version output");
@@ -1750,17 +1807,20 @@ export async function resolveClaudeCodeVersion(
 async function resolveClaudeAuth(
   launch: ResolvedProviderLaunch,
   availability: { resolvedPath: string | null },
-  runtimeSettings?: ProviderRuntimeSettings,
+  runtimeSettings: ProviderRuntimeSettings | undefined,
+  environment: HarnessEnvironment,
 ): Promise<string | null> {
   const run = async (
     executable: string,
     args: string[],
   ): Promise<{ stdout: string; stderr: string }> => {
     try {
-      return await execCommand(executable, args, {
-        ...createProviderEnvSpec({ runtimeSettings }),
-        timeout: 5_000,
-      });
+      return await execHarnessCommand(
+        executable,
+        args,
+        claudeProbeEnv(environment, runtimeSettings, createProviderEnvSpec({ runtimeSettings })),
+        { timeout: 5_000 },
+      );
     } catch (error) {
       const err = toObjectRecord(error);
       const stdout = typeof err?.stdout === "string" ? err.stdout : "";
@@ -2050,6 +2110,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly config: ClaudeAgentConfig;
   private readonly launchEnv?: Record<string, string>;
   private readonly modelGateway?: AgentModelGateway;
+  private readonly harnessEnvironment: HarnessEnvironment;
   private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
   private readonly runtimeSettings?: ProviderRuntimeSettings;
@@ -2131,6 +2192,10 @@ class ClaudeAgentSession implements AgentSession {
     assertClaudeThinkingOptionSupported(config.model, config.thinkingOptionId);
     this.launchEnv = options.launchEnv;
     this.modelGateway = options.modelGateway;
+    // A gateway route always launches under the allowlist.
+    this.harnessEnvironment = options.modelGateway
+      ? { kind: "allowlist", envPassthrough: options.modelGateway.envPassthrough }
+      : options.harnessEnvironment;
     this.agentId = options.agentId;
     this.defaults = options.defaults;
     this.runtimeSettings = options.runtimeSettings;
@@ -3168,7 +3233,7 @@ class ClaudeAgentSession implements AgentSession {
       {
         runtimeSettings: this.runtimeSettings,
         launchEnv: this.launchEnv,
-        builtEnv: this.modelGateway ? options.env : undefined,
+        builtEnv: this.harnessEnvironment.kind === "allowlist" ? options.env : undefined,
         queryFactory: this.queryFactory,
         onChildProcess: (child) => {
           this.childProcess = child;
@@ -3262,19 +3327,24 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private buildSdkEnv(): NodeJS.ProcessEnv {
-    if (this.modelGateway) {
+    if (this.harnessEnvironment.kind === "allowlist") {
       // Claude Code sends model calls to the gateway as `Authorization: Bearer
       // <agent token>` (`ANTHROPIC_AUTH_TOKEN`; `ANTHROPIC_API_KEY` would travel
-      // as `x-api-key`, which the gateway forwards).
-      return buildModelGatewayEnv({
+      // as `x-api-key`, which the gateway forwards). A session without a
+      // gateway route (a draft listing commands) gets no gateway values.
+      return buildAllowlistedHarnessEnv({
         inherited: [process.env, this.runtimeSettings?.env],
         launchEnv: this.launchEnv,
-        baseUrl: this.modelGateway.baseUrl,
-        envPassthrough: this.modelGateway.envPassthrough,
-        gatewayValues: {
-          ANTHROPIC_BASE_URL: this.modelGateway.baseUrl,
-          ANTHROPIC_AUTH_TOKEN: this.modelGateway.token,
-        },
+        envPassthrough: this.harnessEnvironment.envPassthrough,
+        gateway: this.modelGateway
+          ? {
+              baseUrl: this.modelGateway.baseUrl,
+              values: {
+                ANTHROPIC_BASE_URL: this.modelGateway.baseUrl,
+                ANTHROPIC_AUTH_TOKEN: this.modelGateway.token,
+              },
+            }
+          : undefined,
       });
     }
     return createProviderEnv({

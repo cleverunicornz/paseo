@@ -40,7 +40,12 @@ import {
   type ResolveAgentDefaultModeInput,
 } from "../agent-sdk-types.js";
 import type { ProcessEnvRecord } from "../../paseo-env.js";
-import { buildModelGatewayEnv } from "../model-gateway-env.js";
+import {
+  INHERITED_HARNESS_ENVIRONMENT,
+  resolveHarnessSpawnEnv,
+  type HarnessEnvironment,
+  type HarnessSpawnEnv,
+} from "../model-gateway-env.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
@@ -62,7 +67,6 @@ import {
   splitCodexMcpToolResultImages,
 } from "./codex/tool-call-mapper.js";
 import {
-  checkProviderLaunchAvailable,
   createProviderEnv,
   createProviderEnvSpec,
   resolveProviderLaunch,
@@ -70,11 +74,15 @@ import {
   type ResolvedProviderLaunch,
 } from "../provider-launch-config.js";
 import {
-  findExecutable,
-  probeExecutable,
-} from "../../../executable-resolution/executable-resolution.js";
+  buildHarnessBinaryDiagnosticRows,
+  checkHarnessLaunchAvailable,
+  findHarnessExecutable,
+  probeHarnessExecutable,
+  resolveHarnessBinaryVersion,
+  spawnHarnessProcess,
+} from "../harness-process.js";
 import { createPathEquivalenceMatcher } from "../../../utils/path.js";
-import { spawnProcess } from "../../../utils/spawn.js";
+import type { SpawnEnvOptions } from "../../../utils/spawn.js";
 import { extractCodexTerminalSessionId, nonEmptyString } from "./tool-call-mapper-utils.js";
 import { buildCodexFeatures, codexModelSupportsFastMode } from "./codex-feature-definitions.js";
 import {
@@ -98,9 +106,7 @@ import { normalizeProviderReplayTimestamp } from "../provider-history-timestamps
 import {
   formatProviderDiagnostic,
   formatProviderDiagnosticError,
-  buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
-  resolveBinaryVersion,
 } from "./diagnostic-utils.js";
 import { appendOrReplaceGrowingAssistantMessage, runProviderTurn } from "./provider-runner.js";
 import {
@@ -265,6 +271,8 @@ interface CodexAppServerAgentDeps {
   customCodexConfig?: CodexCustomProviderConfig | null;
   // The CODEX_HOME the session's app-server runs with; prompts and skills are read from it.
   codexHome?: string;
+  /** How every process started from the Codex binary gets its environment. */
+  harnessEnvironment?: HarnessEnvironment;
   _createCodexClient?: (
     child: ChildProcessWithoutNullStreams,
     logger: Logger,
@@ -481,7 +489,14 @@ export function codexMicrosoftStoreBinaryCandidates(
     .sort();
 }
 
-export async function findCodexMicrosoftStoreBinary(): Promise<string | null> {
+/** The spawn environment Codex probes have always used when no gateway applies. */
+const INHERITED_PROBE_ENV = resolveHarnessSpawnEnv(INHERITED_HARNESS_ENVIRONMENT, {
+  inherited: {},
+});
+
+export async function findCodexMicrosoftStoreBinary(
+  env: HarnessSpawnEnv = INHERITED_PROBE_ENV,
+): Promise<string | null> {
   if (process.platform !== "win32") {
     return null;
   }
@@ -499,7 +514,7 @@ export async function findCodexMicrosoftStoreBinary(): Promise<string | null> {
   }
 
   for (const candidate of codexMicrosoftStoreBinaryCandidates(packageRoot, entries)) {
-    if (await probeExecutable(candidate)) {
+    if (await probeHarnessExecutable(candidate, env)) {
       return candidate;
     }
   }
@@ -507,18 +522,23 @@ export async function findCodexMicrosoftStoreBinary(): Promise<string | null> {
   return null;
 }
 
-export async function findDefaultCodexBinary(): Promise<string | null> {
-  const pathBinary = await findExecutable("codex");
+export async function findDefaultCodexBinary(
+  env: HarnessSpawnEnv = INHERITED_PROBE_ENV,
+): Promise<string | null> {
+  const pathBinary = await findHarnessExecutable("codex", env);
   if (pathBinary) return pathBinary;
-  return await findCodexMicrosoftStoreBinary();
+  return await findCodexMicrosoftStoreBinary(env);
 }
 
-async function resolveCodexLaunchPrefix(runtimeSettings?: ProviderRuntimeSettings): Promise<{
+async function resolveCodexLaunchPrefix(
+  runtimeSettings: ProviderRuntimeSettings | undefined,
+  probeEnv: HarnessSpawnEnv,
+): Promise<{
   command: string;
   args: string[];
 }> {
   const launch = await resolveCodexLaunch(runtimeSettings);
-  const availability = await checkCodexLaunchAvailable(launch);
+  const availability = await checkCodexLaunchAvailable(launch, probeEnv);
   if (!availability.available) {
     throw new Error(
       "Codex binary not found. Install the Codex CLI (https://github.com/openai/codex) and ensure it is available in your shell PATH.",
@@ -543,10 +563,10 @@ async function resolveCodexLaunch(
   });
 }
 
-async function checkCodexLaunchAvailable(launch: ResolvedProviderLaunch) {
-  return checkProviderLaunchAvailable(launch, {
+async function checkCodexLaunchAvailable(launch: ResolvedProviderLaunch, env: HarnessSpawnEnv) {
+  return checkHarnessLaunchAvailable(launch, env, {
     command: "codex",
-    resolvePath: findDefaultCodexBinary,
+    resolvePath: () => findDefaultCodexBinary(env),
   });
 }
 
@@ -3348,14 +3368,6 @@ function buildCodexModelGatewayConfig(
     },
   };
 }
-
-/**
- * The app-server's environment: inherited (the daemon's, with runtime settings
- * and launch values overlaid), or, for a gateway harness, built from scratch.
- */
-type CodexLaunchEnvironment =
-  | { kind: "inherited"; launchEnv: Record<string, string> | undefined }
-  | { kind: "built"; env: Record<string, string> };
 
 interface CodexSubAgentCallState {
   callId: string;
@@ -7061,42 +7073,57 @@ export class CodexAppServerAgentClient implements AgentClient {
   readonly supportsModelGateway = true;
   private goalsEnabledPromise: Promise<boolean> | null = null;
   private autoReviewEnabledPromise: Promise<boolean> | null = null;
+  private readonly harnessEnvironment: HarnessEnvironment;
 
   constructor(
     private readonly logger: Logger,
     private readonly runtimeSettings?: ProviderRuntimeSettings,
     private readonly deps: CodexAppServerAgentDeps = {},
-  ) {}
+  ) {
+    this.harnessEnvironment = deps.harnessEnvironment ?? INHERITED_HARNESS_ENVIRONMENT;
+  }
 
-  private launchEnvironment(launchContext: AgentLaunchContext | undefined): CodexLaunchEnvironment {
+  /**
+   * An app-server's spawn environment. Without a launch context it is a
+   * catalogue, listing or archive app-server, or a draft session; a gateway
+   * route always launches under the allowlist.
+   */
+  private appServerEnv(launchContext?: AgentLaunchContext): HarnessSpawnEnv {
     const gateway = launchContext?.modelGateway;
-    if (!gateway) {
-      return { kind: "inherited", launchEnv: launchContext?.env };
-    }
-    return {
-      kind: "built",
-      env: buildModelGatewayEnv({
-        inherited: [process.env, this.runtimeSettings?.env],
-        launchEnv: launchContext.env,
-        baseUrl: gateway.baseUrl,
-        envPassthrough: gateway.envPassthrough,
-        gatewayValues: { [CODEX_MODEL_GATEWAY_TOKEN_ENV]: gateway.token },
+    const environment: HarnessEnvironment = gateway
+      ? { kind: "allowlist", envPassthrough: gateway.envPassthrough }
+      : this.harnessEnvironment;
+    return resolveHarnessSpawnEnv(environment, {
+      inherited: createProviderEnvSpec({
+        runtimeSettings: this.runtimeSettings,
+        overlays: [launchContext?.env],
       }),
-    };
+      settingsEnv: this.runtimeSettings?.env,
+      launchEnv: launchContext?.env,
+      gateway: gateway
+        ? { baseUrl: gateway.baseUrl, values: { [CODEX_MODEL_GATEWAY_TOKEN_ENV]: gateway.token } }
+        : undefined,
+    });
+  }
+
+  /** A probe's spawn environment; `inherited` is what the probe has always used. */
+  private probeEnv(inherited: SpawnEnvOptions = {}): HarnessSpawnEnv {
+    return resolveHarnessSpawnEnv(this.harnessEnvironment, {
+      inherited,
+      settingsEnv: this.runtimeSettings?.env,
+    });
   }
 
   private sessionDeps(
     launchContext: AgentLaunchContext | undefined,
-    environment: CodexLaunchEnvironment,
+    appServerEnv: HarnessSpawnEnv,
   ): CodexAppServerAgentDeps {
     const gateway = launchContext?.modelGateway;
     return {
       ...this.deps,
       // Paseo reads the same Codex home the app-server uses.
       codexHome: resolveCodexHomeDir(
-        environment.kind === "built"
-          ? environment.env
-          : buildCodexAppServerEnv(this.runtimeSettings, environment.launchEnv),
+        appServerEnv.env ?? buildCodexAppServerEnv(this.runtimeSettings, launchContext?.env),
       ),
       customCodexConfig: gateway
         ? buildCodexModelGatewayConfig(gateway, this.deps.customProvider)
@@ -7112,8 +7139,14 @@ export class CodexAppServerAgentClient implements AgentClient {
     if (!this.goalsEnabledPromise) {
       this.goalsEnabledPromise = (async () => {
         try {
-          const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
-          const versionOutput = await resolveBinaryVersion(launchPrefix.command);
+          const launchPrefix = await resolveCodexLaunchPrefix(
+            this.runtimeSettings,
+            this.probeEnv(),
+          );
+          const versionOutput = await resolveHarnessBinaryVersion(
+            launchPrefix.command,
+            this.probeEnv(createProviderEnvSpec()),
+          );
           const enabled = codexVersionAtLeast(versionOutput, CODEX_GOALS_MIN_VERSION);
           this.logger.trace(
             {
@@ -7143,9 +7176,13 @@ export class CodexAppServerAgentClient implements AgentClient {
 
   private async probeAutoReviewEnabled(signal?: AbortSignal): Promise<boolean> {
     try {
-      const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+      const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings, this.probeEnv());
       signal?.throwIfAborted();
-      const versionOutput = await resolveBinaryVersion(launchPrefix.command, signal);
+      const versionOutput = await resolveHarnessBinaryVersion(
+        launchPrefix.command,
+        this.probeEnv(createProviderEnvSpec()),
+        signal,
+      );
       signal?.throwIfAborted();
       const enabled = codexVersionAtLeast(versionOutput, CODEX_AUTO_REVIEW_MIN_VERSION);
       this.logger.trace(
@@ -7161,10 +7198,10 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   private async spawnAppServer(
-    environment: CodexLaunchEnvironment = { kind: "inherited", launchEnv: undefined },
+    env: HarnessSpawnEnv = this.appServerEnv(),
     options?: { goalsEnabled?: boolean; agentId?: string },
   ): Promise<ChildProcessWithoutNullStreams> {
-    const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+    const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings, this.probeEnv());
     const args = [...launchPrefix.args, "app-server"];
     if (options?.goalsEnabled) {
       args.push("--enable", "goals");
@@ -7178,15 +7215,9 @@ export class CodexAppServerAgentClient implements AgentClient {
       },
       "provider.codex.spawn",
     );
-    const child = spawnProcess(launchPrefix.command, args, {
+    const child = spawnHarnessProcess(launchPrefix.command, args, env, {
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
-      ...(environment.kind === "built"
-        ? { env: environment.env, envMode: "internal" as const }
-        : createProviderEnvSpec({
-            runtimeSettings: this.runtimeSettings,
-            overlays: [environment.launchEnv],
-          })),
     });
     assertChildWithPipes(child);
     return child;
@@ -7207,17 +7238,17 @@ export class CodexAppServerAgentClient implements AgentClient {
     const sessionConfig: AgentSessionConfig = { ...config, provider: CODEX_PROVIDER };
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
-    const environment = this.launchEnvironment(launchContext);
+    const appServerEnv = this.appServerEnv(launchContext);
     const session = new CodexAppServerAgentSession(
       sessionConfig,
       null,
       this.logger,
       () =>
-        this.spawnAppServer(environment, {
+        this.spawnAppServer(appServerEnv, {
           goalsEnabled,
           agentId: launchContext?.agentId,
         }),
-      this.sessionDeps(launchContext, environment),
+      this.sessionDeps(launchContext, appServerEnv),
       options?.persistSession === false,
       goalsEnabled,
       autoReviewEnabled,
@@ -7242,17 +7273,17 @@ export class CodexAppServerAgentClient implements AgentClient {
     };
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
-    const environment = this.launchEnvironment(launchContext);
+    const appServerEnv = this.appServerEnv(launchContext);
     const session = new CodexAppServerAgentSession(
       merged,
       handle,
       this.logger,
       () =>
-        this.spawnAppServer(environment, {
+        this.spawnAppServer(appServerEnv, {
           goalsEnabled,
           agentId: launchContext?.agentId,
         }),
-      this.sessionDeps(launchContext, environment),
+      this.sessionDeps(launchContext, appServerEnv),
       false,
       goalsEnabled,
       autoReviewEnabled,
@@ -7449,19 +7480,23 @@ export class CodexAppServerAgentClient implements AgentClient {
 
   async isAvailable(): Promise<boolean> {
     const launch = await resolveCodexLaunch(this.runtimeSettings);
-    const availability = await checkCodexLaunchAvailable(launch);
+    const availability = await checkCodexLaunchAvailable(launch, this.probeEnv());
     return availability.available;
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
       const launch = await resolveCodexLaunch(this.runtimeSettings);
-      const availability = await checkCodexLaunchAvailable(launch);
+      const availability = await checkCodexLaunchAvailable(launch, this.probeEnv());
       const entries: Array<{ label: string; value: string }> = [
         ...(await buildCommandResolutionDiagnosticRows(launch, {
           knownBinaryNames: ["codex"],
         })),
-        ...(await buildBinaryDiagnosticRows(launch, availability)),
+        ...(await buildHarnessBinaryDiagnosticRows(
+          launch,
+          availability,
+          this.probeEnv(createProviderEnvSpec()),
+        )),
       ];
 
       return {

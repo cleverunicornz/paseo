@@ -936,6 +936,8 @@ export async function createPaseoDaemon(
       managedProcesses,
       isDev: config.isDev === true,
       extraClients: config.agentClients,
+      mcpGatewayModelBackends: config.mcpGatewayModelBackends,
+      mcpGatewayEnvPassthrough: config.mcpGatewayEnvPassthrough,
     },
   });
   const providerSnapshotManager = agentProviderRuntime.snapshotManager;

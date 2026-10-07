@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
-import { execCommand } from "../utils/spawn.js";
+import { execCommand, type SpawnEnvOptions } from "../utils/spawn.js";
 import { isWindowsCommandScript } from "../utils/windows-command.js";
 import { windowsExecutableResolution } from "./windows.js";
 
@@ -59,12 +59,18 @@ async function enumerateCandidatesViaLibrary(name: string): Promise<string[]> {
   });
 }
 
+/**
+ * Runs `<executablePath> --version`. `env` is the probe's spawn environment;
+ * a harness binary is probed with its harness spawn environment.
+ */
 export async function probeExecutable(
   executablePath: string,
   timeoutMs = PROBE_TIMEOUT_MS,
+  env: SpawnEnvOptions = {},
 ): Promise<boolean> {
   try {
     await execCommand(executablePath, ["--version"], {
+      ...env,
       timeout: timeoutMs,
       killSignal: "SIGKILL",
       maxBuffer: 64 * 1024,
@@ -113,6 +119,7 @@ export function executableExists(
 export async function findExecutable(
   name: string,
   probeTimeoutMs = PROBE_TIMEOUT_MS,
+  env: SpawnEnvOptions = {},
 ): Promise<string | null> {
   const trimmed = name.trim();
   if (!trimmed) {
@@ -122,19 +129,19 @@ export async function findExecutable(
   if (process.platform === "win32") {
     return windowsExecutableResolution.find(trimmed, {
       enumeratePathCandidates: enumerateCandidates,
-      probeExecutable,
+      probeExecutable: (candidate, timeoutMs) => probeExecutable(candidate, timeoutMs, env),
       exists: existsSync,
       probeTimeoutMs,
     });
   }
 
   if (hasPathSeparator(trimmed)) {
-    return (await probeExecutable(trimmed, probeTimeoutMs)) ? trimmed : null;
+    return (await probeExecutable(trimmed, probeTimeoutMs, env)) ? trimmed : null;
   }
 
   const candidates = await enumerateCandidates(trimmed);
   for (const candidate of candidates) {
-    if (await probeExecutable(candidate, probeTimeoutMs)) {
+    if (await probeExecutable(candidate, probeTimeoutMs, env)) {
       return candidate;
     }
   }
