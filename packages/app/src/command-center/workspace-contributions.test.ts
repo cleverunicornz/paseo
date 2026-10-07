@@ -84,6 +84,7 @@ function source(gitActions: GitActions): {
         isGit: false,
         canPin: false,
         canShowSetup: false,
+        canCreateAgent: true,
       },
       activeTabKind: null,
       activeTabIndex: -1,
@@ -178,6 +179,16 @@ describe("workspace command center contributions", () => {
     ]);
   });
 
+  it("offers no new agent on a single-agent host that already has its agent", () => {
+    const fixture = source({ primary: null, secondary: [], menu: [] });
+    fixture.value.capabilities = { ...fixture.value.capabilities, canCreateAgent: false };
+
+    const contributions = buildWorkspaceCommandCenterContributions(fixture.value);
+
+    expect(contributions.some((item) => item.id === "tab:new-agent")).toBe(false);
+    expect(contributions.some((item) => item.id === "tab:new-terminal")).toBe(true);
+  });
+
   it("omits browser and split actions when their existing capabilities are unavailable", () => {
     const fixture = source({ primary: null, secondary: [], menu: [] });
     fixture.value.capabilities = {
@@ -186,6 +197,7 @@ describe("workspace command center contributions", () => {
       isGit: false,
       canPin: false,
       canShowSetup: false,
+      canCreateAgent: true,
     };
 
     const contributions = buildWorkspaceCommandCenterContributions(fixture.value);

@@ -22,7 +22,8 @@ import type { DaemonConfigStore } from "../daemon-config-store.js";
 import { type ManagedPluginCandidate, ManagedPluginSources } from "./managed-source.js";
 import { readPluginManifest } from "./manifest.js";
 import { runPluginBuild } from "./preparation.js";
-import { PluginRuntime, type PluginStopReadinessPart } from "./runtime.js";
+import { PluginRuntime, type PluginGatewayToolCaller } from "./runtime.js";
+import type { PluginStopReadinessOperation } from "./plugin-process-protocol.js";
 import type { TimelineDrainResult } from "./timeline-deliveries.js";
 import type { PluginProviderMetadata } from "./plugin-process-protocol.js";
 import { readPluginProviderIcon } from "./provider-icon.js";
@@ -44,13 +45,14 @@ interface PluginRuntimePort {
   stopPluginById(pluginId: string): Promise<boolean>;
   stopAll(): Promise<void>;
   drainTimelineDeliveries?(deadlineMs: number): Promise<TimelineDrainResult>;
-  listStopReadinessProviders?(part: PluginStopReadinessPart): string[];
+  listStopReadinessProviders?(operation: PluginStopReadinessOperation): string[];
   hasPendingTimelineDeliveries?(pluginId: string): boolean;
   requestStopReadiness?(input: {
     pluginId: string;
-    part: PluginStopReadinessPart;
-    stopping: boolean;
+    operation: PluginStopReadinessOperation;
+    signal?: AbortSignal;
   }): Promise<unknown>;
+  bindGatewayToolCaller?(caller: PluginGatewayToolCaller): void;
   subscribe(listener: (pluginId: string, error?: string) => void): () => void;
   bindPaseoSessionHost(sessionHost: Parameters<PluginRuntime["bindPaseoSessionHost"]>[0]): void;
 }
@@ -431,8 +433,12 @@ export class PluginService {
     );
   }
 
-  listStopReadinessProviders(part: PluginStopReadinessPart): string[] {
-    return this.runtime.listStopReadinessProviders?.(part) ?? [];
+  listStopReadinessProviders(operation: PluginStopReadinessOperation): string[] {
+    return this.runtime.listStopReadinessProviders?.(operation) ?? [];
+  }
+
+  bindGatewayToolCaller(caller: PluginGatewayToolCaller): void {
+    this.runtime.bindGatewayToolCaller?.(caller);
   }
 
   hasPendingTimelineDeliveries(pluginId: string): boolean {
@@ -441,8 +447,8 @@ export class PluginService {
 
   requestStopReadiness(input: {
     pluginId: string;
-    part: PluginStopReadinessPart;
-    stopping: boolean;
+    operation: PluginStopReadinessOperation;
+    signal?: AbortSignal;
   }): Promise<unknown> {
     if (!this.runtime.requestStopReadiness) {
       return Promise.reject(new Error("Plugin stop readiness is unavailable"));

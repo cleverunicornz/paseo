@@ -19,9 +19,10 @@ export type {
   PluginLifecycleRegistration,
 } from "./lifecycle.js";
 export type {
-  PluginStopContext,
+  PluginStopReadiness,
   PluginStopReadinessProvider,
-  PluginStopTimelineStream,
+  PluginStopSignalContext,
   PluginTimelineStopReadiness,
   PluginWipStopReadiness,
 } from "./stop-readiness.js";
+export type { PluginMcpApi, PluginMcpToolCall, PluginMcpToolResult } from "./mcp.js";

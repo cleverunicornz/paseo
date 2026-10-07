@@ -30,6 +30,38 @@ export function selectHostFeature(
   return hostSupportsFeature(state.sessions[serverId]?.serverInfo, feature);
 }
 
+interface AgentCreationSessionState {
+  sessions: Record<
+    string,
+    | {
+        serverInfo: DaemonServerInfo | null;
+        agents: ReadonlyMap<string, { archivedAt?: Date | null }>;
+      }
+    | undefined
+  >;
+}
+
+/**
+ * A single-agent host refuses a second live agent, so every way of starting
+ * one is withdrawn once it has a live agent.
+ */
+export function selectAgentCreationBlocked(
+  state: AgentCreationSessionState,
+  serverId: string,
+): boolean {
+  const session = state.sessions[serverId];
+  if (!hostSupportsFeature(session?.serverInfo, "singleAgent")) return false;
+  for (const agent of session?.agents.values() ?? []) {
+    if (!agent.archivedAt) return true;
+  }
+  return false;
+}
+
+export function useAgentCreationBlocked(serverId: string | null | undefined): boolean {
+  const normalizedServerId = serverId?.trim() ?? "";
+  return useSessionStore((state) => selectAgentCreationBlocked(state, normalizedServerId));
+}
+
 export function useHostFeature(
   serverId: string | null | undefined,
   feature: HostFeatureName,

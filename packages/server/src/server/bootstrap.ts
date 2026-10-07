@@ -209,8 +209,9 @@ import {
   DEFAULT_SESSION_RUNTIME_CONFIG,
   type SessionRuntimeConfig,
 } from "./session-runtime-config.js";
-import { StopReadinessService } from "./stop-readiness.js";
-import type { TimelineDrainResult } from "./plugins/timeline-deliveries.js";
+import { StopReadinessService, type ShutdownDrainResult } from "./stop-readiness.js";
+import { createWebBasePathMiddleware, stripUpgradeBasePath } from "./web-base-path.js";
+import { createPluginGatewayToolCaller } from "./mcp-gateway/plugin-tool-call.js";
 import {
   createRequireBearerMiddleware,
   authorizeAgentMcpRequest,
@@ -506,7 +507,7 @@ export interface PaseoDaemonConfig {
 
 export interface DaemonStopResult {
   /** Whether every timeline item reached its plugins before they stopped. */
-  timelineDrain: TimelineDrainResult;
+  timelineDrain: ShutdownDrainResult;
 }
 
 export interface PaseoDaemon {
@@ -567,6 +568,7 @@ function mountWebUi(app: express.Application, config: PaseoDaemonConfig, logger:
       distDir: config.webUi?.distDir ?? null,
       label: getHostname(),
       logger,
+      basePath: resolveSessionRuntime(config).webBasePath,
     }),
   );
 }
@@ -747,6 +749,9 @@ export async function createPaseoDaemon(
     logger,
   });
 
+  // A reverse proxy forwards `<basePath>...` unchanged; route it without the prefix.
+  app.use(createWebBasePathMiddleware(sessionRuntime.webBasePath));
+
   // Service proxy classifies service hosts before daemon auth/route fallthrough.
   // Registered service hosts proxy directly; known service namespaces without a
   // route return 404 and never reach daemon APIs.
@@ -906,6 +911,10 @@ export async function createPaseoDaemon(
   });
 
   const httpServer = createHTTPServer(app);
+  // First upgrade listener, so every WebSocket route sees the path without the prefix.
+  httpServer.prependListener("upgrade", (req) => {
+    stripUpgradeBasePath(req, sessionRuntime.webBasePath);
+  });
 
   // Script proxy WebSocket upgrade handler — must be registered before the
   // VoiceAssistantWebSocketServer attaches its own "upgrade" listener so that
@@ -1023,9 +1032,19 @@ export async function createPaseoDaemon(
   });
   const stopReadiness = new StopReadinessService({
     plugins: pluginRuntime,
-    stopAcceptingWork: () => agentManager.beginStopping(),
+    stopAgentWork: async () => {
+      agentManager.beginStopping();
+      await agentManager.stopRunningTurns();
+    },
     logger,
   });
+  pluginRuntime.bindGatewayToolCaller(
+    createPluginGatewayToolCaller({
+      getGatewayBaseUrl: () => createLoopbackDaemonUrl(boundListenTarget, MCP_GATEWAY_ROUTE),
+      isLiveAgent: (agentId) => agentManager.getAgent(agentId) !== null,
+      issueAgentToken: (agentId) => agentManager.issueAgentToken(agentId),
+    }),
+  );
   // Control endpoints for whatever stops this daemon's host, behind the same
   // Host allowlist and daemon password as the rest of /api.
   app.get("/api/stop-readiness", (_req, res) => {
@@ -1941,9 +1960,7 @@ export async function createPaseoDaemon(
     await agentProviderRuntime.shutdown();
     // Every agent is closed and its last timeline items emitted. Plugins stay up
     // until they acknowledged those items or the drain deadline passed.
-    const timelineDrain = await pluginRuntime.drainTimelineDeliveries(
-      sessionRuntime.timelineDrainMs,
-    );
+    const timelineDrain = await stopReadiness.drainForShutdown(sessionRuntime.timelineDrainMs);
     reportTimelineDrain(logger, timelineDrain);
     await pluginRuntime.stopAllPlugins();
     terminalManager.killAll();
@@ -1991,7 +2008,7 @@ function resolveSessionRuntime(config: PaseoDaemonConfig): SessionRuntimeConfig 
   return config.sessionRuntime ?? DEFAULT_SESSION_RUNTIME_CONFIG;
 }
 
-function reportTimelineDrain(logger: Logger, result: TimelineDrainResult): void {
+function reportTimelineDrain(logger: Logger, result: ShutdownDrainResult): void {
   if (result.status === "drained") {
     logger.info("Timeline drain complete: every timeline item was acknowledged");
     return;
@@ -2000,6 +2017,12 @@ function reportTimelineDrain(logger: Logger, result: TimelineDrainResult): void 
     logger.error(
       { ...failure, deadlineMs: result.deadlineMs },
       `Timeline drain failed: plugin ${failure.pluginId} did not acknowledge agent ${failure.agentId} epoch ${failure.epoch} through seq ${failure.highestUnacknowledgedSeq}`,
+    );
+  }
+  for (const failure of result.providerFailures) {
+    logger.error(
+      { ...failure, deadlineMs: result.deadlineMs },
+      `Timeline drain failed: plugin ${failure.pluginId} did not finish its drain (${failure.reason})`,
     );
   }
 }

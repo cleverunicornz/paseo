@@ -215,13 +215,28 @@ export function deriveLabelFromEndpoint(endpoint: string): string {
 
 export interface WebSocketUrlOptions {
   useTls: boolean;
+  /** The path the daemon is served under, such as `/s/abc/`; `/` when absent. */
+  basePath?: string;
+}
+
+/** `/` or `/segment/.../` made of unreserved URL characters. */
+const DAEMON_BASE_PATH_PATTERN = /^\/(?:[A-Za-z0-9._~-]+\/)*$/;
+
+/** Returns the base path with both slashes, or null when it is not a valid one. */
+export function normalizeDaemonBasePath(value: string | undefined | null): string | null {
+  if (value === undefined || value === null) return "/";
+  const trimmed = value.trim();
+  const withSlash = trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
+  return DAEMON_BASE_PATH_PATTERN.test(withSlash) && !withSlash.includes("/../") ? withSlash : null;
 }
 
 export function buildDaemonWebSocketUrl(endpoint: string, opts: WebSocketUrlOptions): string {
   const { host, port, isIpv6 } = parseHostPort(endpoint);
   const protocol = opts.useTls ? "wss" : "ws";
   const hostPart = isIpv6 ? `[${host}]` : host;
-  return new URL(`${protocol}://${hostPart}:${port}/ws`).toString();
+  const basePath = normalizeDaemonBasePath(opts.basePath);
+  if (basePath === null) throw new Error(`Invalid daemon base path: ${opts.basePath}`);
+  return new URL(`${protocol}://${hostPart}:${port}${basePath}ws`).toString();
 }
 
 export function buildRelayWebSocketUrl(params: {

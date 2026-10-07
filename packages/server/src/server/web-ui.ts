@@ -144,10 +144,13 @@ export interface WebUiMiddlewareOptions {
   distDir: string | null;
   label: string;
   logger: Logger;
+  /** The path a reverse proxy serves the daemon under, such as `/s/abc/`; `/` by default. */
+  basePath?: string;
 }
 
 export function createWebUiMiddleware(options: WebUiMiddlewareOptions): RequestHandler {
   const { enabled, distDir, label, logger } = options;
+  const basePath = options.basePath ?? "/";
   const childLogger = logger.child({ module: "web-ui" });
 
   if (!enabled || !distDir) {
@@ -175,7 +178,7 @@ export function createWebUiMiddleware(options: WebUiMiddlewareOptions): RequestH
       return;
     }
 
-    serveWebUiFile({ distDir, requestPath: req.path, label, req, res });
+    serveWebUiFile({ distDir, requestPath: req.path, label, basePath, req, res });
   };
 }
 
@@ -183,12 +186,13 @@ interface ServeWebUiFileOptions {
   distDir: string;
   requestPath: string;
   label: string;
+  basePath: string;
   req: Parameters<RequestHandler>[0];
   res: Parameters<RequestHandler>[1];
 }
 
 function serveWebUiFile(options: ServeWebUiFileOptions): void {
-  const { distDir, requestPath, label, req, res } = options;
+  const { distDir, requestPath, label, basePath, req, res } = options;
 
   const target = resolveTargetFile(distDir, requestPath);
   if (!target) {
@@ -213,7 +217,7 @@ function serveWebUiFile(options: ServeWebUiFileOptions): void {
   }
 
   if (isIndexHtml) {
-    sendIndexHtml(res, finalFile, req, label);
+    sendIndexHtml({ res, filePath: finalFile, req, label, basePath });
     return;
   }
 
@@ -228,19 +232,33 @@ function serveWebUiFile(options: ServeWebUiFileOptions): void {
   stream.pipe(res);
 }
 
-function sendIndexHtml(
-  res: Response,
-  filePath: string,
-  req: Parameters<RequestHandler>[0],
-  label: string,
-): void {
+function sendIndexHtml(input: {
+  res: Response;
+  filePath: string;
+  req: Parameters<RequestHandler>[0];
+  label: string;
+  basePath: string;
+}): void {
+  const { res, filePath, req, label, basePath } = input;
   try {
-    const html = readFileSync(filePath, "utf-8");
-    const injected = injectConnectionHint(html, req, label);
+    const html = prefixRootAbsoluteReferences(readFileSync(filePath, "utf-8"), basePath);
+    const injected = injectConnectionHint({ html, req, label, basePath });
     res.status(200).send(injected);
   } catch {
     res.status(500).end();
   }
+}
+
+/** `href="/x"` and `src="/x"` become `href="/s/abc/x"`; protocol-relative `//x` is left alone. */
+function prefixRootAbsoluteReferences(html: string, basePath: string): string {
+  if (basePath === "/") return html;
+  return html.replace(/(\s(?:href|src)=")\/(?!\/)/g, `$1${basePath}`);
+}
+
+/** Behind a proxy on a default port the Host header has no port; the client needs one. */
+function withDefaultPort(host: string, useTls: boolean): string {
+  if (!host || /:\d+$/.test(host)) return host;
+  return `${host}:${useTls ? 443 : 80}`;
 }
 
 function serializeInlineScriptJson(value: unknown): string {
@@ -250,19 +268,27 @@ function serializeInlineScriptJson(value: unknown): string {
     .replace(/&/g, "\\u0026");
 }
 
-function injectConnectionHint(
-  html: string,
-  req: Parameters<RequestHandler>[0],
-  label: string,
-): string {
-  const host = typeof req.headers.host === "string" ? req.headers.host : "";
+function injectConnectionHint(input: {
+  html: string;
+  req: Parameters<RequestHandler>[0];
+  label: string;
+  basePath: string;
+}): string {
+  const { html, req, label, basePath } = input;
   const useTls = req.protocol === "https";
+  const host = withDefaultPort(
+    typeof req.headers.host === "string" ? req.headers.host : "",
+    useTls,
+  );
   const hint = {
     listen: host,
     useTls,
     label,
+    ...(basePath === "/" ? {} : { basePath }),
   };
-  const script = `<script>window.__PASEO_INITIAL_DAEMON_CONNECTION__=${serializeInlineScriptJson(hint)}</script>`;
+  // The daemon web UI bundle reads its router and asset base from this global.
+  const runtimeBasePath = basePath === "/" ? "" : basePath.slice(0, -1);
+  const script = `<script>window.__PASEO_WEB_BASE_PATH__=${serializeInlineScriptJson(runtimeBasePath)};window.__PASEO_INITIAL_DAEMON_CONNECTION__=${serializeInlineScriptJson(hint)}</script>`;
   const headClose = /<\/head>/i;
   if (headClose.test(html)) {
     return html.replace(headClose, `${script}</head>`);

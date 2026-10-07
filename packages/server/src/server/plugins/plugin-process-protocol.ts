@@ -5,7 +5,6 @@ import type {
   ProviderInput,
 } from "@getpaseo/plugin/server/provider";
 import { ProviderEventSchema, ProviderInputSchema } from "@getpaseo/plugin/server/provider";
-import type { PluginStopContext } from "@getpaseo/plugin/server";
 import { z } from "zod";
 
 export interface PluginProviderMetadata {
@@ -16,15 +15,18 @@ export interface PluginProviderMetadata {
   iconPath?: string;
 }
 
-/** Which stop-readiness parts a plugin's server entry provides. */
+/** Which stop-readiness operations a plugin's server entry provides. */
 export interface PluginStopReadinessCapabilities {
-  timeline: boolean;
-  wip: boolean;
-  beginStopping: boolean;
+  readiness: boolean;
+  stop: boolean;
+  drain: boolean;
 }
 
-/** The stop context as it crosses the process boundary; the child adds its own `paseo`. */
-export type PluginStopContextPayload = Omit<PluginStopContext, "paseo">;
+export type PluginStopReadinessOperation = keyof PluginStopReadinessCapabilities;
+
+export type PluginMcpCallResult =
+  | { type: "mcp.call_tool.result"; callId: string; ok: true; result: unknown }
+  | { type: "mcp.call_tool.result"; callId: string; ok: false; error: string };
 
 export type PluginProcessRequest =
   | {
@@ -43,13 +45,9 @@ export type PluginProcessRequest =
   | { type: "hook"; requestId: string; kind: "event" | "before"; name: string; input: unknown }
   | { type: "hook.cancel"; requestId: string }
   | { type: "invoke"; requestId: string; method: string; input: unknown }
-  | {
-      type: "stop_readiness";
-      requestId: string;
-      part: "timeline" | "wip";
-      context: PluginStopContextPayload;
-    }
-  | { type: "begin_stopping"; requestId: string; context: PluginStopContextPayload }
+  | { type: "stop_readiness"; requestId: string; operation: PluginStopReadinessOperation }
+  | { type: "stop_readiness.cancel"; requestId: string }
+  | PluginMcpCallResult
   | {
       type: "provider.connect";
       providerId: string;
@@ -80,6 +78,15 @@ export type PluginProcessMessage =
   | { type: "result"; requestId: string; output: unknown }
   | { type: "error"; requestId: string; error: string }
   | { type: "fatal"; error: string }
+  | {
+      type: "mcp.call_tool";
+      callId: string;
+      backend: string;
+      tool: string;
+      arguments: Record<string, unknown>;
+      onBehalfOf: string;
+      timeoutMs: number;
+    }
   | {
       type: "provider.connected";
       connectionId: string;
@@ -116,25 +123,8 @@ const providerConnectRequestSchema = z
     capabilities: z.array(z.string()),
   })
   .strict();
-const stopContextSchema = z
-  .object({
-    stopping: z.boolean(),
-    timeline: z.array(
-      z
-        .object({
-          agentId: z.string(),
-          epoch: z.string(),
-          emittedThrough: z.number().int(),
-          deliveredThrough: z.number().int(),
-          pending: z.number().int().nonnegative(),
-          failed: z.number().int().nonnegative(),
-        })
-        .strict(),
-    ),
-  })
-  .strict();
 const stopReadinessCapabilitiesSchema = z
-  .object({ timeline: z.boolean(), wip: z.boolean(), beginStopping: z.boolean() })
+  .object({ readiness: z.boolean(), stop: z.boolean(), drain: z.boolean() })
   .strict();
 const frameFields = {
   data: z.union([z.string(), z.instanceof(Uint8Array)]),
@@ -184,17 +174,28 @@ export const PluginProcessRequestSchema: z.ZodType<PluginProcessRequest> = z.dis
       .object({
         type: z.literal("stop_readiness"),
         requestId: z.string().min(1),
-        part: z.enum(["timeline", "wip"]),
-        context: stopContextSchema,
+        operation: z.enum(["readiness", "stop", "drain"]),
       })
       .strict(),
-    z
-      .object({
-        type: z.literal("begin_stopping"),
-        requestId: z.string().min(1),
-        context: stopContextSchema,
-      })
-      .strict(),
+    z.object({ type: z.literal("stop_readiness.cancel"), requestId: z.string().min(1) }).strict(),
+    z.discriminatedUnion("ok", [
+      z
+        .object({
+          type: z.literal("mcp.call_tool.result"),
+          callId: z.string().min(1),
+          ok: z.literal(true),
+          result: z.unknown(),
+        })
+        .strict(),
+      z
+        .object({
+          type: z.literal("mcp.call_tool.result"),
+          callId: z.string().min(1),
+          ok: z.literal(false),
+          error: z.string(),
+        })
+        .strict(),
+    ]),
     z
       .object({
         type: z.literal("invoke"),
@@ -247,6 +248,17 @@ export const PluginProcessMessageSchema: z.ZodType<PluginProcessMessage> = z.dis
       .object({ type: z.literal("error"), requestId: z.string().min(1), error: z.string() })
       .strict(),
     z.object({ type: z.literal("fatal"), error: z.string() }).strict(),
+    z
+      .object({
+        type: z.literal("mcp.call_tool"),
+        callId: z.string().min(1),
+        backend: z.string().min(1),
+        tool: z.string().min(1),
+        arguments: z.record(z.string(), z.unknown()),
+        onBehalfOf: z.string().min(1),
+        timeoutMs: z.number().int().min(1).max(600_000),
+      })
+      .strict(),
     z
       .object({
         type: z.literal("provider.connected"),

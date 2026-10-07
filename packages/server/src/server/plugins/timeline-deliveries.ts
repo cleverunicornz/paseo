@@ -1,5 +1,3 @@
-import type { PluginStopTimelineStream } from "@getpaseo/plugin/server";
-
 interface DeliveryStream {
   pluginId: string;
   agentId: string;
@@ -58,20 +56,6 @@ export class TimelineDeliveryLedger {
       if (stream.pending.size > 0) return true;
     }
     return false;
-  }
-
-  /** The plugin's view of its deliveries, as stop-readiness providers receive it. */
-  describe(pluginId: string): PluginStopTimelineStream[] {
-    return [...this.streams.values()]
-      .filter((stream) => stream.pluginId === pluginId)
-      .map((stream) => ({
-        agentId: stream.agentId,
-        epoch: stream.epoch,
-        emittedThrough: stream.emittedThrough,
-        deliveredThrough: deliveredThrough(stream),
-        pending: stream.pending.size,
-        failed: stream.failed.size,
-      }));
   }
 
   /**

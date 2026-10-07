@@ -25,6 +25,7 @@ import {
   type PanelPresentation,
 } from "@/panels/panel-registry";
 import { ensurePanelsRegistered } from "@/panels/register-panels";
+import { useAgentCreationBlocked } from "@/runtime/host-features";
 import {
   getTerminalProfileIcon,
   resolveTerminalProfiles,
@@ -104,6 +105,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
   const launcher = useContext(NewTabLauncherContext);
   invariant(launcher, "NewTabLauncherProvider is required");
   const { config } = useDaemonConfig(serverId);
+  const agentCreationBlocked = useAgentCreationBlocked(serverId);
   const plugins = useInstalledPlugins();
   ensurePanelsRegistered();
 
@@ -131,6 +133,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
         disabled: false,
         panelKind: "draft",
         toggleTarget: null,
+        hidden: agentCreationBlocked,
         launch: launchSelection(BUILT_IN_SELECTIONS.agent),
       },
       terminal: {
@@ -251,6 +254,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
     }
     return groups;
   }, [
+    agentCreationBlocked,
     config?.terminalProfiles,
     editTerminalProfiles,
     launchSelection,

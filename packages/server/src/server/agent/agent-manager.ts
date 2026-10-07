@@ -922,6 +922,27 @@ export class AgentManager {
     return this.admission.isStopping;
   }
 
+  /** Cancels every public agent's running turn; turns that refuse to stop are logged. */
+  async stopRunningTurns(): Promise<void> {
+    const running = [...this.agents.values()].filter(
+      (agent) => !agent.internal && this.hasInFlightRun(agent.id),
+    );
+    const outcomes = await Promise.allSettled(
+      running.map((agent) => this.cancelAgentRun(agent.id)),
+    );
+    outcomes.forEach((outcome, index) => {
+      if (outcome.status === "rejected" || outcome.value.status === "refused") {
+        this.logger.warn(
+          {
+            agentId: running[index]!.id,
+            err: outcome.status === "rejected" ? outcome.reason : null,
+          },
+          "A running turn did not stop",
+        );
+      }
+    });
+  }
+
   isSingleAgent(): boolean {
     return this.admission.singleAgent;
   }

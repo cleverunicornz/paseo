@@ -3,13 +3,21 @@ import {
   PluginProcessRequestSchema,
   type PluginProcessMessage,
   type PluginProcessRequest,
+  type PluginStopReadinessOperation,
 } from "./plugin-process-protocol.js";
 import { createRequire } from "node:module";
 import * as pluginSharedRuntime from "@getpaseo/plugin";
 import * as pluginProviderRuntime from "@getpaseo/plugin/server/provider";
 import * as pluginAcpRuntime from "@getpaseo/plugin/server/acp";
 import type { SettingsDefinition, PluginRpcContract } from "@getpaseo/plugin";
-import type { PluginHandlerContext, PluginStopReadinessProvider } from "@getpaseo/plugin/server";
+import type {
+  PluginHandlerContext,
+  PluginMcpApi,
+  PluginMcpToolCall,
+  PluginMcpToolResult,
+  PluginStopReadinessProvider,
+} from "@getpaseo/plugin/server";
+import { randomUUID } from "node:crypto";
 import type { ZodType } from "zod";
 import {
   ProviderEventSchema,
@@ -55,6 +63,7 @@ const providerConnections = new Map<
 >();
 const pendingProviderConnections = new Map<string, { tombstoned: boolean }>();
 let stopReadinessProvider: PluginStopReadinessProvider | null = null;
+const activeStopOperations = new Map<string, AbortController>();
 let settingUp = false;
 let cleanup: (() => void | Promise<void>) | null = null;
 let daemonClient: DaemonClient | null = null;
@@ -130,9 +139,12 @@ function registerStopReadiness(provider: PluginStopReadinessProvider): void {
   if (provider === null || typeof provider !== "object") {
     throw new Error("Invalid stop-readiness provider");
   }
-  for (const part of ["timeline", "wip", "beginStopping"] as const) {
-    if (provider[part] !== undefined && typeof provider[part] !== "function") {
-      throw new Error(`Stop-readiness provider ${part} must be a function`);
+  if (typeof provider.readiness !== "function") {
+    throw new Error("Stop-readiness provider readiness must be a function");
+  }
+  for (const operation of ["stop", "drain"] as const) {
+    if (provider[operation] !== undefined && typeof provider[operation] !== "function") {
+      throw new Error(`Stop-readiness provider ${operation} must be a function`);
     }
   }
   stopReadinessProvider = provider;
@@ -140,31 +152,79 @@ function registerStopReadiness(provider: PluginStopReadinessProvider): void {
 
 function stopReadinessCapabilities() {
   return {
-    timeline: typeof stopReadinessProvider?.timeline === "function",
-    wip: typeof stopReadinessProvider?.wip === "function",
-    beginStopping: typeof stopReadinessProvider?.beginStopping === "function",
+    readiness: typeof stopReadinessProvider?.readiness === "function",
+    stop: typeof stopReadinessProvider?.stop === "function",
+    drain: typeof stopReadinessProvider?.drain === "function",
   };
 }
 
+async function runStopReadinessOperation(
+  operation: PluginStopReadinessOperation,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const provider = stopReadinessProvider;
+  if (!provider) throw new Error("Plugin does not provide stop readiness");
+  if (operation === "readiness") return jsonTransportValue(await provider.readiness());
+  if (operation === "stop") {
+    if (!provider.stop) throw new Error("Plugin does not provide stop");
+    return jsonTransportValue(await provider.stop({ signal }));
+  }
+  if (!provider.drain) throw new Error("Plugin does not provide drain");
+  await provider.drain({ signal });
+  return null;
+}
+
 function handleStopReadinessMessage(
-  message: Extract<PluginProcessRequest, { type: "stop_readiness" | "begin_stopping" }>,
+  message: Extract<PluginProcessRequest, { type: "stop_readiness" | "stop_readiness.cancel" }>,
 ): void {
-  void (async () => {
-    if (!paseo) throw new Error("Plugin Paseo API is unavailable");
-    const context = { ...message.context, paseo };
-    const provider = stopReadinessProvider;
-    if (message.type === "begin_stopping") {
-      if (!provider?.beginStopping) throw new Error("Plugin does not provide beginStopping");
-      await provider.beginStopping(context);
-      return null;
-    }
-    const answer = provider?.[message.part];
-    if (!answer) throw new Error(`Plugin does not provide stop readiness ${message.part}`);
-    return jsonTransportValue(await answer(context));
-  })().then(
-    (output) => send({ type: "result", requestId: message.requestId, output }),
-    (error) => send({ type: "error", requestId: message.requestId, error: describeError(error) }),
-  );
+  if (message.type === "stop_readiness.cancel") {
+    activeStopOperations.get(message.requestId)?.abort();
+    return;
+  }
+  const controller = new AbortController();
+  activeStopOperations.set(message.requestId, controller);
+  void runStopReadinessOperation(message.operation, controller.signal)
+    .then(
+      (output) => send({ type: "result", requestId: message.requestId, output }),
+      (error) => send({ type: "error", requestId: message.requestId, error: describeError(error) }),
+    )
+    .finally(() => activeStopOperations.delete(message.requestId));
+}
+
+const pendingMcpCalls = new Map<
+  string,
+  { resolve: (result: unknown) => void; reject: (error: Error) => void }
+>();
+
+// The daemon makes the call with the agent's identity; this process only ever
+// sees the backend's result.
+const mcp: PluginMcpApi = {
+  callTool(call: PluginMcpToolCall): Promise<PluginMcpToolResult> {
+    if (stopping) return Promise.reject(new Error("Plugin is stopping"));
+    const callId = randomUUID();
+    return new Promise<unknown>((resolve, reject) => {
+      pendingMcpCalls.set(callId, { resolve, reject });
+      send({
+        type: "mcp.call_tool",
+        callId,
+        backend: call.backend,
+        tool: call.tool,
+        arguments: jsonTransportValue(call.arguments ?? {}),
+        onBehalfOf: call.onBehalfOf,
+        timeoutMs: call.timeoutMs ?? 60_000,
+      });
+    }) as Promise<PluginMcpToolResult>;
+  },
+};
+
+function settleMcpCall(
+  message: Extract<PluginProcessRequest, { type: "mcp.call_tool.result" }>,
+): void {
+  const pending = pendingMcpCalls.get(message.callId);
+  if (!pending) return;
+  pendingMcpCalls.delete(message.callId);
+  if (message.ok) pending.resolve(message.result);
+  else pending.reject(new Error(message.error));
 }
 
 function providerMetadata(provider: ProviderRegistration) {
@@ -298,6 +358,7 @@ function evaluateBundle(bundle: string): void {
       handle: register,
       registerProvider,
       registerStopReadiness,
+      mcp,
       registerSettings,
       on: hooks.on,
       before: hooks.before,
@@ -355,6 +416,9 @@ async function shutdown(): Promise<void> {
     ?.dispose()
     .catch((error) => console.error("Plugin API cleanup failed", error));
   hooks.close();
+  for (const controller of activeStopOperations.values()) controller.abort();
+  for (const pending of pendingMcpCalls.values()) pending.reject(new Error("Plugin is stopping"));
+  pendingMcpCalls.clear();
   for (const pending of pendingProviderConnections.values()) pending.tombstoned = true;
   const currentCleanup = cleanup;
   cleanup = null;
@@ -405,6 +469,10 @@ process.on("message", (rawMessage: unknown) => {
     void shutdown();
     return;
   }
+  if (message.type === "mcp.call_tool.result") {
+    settleMcpCall(message);
+    return;
+  }
   if (stopping) {
     refuseWhileStopping(message);
     return;
@@ -450,7 +518,7 @@ process.on("message", (rawMessage: unknown) => {
     return;
   }
   if (message.type === "paseo_frame" || message.type === "paseo_close") return;
-  if (message.type === "stop_readiness" || message.type === "begin_stopping") {
+  if (message.type === "stop_readiness" || message.type === "stop_readiness.cancel") {
     handleStopReadinessMessage(message);
     return;
   }
@@ -481,11 +549,7 @@ process.on("message", (rawMessage: unknown) => {
 });
 
 function refuseWhileStopping(message: PluginProcessRequest): void {
-  if (
-    message.type === "provider.catalog_key" ||
-    message.type === "stop_readiness" ||
-    message.type === "begin_stopping"
-  ) {
+  if (message.type === "provider.catalog_key" || message.type === "stop_readiness") {
     send({ type: "error", requestId: message.requestId, error: "Plugin is stopping" });
   } else if (message.type === "provider.connect") {
     send({

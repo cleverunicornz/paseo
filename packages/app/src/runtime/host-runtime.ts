@@ -15,6 +15,7 @@ import {
   upsertHostConnectionInProfiles,
   registryHasConnection,
   relayConnectionFromOffer,
+  withDirectTcpBasePath,
   StoredHostRegistrySchema,
   type HostConnection,
   type HostProfile,
@@ -258,7 +259,9 @@ function toActiveConnection(connection: HostConnection): ActiveConnection {
     return {
       type: "directTcp",
       endpoint: connection.endpoint,
-      display: connection.endpoint,
+      display: connection.basePath
+        ? `${connection.endpoint}${connection.basePath}`
+        : connection.endpoint,
     };
   }
   return {
@@ -579,6 +582,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
           ...webSocketConfig,
           url: buildDaemonWebSocketUrl(connection.endpoint, {
             useTls: connection.useTls ?? false,
+            basePath: connection.basePath,
           }),
         });
       }
@@ -1405,11 +1409,14 @@ const INITIAL_DAEMON_CONNECTION_HINT_GLOBAL_KEY = "__PASEO_INITIAL_DAEMON_CONNEC
 export interface InitialDaemonConnectionHint {
   listen: string;
   useTls?: boolean;
+  /** The path the page and the daemon are served under behind a reverse proxy. */
+  basePath?: string;
 }
 
 const InitialDaemonConnectionHintSchema: z.ZodType<InitialDaemonConnectionHint> = z.object({
   listen: z.string().trim().min(1),
   useTls: z.boolean().optional().default(false),
+  basePath: z.string().optional(),
 });
 
 export function readInitialDaemonConnectionHint(input?: {
@@ -1723,7 +1730,8 @@ export class HostRuntimeStore {
   private async bootstrapInitialConnectionHint(
     hint: InitialDaemonConnectionHint,
   ): Promise<boolean> {
-    const connection = connectionFromListen(hint.listen);
+    const listened = connectionFromListen(hint.listen);
+    const connection = listened ? withDirectTcpBasePath(listened, hint.basePath) : null;
     if (!connection) {
       return false;
     }

@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 import { z } from "zod";
-import type { PluginStopReadinessPart } from "./plugins/runtime.js";
+import type { PluginStopReadinessOperation } from "./plugins/plugin-process-protocol.js";
+import type { TimelineDrainFailure, TimelineDrainResult } from "./plugins/timeline-deliveries.js";
 
 export interface TimelineReadiness {
   ready: boolean;
@@ -24,14 +25,30 @@ export interface StopReadiness {
   wip: WipReadiness;
 }
 
+/** A stop-readiness provider whose `drain` did not resolve before the shutdown deadline. */
+export interface ProviderDrainFailure {
+  pluginId: string;
+  reason: "deadline" | "rejected";
+}
+
+export type ShutdownDrainResult =
+  | { status: "drained" }
+  | {
+      status: "failed";
+      deadlineMs: number;
+      failures: TimelineDrainFailure[];
+      providerFailures: ProviderDrainFailure[];
+    };
+
 export interface StopReadinessPlugins {
-  listStopReadinessProviders(part: PluginStopReadinessPart): string[];
+  listStopReadinessProviders(operation: PluginStopReadinessOperation): string[];
   hasPendingTimelineDeliveries(pluginId: string): boolean;
   requestStopReadiness(input: {
     pluginId: string;
-    part: PluginStopReadinessPart;
-    stopping: boolean;
+    operation: PluginStopReadinessOperation;
+    signal?: AbortSignal;
   }): Promise<unknown>;
+  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult>;
 }
 
 const MAX_REASON_LENGTH = 300;
@@ -44,7 +61,11 @@ function sanitizeReason(reason: string | undefined): string | undefined {
     .slice(0, MAX_REASON_LENGTH);
 }
 
-const ReasonSchema = z.string().optional();
+function withReason<Part extends { reason?: string }>(part: Part): Part {
+  const { reason, ...rest } = part;
+  const sanitized = sanitizeReason(reason);
+  return (sanitized === undefined ? rest : { ...rest, reason: sanitized }) as Part;
+}
 
 const TimelineAnswerSchema = z
   .object({
@@ -52,7 +73,7 @@ const TimelineAnswerSchema = z
     epoch: z.string().max(200).nullable(),
     emitted_through: z.number().int().nonnegative().nullable(),
     acknowledged_through: z.number().int().nonnegative().nullable(),
-    reason: ReasonSchema,
+    reason: z.string().optional(),
   })
   .strict();
 
@@ -69,108 +90,178 @@ const WipAnswerSchema = z
       .string()
       .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
       .optional(),
-    reason: ReasonSchema,
+    reason: z.string().optional(),
   })
   .strict();
 
-function unavailableTimeline(reason: string): TimelineReadiness {
-  return { ready: false, epoch: null, emitted_through: null, acknowledged_through: null, reason };
+const ReadinessAnswerSchema = z
+  .object({ ready: z.boolean(), timeline: TimelineAnswerSchema, wip: WipAnswerSchema })
+  .strict();
+
+function notReady(reason: string): StopReadiness {
+  return {
+    ready: false,
+    timeline: {
+      ready: false,
+      epoch: null,
+      emitted_through: null,
+      acknowledged_through: null,
+      reason,
+    },
+    wip: { ready: false, reason },
+  };
 }
 
 /**
- * Composes the daemon's stop-readiness answer from plugin providers and starts
- * their stop work on request. A part with no provider, several providers, a
- * failed provider or a malformed answer is not ready.
+ * Composes the daemon's stop-readiness answer from the plugin that registered
+ * a stop-readiness provider, and drives that provider's stop work. With no
+ * provider, several providers, a failed provider or a malformed answer,
+ * nothing is ready.
  */
 export class StopReadinessService {
-  private stopping = false;
+  private stopWork: AbortController | null = null;
 
   constructor(
     private readonly deps: {
       plugins: StopReadinessPlugins;
-      /** Stops new agents and new turns in the agent manager. */
-      stopAcceptingWork: () => void;
+      /** Refuses new agents and turns, then stops the turns that are running. */
+      stopAgentWork: () => Promise<void>;
       logger: Logger;
     },
   ) {}
 
-  isStopping(): boolean {
-    return this.stopping;
-  }
-
   async readiness(): Promise<StopReadiness> {
-    const [timeline, wip] = await Promise.all([this.timeline(), this.wip()]);
+    const providers = this.deps.plugins.listStopReadinessProviders("readiness");
+    if (providers.length === 0) return notReady("no provider");
+    if (providers.length > 1) return notReady("multiple providers");
+    const pluginId = providers[0]!;
+    let raw: unknown;
+    try {
+      raw = await this.deps.plugins.requestStopReadiness({ pluginId, operation: "readiness" });
+    } catch (error) {
+      this.deps.logger.warn({ err: error, pluginId }, "Stop-readiness provider failed");
+      return notReady("provider failed");
+    }
+    const parsed = ReadinessAnswerSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.deps.logger.warn(
+        { pluginId, issues: parsed.error.issues.map((issue) => issue.message) },
+        "Stop-readiness provider answered with an invalid shape",
+      );
+      return notReady("invalid provider answer");
+    }
+    // Items the daemon sent that the provider has not answered may not be in its count yet.
+    const timeline =
+      parsed.data.timeline.ready && this.deps.plugins.hasPendingTimelineDeliveries(pluginId)
+        ? {
+            ...parsed.data.timeline,
+            ready: false,
+            reason: "timeline items in flight to the provider",
+          }
+        : withReason(parsed.data.timeline);
+    const wip = withReason(parsed.data.wip);
     return { ready: timeline.ready && wip.ready, timeline, wip };
   }
 
   /**
-   * Refuses new agents and new turns from now on, then asks every provider to
-   * start its stop work. Providers run in the background; their failures are
-   * logged and show up as parts that do not become ready.
+   * Refuses new agents and turns, stops the running turns, then calls the
+   * provider's `stop` and `drain` together. Returns once the work is started.
    */
   beginStopping(): void {
-    this.stopping = true;
-    this.deps.stopAcceptingWork();
-    for (const pluginId of this.deps.plugins.listStopReadinessProviders("beginStopping")) {
-      this.deps.plugins
-        .requestStopReadiness({ pluginId, part: "beginStopping", stopping: true })
-        .catch((error: unknown) => {
-          this.deps.logger.warn({ err: error, pluginId }, "Plugin failed to begin stopping");
-        });
-    }
+    this.stopWork?.abort();
+    const controller = new AbortController();
+    this.stopWork = controller;
+    void this.runStopWork(controller.signal);
   }
 
-  private async timeline(): Promise<TimelineReadiness> {
-    const answer = await this.ask("timeline", TimelineAnswerSchema);
-    if (answer.status !== "answered") return unavailableTimeline(answer.reason);
-    const { pluginId, value } = answer;
-    if (value.ready && this.deps.plugins.hasPendingTimelineDeliveries(pluginId)) {
-      return { ...value, ready: false, reason: "timeline items in flight to the provider" };
-    }
-    return { ...value, ...optionalReason(value.reason) };
-  }
-
-  private async wip(): Promise<WipReadiness> {
-    const answer = await this.ask("wip", WipAnswerSchema);
-    if (answer.status !== "answered") return { ready: false, reason: answer.reason };
-    return { ...answer.value, ...optionalReason(answer.value.reason) };
-  }
-
-  private async ask<Schema extends z.ZodType>(
-    part: "timeline" | "wip",
-    schema: Schema,
-  ): Promise<
-    | { status: "answered"; pluginId: string; value: z.infer<Schema> }
-    | { status: "unavailable"; reason: string }
-  > {
-    const providers = this.deps.plugins.listStopReadinessProviders(part);
-    if (providers.length === 0) return { status: "unavailable", reason: "no provider" };
-    if (providers.length > 1) return { status: "unavailable", reason: "multiple providers" };
-    const pluginId = providers[0]!;
-    let raw: unknown;
+  private async runStopWork(signal: AbortSignal): Promise<void> {
     try {
-      raw = await this.deps.plugins.requestStopReadiness({
-        pluginId,
-        part,
-        stopping: this.stopping,
-      });
+      await this.deps.stopAgentWork();
     } catch (error) {
-      this.deps.logger.warn({ err: error, pluginId, part }, "Stop-readiness provider failed");
-      return { status: "unavailable", reason: "provider failed" };
+      this.deps.logger.warn({ err: error }, "Failed to stop running turns");
     }
-    const parsed = schema.safeParse(raw);
-    if (!parsed.success) {
-      this.deps.logger.warn(
-        { pluginId, part, issues: parsed.error.issues.map((issue) => issue.message) },
-        "Stop-readiness provider answered with an invalid shape",
+    if (signal.aborted) return;
+    for (const operation of ["stop", "drain"] as const) {
+      for (const pluginId of this.deps.plugins.listStopReadinessProviders(operation)) {
+        this.deps.plugins
+          .requestStopReadiness({ pluginId, operation, signal })
+          .catch((error: unknown) => {
+            this.deps.logger.warn(
+              { err: error, pluginId, operation },
+              "Stop-readiness provider operation failed",
+            );
+          });
+      }
+    }
+  }
+
+  /**
+   * Waits up to the deadline for the daemon's own timeline deliveries and for
+   * every provider's `drain`. Whatever is still outstanding then is a failure.
+   */
+  async drainForShutdown(deadlineMs: number): Promise<ShutdownDrainResult> {
+    this.stopWork?.abort();
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), deadlineMs);
+    try {
+      const [deliveries, providerFailures] = await Promise.all([
+        this.deps.plugins.drainTimelineDeliveries(deadlineMs),
+        this.drainProviders(deadline.signal),
+      ]);
+      if (deliveries.status === "drained" && providerFailures.length === 0) {
+        return { status: "drained" };
+      }
+      return {
+        status: "failed",
+        deadlineMs,
+        failures: deliveries.status === "failed" ? deliveries.failures : [],
+        providerFailures,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async drainProviders(deadline: AbortSignal): Promise<ProviderDrainFailure[]> {
+    const pluginIds = this.deps.plugins.listStopReadinessProviders("drain");
+    const outcomes = await Promise.all(
+      pluginIds.map((pluginId) =>
+        settleBy(
+          this.deps.plugins.requestStopReadiness({
+            pluginId,
+            operation: "drain",
+            signal: deadline,
+          }),
+          deadline,
+        ).then((outcome) => ({ pluginId, outcome })),
+      ),
+    );
+    return outcomes.flatMap(({ pluginId, outcome }) => {
+      if (outcome.status === "resolved") return [];
+      this.deps.logger.error(
+        { pluginId, reason: outcome.status, err: outcome.error },
+        "Stop-readiness provider did not drain",
       );
-      return { status: "unavailable", reason: "invalid provider answer" };
-    }
-    return { status: "answered", pluginId, value: parsed.data };
+      return [{ pluginId, reason: outcome.status === "deadline" ? "deadline" : "rejected" }];
+    });
   }
 }
 
-function optionalReason(reason: string | undefined): { reason?: string } {
-  const sanitized = sanitizeReason(reason);
-  return sanitized === undefined ? {} : { reason: sanitized };
+type Settled =
+  | { status: "resolved" }
+  | { status: "rejected"; error: unknown }
+  | { status: "deadline"; error?: undefined };
+
+/** A drain that rejects because the deadline aborted it counts as missing the deadline. */
+function settleBy(promise: Promise<unknown>, deadline: AbortSignal): Promise<Settled> {
+  const expired = new Promise<Settled>((resolve) => {
+    if (deadline.aborted) resolve({ status: "deadline" });
+    deadline.addEventListener("abort", () => resolve({ status: "deadline" }), { once: true });
+  });
+  const settled = promise.then(
+    (): Settled => ({ status: "resolved" }),
+    (error: unknown): Settled =>
+      deadline.aborted ? { status: "deadline" } : { status: "rejected", error },
+  );
+  return Promise.race([settled, expired]);
 }

@@ -96,6 +96,18 @@ describe("daemon websocket URLs", () => {
       "wss://example.com:6767/ws",
     );
   });
+
+  test("puts /ws under the daemon's base path", () => {
+    expect(buildDaemonWebSocketUrl("dash.example:443", { useTls: true, basePath: "/s/abc/" })).toBe(
+      "wss://dash.example/s/abc/ws",
+    );
+    expect(
+      buildDaemonWebSocketUrl("dash.example:8080", { useTls: false, basePath: "/s/abc" }),
+    ).toBe("ws://dash.example:8080/s/abc/ws");
+    expect(() =>
+      buildDaemonWebSocketUrl("dash.example:443", { useTls: true, basePath: "/s/../x/" }),
+    ).toThrow("Invalid daemon base path");
+  });
 });
 
 describe("relay websocket URL versioning", () => {

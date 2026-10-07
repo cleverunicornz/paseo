@@ -147,6 +147,7 @@ test("a recorder that never answers within the deadline fails the drain and repo
           deliveredThrough: Math.min(...seqs) - 1,
         },
       ],
+      providerFailures: [],
     });
     const report = lines.find((line) => line.msg.startsWith("Timeline drain failed"));
     expect(report).toMatchObject({
@@ -158,6 +159,93 @@ test("a recorder that never answers within the deadline fails the drain and repo
     });
     expect(report?.msg).toContain(`agent ${agentId} epoch ${epoch}`);
     expect((await readEvents(directory)).filter((line) => line.startsWith("ack "))).toEqual([]);
+  } finally {
+    await removeDaemonFiles(daemon);
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 60_000);
+
+/** A plugin whose stop-readiness provider drains with `drainBody`; it logs to `events.log`. */
+async function writeDrainProviderPlugin(directory: string, drainBody: string): Promise<void> {
+  await writeFile(
+    path.join(directory, "paseo-plugin.json"),
+    JSON.stringify({ id: "harness", requirements: { paseo: ">=0.8.0" } }),
+  );
+  await writeFile(
+    path.join(directory, "index.server.ts"),
+    `
+import { appendFileSync } from "node:fs";
+const log = (line) => appendFileSync(${JSON.stringify(path.join(directory, "events.log"))}, line + "\\n");
+export default function contribute(server) {
+  server.registerStopReadiness({
+    readiness: () => ({ ready: false, timeline: { ready: false, epoch: null, emitted_through: null, acknowledged_through: null }, wip: { ready: false } }),
+    drain: async ({ signal }) => {
+${drainBody}
+    },
+  });
+  return () => log("cleanup");
+}
+`,
+  );
+}
+
+async function installPlugin(daemon: TestPaseoDaemon, directory: string): Promise<void> {
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws`, appVersion: "0.8.0" });
+  await client.connect();
+  await client.patchDaemonConfig({ pluginsEnabled: true });
+  await client.installDirectoryPlugin(directory);
+  await client.close();
+}
+
+test("shutdown waits for the stop-readiness provider's drain before stopping plugins", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "paseo-provider-drain-"));
+  await writeDrainProviderPlugin(
+    directory,
+    `      await new Promise((resolve) => setTimeout(resolve, 2000));
+      log("drained " + signal.aborted);`,
+  );
+  const daemon = await createTestPaseoDaemon({
+    daemonVersion: "0.8.0",
+    sessionRuntime: { timelineDrainMs: 30_000, singleAgent: false, webBasePath: "/" },
+  });
+  try {
+    await installPlugin(daemon, directory);
+
+    const result = await daemon.daemon.stop();
+
+    expect(await readEvents(directory)).toEqual(["drained false", "cleanup"]);
+    expect(result.timelineDrain).toEqual({ status: "drained" });
+  } finally {
+    await removeDaemonFiles(daemon);
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test("a provider drain unfinished at the deadline is aborted and fails the drain", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "paseo-provider-drain-"));
+  await writeDrainProviderPlugin(
+    directory,
+    `      await new Promise((_resolve, reject) => signal.addEventListener("abort", () => {
+        log("aborted");
+        reject(new Error("aborted"));
+      }));`,
+  );
+  const daemon = await createTestPaseoDaemon({
+    daemonVersion: "0.8.0",
+    sessionRuntime: { timelineDrainMs: 1_000, singleAgent: false, webBasePath: "/" },
+  });
+  try {
+    await installPlugin(daemon, directory);
+
+    const result = await daemon.daemon.stop();
+
+    expect(result.timelineDrain).toEqual({
+      status: "failed",
+      deadlineMs: 1_000,
+      failures: [],
+      providerFailures: [{ pluginId: "harness", reason: "deadline" }],
+    });
+    expect(await readEvents(directory)).toEqual(["aborted", "cleanup"]);
   } finally {
     await removeDaemonFiles(daemon);
     await rm(directory, { recursive: true, force: true });

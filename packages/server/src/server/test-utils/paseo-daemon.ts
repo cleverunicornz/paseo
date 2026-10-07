@@ -51,6 +51,7 @@ interface TestPaseoDaemonOptions {
   pluginsEnabled?: PaseoDaemonConfig["pluginsEnabled"];
   plugins?: PaseoDaemonConfig["plugins"];
   sessionRuntime?: PaseoDaemonConfig["sessionRuntime"];
+  mcpGatewayBackends?: PaseoDaemonConfig["mcpGatewayBackends"];
 }
 
 export interface TestPaseoDaemon {
@@ -204,7 +205,13 @@ async function prepareTestDaemonConfig(
     autoArchiveAfterMerge: options.autoArchiveAfterMerge,
     pluginsEnabled: options.pluginsEnabled,
     plugins: options.plugins,
-    sessionRuntime: options.sessionRuntime,
+    mcpGatewayBackends: options.mcpGatewayBackends,
+    // Tests close daemons whose plugins may never answer; keep the drain short.
+    sessionRuntime: options.sessionRuntime ?? {
+      timelineDrainMs: 2_000,
+      singleAgent: false,
+      webBasePath: "/",
+    },
   };
   return { config, paseoHomeRoot, paseoHome, staticDir };
 }

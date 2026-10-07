@@ -117,6 +117,8 @@ export interface WorkspaceCommandCenterSource {
     canPin: boolean;
     /** The workspace has setup commands or a setup error — same gate as the header menu. */
     canShowSetup: boolean;
+    /** False on a single-agent host that already has its agent. */
+    canCreateAgent: boolean;
   };
   activeTabKind: WorkspaceTabTarget["kind"] | null;
   activeTabIndex: number;
@@ -530,19 +532,22 @@ function buildWorkspaceCallback(input: {
 function buildCreationContributions(
   source: WorkspaceCommandCenterSource,
 ): CommandCenterContribution[] {
-  const contributions: CommandCenterContribution[] = [
-    buildWorkspaceAction({
-      source,
-      id: "tab:new-agent",
-      rank: 0,
-      title: source.labels.newAgent,
-      keywords: ["tab", "new", "agent", "chat"],
-      icon: source.icons.newAgent,
-      shortcutKeys: source.shortcuts.newAgent,
-      action: { id: "workspace.agent.new", scope: "workspace" },
-      visibility: "always",
-    }),
-  ];
+  const contributions: CommandCenterContribution[] = [];
+  if (source.capabilities.canCreateAgent) {
+    contributions.push(
+      buildWorkspaceAction({
+        source,
+        id: "tab:new-agent",
+        rank: 0,
+        title: source.labels.newAgent,
+        keywords: ["tab", "new", "agent", "chat"],
+        icon: source.icons.newAgent,
+        shortcutKeys: source.shortcuts.newAgent,
+        action: { id: "workspace.agent.new", scope: "workspace" },
+        visibility: "always",
+      }),
+    );
+  }
   const primary = source.gitActions.primary;
   if (primary) contributions.push(buildGitContribution(source, primary, 1, "always"));
   contributions.push(

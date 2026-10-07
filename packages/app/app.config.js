@@ -181,6 +181,7 @@ export default {
       ...(isProfileBuild ? [withAndroidProfileable] : []),
     ],
     experiments: {
+      ...(process.env.PASEO_WEB_BASE_URL ? { baseUrl: process.env.PASEO_WEB_BASE_URL } : {}),
       typedRoutes: true,
       reactCompiler: true,
       autolinkingModuleResolution: true,

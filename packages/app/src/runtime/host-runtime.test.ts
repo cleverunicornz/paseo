@@ -4259,6 +4259,49 @@ describe("HostRuntimeStore initial connection hint bootstrap", () => {
     store.syncHosts([]);
   });
 
+  it("connects under the base path the hint names, as its own connection", async () => {
+    const seen: { id: string; basePath?: string }[] = [];
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async ({ connection }) => {
+          if (connection.type === "directTcp") {
+            seen.push({ id: connection.id, basePath: connection.basePath });
+          }
+          return {
+            client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+            serverId: "srv_prefixed",
+            hostname: "prefixed host",
+          };
+        },
+        getClientId: async () => "cid_test_runtime",
+        readInitialConnectionHint: () => ({
+          listen: "dash.example:443",
+          useTls: true,
+          basePath: "/s/abc/",
+        }),
+      },
+      storage: createMemoryHostRuntimeStorage(),
+    });
+
+    const hostAdded = onceHostListMatches(store, () => store.getHosts().length > 0);
+    store.boot();
+    await hostAdded;
+
+    expect(seen).toContainEqual({ id: "direct:dash.example:443/s/abc/", basePath: "/s/abc/" });
+    expect(store.getHosts()[0]?.connections).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "direct:dash.example:443/s/abc/",
+          endpoint: "dash.example:443",
+          basePath: "/s/abc/",
+        }),
+      ]),
+    );
+
+    store.syncHosts([]);
+  });
+
   it("does not infer window.location.host when no explicit hint is present", async () => {
     const seenProbes: { endpoint: string; useTls?: boolean }[] = [];
     const firstProbe = createDeferred<void>();

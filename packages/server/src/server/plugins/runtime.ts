@@ -25,6 +25,7 @@ import type {
   PluginProcessRequest,
   PluginProviderMetadata,
   PluginStopReadinessCapabilities,
+  PluginStopReadinessOperation,
 } from "./plugin-process-protocol.js";
 import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
 import { PluginSessionSocket } from "./session-socket.js";
@@ -39,12 +40,22 @@ const MAX_LOG_LINE_BYTES = 16 * 1024;
 const SOFT_SHUTDOWN_TIMEOUT_MS = 2_000;
 const STOP_READINESS_TIMEOUT_MS = 10_000;
 const NO_STOP_READINESS: PluginStopReadinessCapabilities = {
-  timeline: false,
-  wip: false,
-  beginStopping: false,
+  readiness: false,
+  stop: false,
+  drain: false,
 };
 
-export type PluginStopReadinessPart = keyof PluginStopReadinessCapabilities;
+/** One gateway tool call a plugin asked the daemon to make on behalf of an agent. */
+export interface PluginGatewayToolCall {
+  pluginId: string;
+  backend: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  onBehalfOf: string;
+  timeoutMs: number;
+}
+
+export type PluginGatewayToolCaller = (call: PluginGatewayToolCall) => Promise<unknown>;
 
 interface PluginOutputStream {
   on(event: "data", listener: (chunk: Buffer | string) => void): this;
@@ -303,6 +314,7 @@ export class PluginRuntime {
   private sessionHost: PluginPaseoSessionHost | null;
   private readonly listeners = new Set<(pluginId: string, error?: string) => void>();
   private readonly timelineDeliveries = new TimelineDeliveryLedger();
+  private gatewayToolCaller: PluginGatewayToolCaller | null = null;
 
   constructor(
     logger: pino.Logger,
@@ -312,6 +324,11 @@ export class PluginRuntime {
     this.logger = logger.child({ module: "plugins" });
     this.spawnChild = dependencies.spawnChild ?? spawnPluginChild;
     this.sessionHost = dependencies.sessionHost ?? null;
+  }
+
+  /** How `server.mcp.callTool` reaches the gateway; bound once the agent manager exists. */
+  bindGatewayToolCaller(caller: PluginGatewayToolCaller): void {
+    this.gatewayToolCaller = caller;
   }
 
   bindPaseoSessionHost(sessionHost: PluginPaseoSessionHost): void {
@@ -535,10 +552,10 @@ export class PluginRuntime {
     return this.timelineDeliveries.drain(deadlineMs);
   }
 
-  /** Running plugins that provide a stop-readiness part, by plugin id. */
-  listStopReadinessProviders(part: PluginStopReadinessPart): string[] {
+  /** Running plugins that registered a stop-readiness provider with this operation, by id. */
+  listStopReadinessProviders(operation: PluginStopReadinessOperation): string[] {
     return [...this.plugins.values()]
-      .filter((loaded) => loaded.child && loaded.stopReadiness[part])
+      .filter((loaded) => loaded.child && loaded.stopReadiness[operation])
       .map((loaded) => loaded.id)
       .sort((left, right) => left.localeCompare(right));
   }
@@ -547,27 +564,74 @@ export class PluginRuntime {
     return this.timelineDeliveries.hasPending(pluginId);
   }
 
+  /**
+   * `readiness` answers within a short timeout. `stop` and `drain` run until
+   * the provider settles them; aborting `signal` aborts the provider's signal.
+   */
   async requestStopReadiness(input: {
     pluginId: string;
-    part: PluginStopReadinessPart;
-    stopping: boolean;
+    operation: PluginStopReadinessOperation;
+    signal?: AbortSignal;
   }): Promise<unknown> {
     const loaded = this.plugins.get(input.pluginId);
-    if (!loaded?.stopReadiness[input.part]) {
-      throw new Error(`Plugin ${input.pluginId} does not provide stop readiness ${input.part}`);
+    if (!loaded?.stopReadiness[input.operation]) {
+      throw new Error(
+        `Plugin ${input.pluginId} does not provide stop readiness ${input.operation}`,
+      );
     }
-    const context = {
-      stopping: input.stopping,
-      timeline: this.timelineDeliveries.describe(input.pluginId),
-    };
     const requestId = randomUUID();
-    return this.request(
-      loaded,
-      input.part === "beginStopping"
-        ? { type: "begin_stopping", requestId, context }
-        : { type: "stop_readiness", requestId, part: input.part, context },
-      { timeoutMs: STOP_READINESS_TIMEOUT_MS },
-    );
+    const cancel = () => {
+      if (loaded.child?.connected) {
+        void send(loaded.child, { type: "stop_readiness.cancel", requestId }).catch(() => {});
+      }
+    };
+    input.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      return await this.request(
+        loaded,
+        { type: "stop_readiness", requestId, operation: input.operation },
+        { timeoutMs: input.operation === "readiness" ? STOP_READINESS_TIMEOUT_MS : null },
+      );
+    } finally {
+      input.signal?.removeEventListener("abort", cancel);
+    }
+  }
+
+  private answerGatewayToolCall(
+    loaded: LoadedPlugin,
+    message: Extract<PluginProcessMessage, { type: "mcp.call_tool" }>,
+  ): void {
+    const caller = this.gatewayToolCaller;
+    const call = caller
+      ? caller({
+          pluginId: loaded.id,
+          backend: message.backend,
+          tool: message.tool,
+          arguments: message.arguments,
+          onBehalfOf: message.onBehalfOf,
+          timeoutMs: message.timeoutMs,
+        })
+      : Promise.reject(new Error("Gateway tool calls are unavailable"));
+    void call
+      .then(
+        (result): PluginProcessRequest => ({
+          type: "mcp.call_tool.result",
+          callId: message.callId,
+          ok: true,
+          result,
+        }),
+        (error: unknown): PluginProcessRequest => ({
+          type: "mcp.call_tool.result",
+          callId: message.callId,
+          ok: false,
+          error: describeError(error),
+        }),
+      )
+      .then((answer) => {
+        if (loaded.child?.connected) return send(loaded.child, answer);
+        return undefined;
+      })
+      .catch(() => undefined);
   }
 
   async before<Name extends keyof PluginBeforeRequests>(
@@ -870,6 +934,10 @@ export class PluginRuntime {
     }
     if (message.type.startsWith("provider.")) {
       this.handleProviderMessage(loaded, message);
+      return;
+    }
+    if (message.type === "mcp.call_tool") {
+      this.answerGatewayToolCall(loaded, message);
       return;
     }
     if (message.type !== "result" && message.type !== "error") return;
