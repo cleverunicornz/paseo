@@ -35,6 +35,9 @@ import { CodexAppServerAgentClient } from "./codex-app-server-agent.js";
  */
 const CLAUDE_SDK_CHILD_VARIABLES = new Set(["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"]);
 
+/** The start of the argv the Claude Agent SDK gives a Claude Code session process. */
+const CLAUDE_SESSION_ARGV = "--output-format stream-json";
+
 const ALLOWLIST: HarnessEnvironment = { kind: "allowlist", envPassthrough: PASSTHROUGH };
 
 interface ProcessRecord {
@@ -222,13 +225,13 @@ const HARNESS_PATHS: HarnessPath[] = [
   {
     name: "Claude draft session started without a launch context",
     provider: "claude",
-    starts: ["--version"],
+    starts: ["--version", CLAUDE_SESSION_ARGV],
     run: (client, cwd) => runClaudeSession(client, cwd),
   },
   {
     name: "Claude agent session started without a gateway route",
     provider: "claude",
-    starts: ["--version"],
+    starts: ["--version", CLAUDE_SESSION_ARGV],
     launchValues: (cwd) => paseoLaunchValues("agent-claude", cwd),
     run: (client, cwd) => runClaudeSession(client, cwd, plainLaunch("agent-claude", cwd)),
   },
@@ -345,6 +348,40 @@ describe("without a gateway route every harness process inherits as before", () 
       }
       expect(record.env.UNLISTED_SETTING, label).toBe("unlisted");
     });
+  });
+});
+
+/** A stand-in login shell that records every start and answers the `type -a` lookup. */
+function useRecordingShell(root: string): string {
+  const recordPath = join(root, "shell.jsonl");
+  const shell = join(root, "sh");
+  writeFileSync(shell, `#!${process.execPath}\n${RECORD_PROCESS(recordPath)}\nprocess.exit(0);\n`);
+  chmodSync(shell, 0o755);
+  const saved = process.env.SHELL;
+  process.env.SHELL = shell;
+  restores.push(() => {
+    if (saved === undefined) delete process.env.SHELL;
+    else process.env.SHELL = saved;
+  });
+  return recordPath;
+}
+
+describe("a gateway provider's diagnostic looks its binary up from the allowlisted environment", () => {
+  test.each(["claude", "codex"] as const)("%s login-shell lookup", async (provider) => {
+    const root = createRoot(`shell-${provider}`);
+    const fake = provider === "claude" ? createRecordingClaude(root) : createRecordingCodex(root);
+    restores.push(inheritOnDaemonProcess());
+    const shellRecords = useRecordingShell(root);
+    const client =
+      provider === "claude"
+        ? claudeClient(fake.binary, ALLOWLIST)
+        : codexClient(fake.binary, ALLOWLIST);
+
+    await client.getDiagnostic!();
+
+    const records = readProcessRecords(shellRecords);
+    expect(records.map((record) => record.argv)).toEqual([["-lc", `type -a '${provider}'`]]);
+    expect(records[0].env).toEqual(expectedAllowlistedEnv({ daemonEnv: process.env }));
   });
 });
 
