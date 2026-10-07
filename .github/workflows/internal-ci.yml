@@ -76,6 +76,14 @@ jobs:
           cd packages/app && npx vitest run src/runtime/host-features.test.ts src/runtime/host-runtime.test.ts src/types/host-connection.test.ts src/command-center/workspace-contributions.test.ts
       - name: Build bundled web UI
         run: npm run build:daemon-web-ui
+      - name: Keep the built packages for the browser check
+        run: tar -czf "$RUNNER_TEMP/paseo-dist.tgz" packages/*/dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paseo-dist-${{ github.run_id }}
+          path: ${{ runner.temp }}/paseo-dist.tgz
+          retention-days: 1
+          if-no-files-found: error
       - name: Pack release packages
         shell: bash
         run: |
@@ -101,7 +109,9 @@ jobs:
           gh release create "$RELEASE_TAG" "$RUNNER_TEMP/paseo-release/"* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes 'Source-built daemon packages. Package names and protocol remain compatible with the upstream release. Install all seven packages together; SHA256SUMS and SHA512SUMS bind the assets. SOURCE_COMMIT and NODE_VERSION retain build identity.'
 
   web-ui-base-path:
-    # The browser comes from the pinned Playwright image, which needs a Docker daemon.
+    # The browser comes from the pinned Playwright image, which needs a Docker daemon. The web UI
+    # export does not fit this runner's memory, so the daemon job's build is reused.
+    needs: daemon
     runs-on: { group: ci, labels: build-docker }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -116,10 +126,12 @@ jobs:
           echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
-      - name: Build daemon and bundled web UI
-        run: |
-          npm run build:server
-          npm run build:daemon-web-ui
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: paseo-dist-${{ github.run_id }}
+          path: ${{ runner.temp }}
+      - name: Unpack the daemon job's built packages and web UI
+        run: tar -xzf "$RUNNER_TEMP/paseo-dist.tgz"
       - name: Load the web UI under /s/x/ behind a prefix proxy in Chromium
         shell: bash
         run: |
