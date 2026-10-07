@@ -1068,6 +1068,23 @@ test("disallowedTools flows through to runtime settings", () => {
   });
 });
 
+test("builtinTools flows to runtime settings and a derived provider inherits it", () => {
+  buildProviderRegistry(logger, {
+    providerOverrides: {
+      claude: { builtinTools: "off" },
+      work: { extends: "claude", label: "Work" },
+      play: { extends: "claude", label: "Play", builtinTools: "on" },
+    },
+  });
+
+  const builtinTools = mockState.constructorArgs.claude.map((entry) =>
+    typeof entry.runtimeSettings === "object" && entry.runtimeSettings !== null
+      ? Reflect.get(entry.runtimeSettings, "builtinTools")
+      : undefined,
+  );
+  expect(builtinTools.sort()).toEqual(["off", "off", "on"]);
+});
+
 test("derived provider inherits and merges disallowedTools from base", () => {
   buildProviderRegistry(logger, {
     providerOverrides: {

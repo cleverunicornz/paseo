@@ -98,7 +98,7 @@ export const FILE_EXPLORER_STREAM_CHUNK_BYTES = 256 * 1024;
 export const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
 const READ_FILE_OPEN_FLAGS =
   process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
-const ACCESS_OUTSIDE_WORKSPACE_MESSAGE = "Access outside of workspace is not allowed";
+export const ACCESS_OUTSIDE_WORKSPACE_MESSAGE = "Access outside of workspace is not allowed";
 
 function fileRevision(stats: BigIntStats): string {
   return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}`;
@@ -800,7 +800,13 @@ async function isCaseOnlyRename(
   return isSameEntry && source.requestedPath.toLowerCase() === targetPath.toLowerCase();
 }
 
-async function resolveScopedPath({
+/**
+ * Resolves `relativePath` against the workspace `root` and refuses any path
+ * that leaves it, lexically or through a symlink. A path that does not exist
+ * yet is judged by its nearest existing ancestor, so creating it cannot land
+ * outside the workspace through a symlinked directory either.
+ */
+export async function resolveScopedPath({
   root,
   relativePath = ".",
 }: ScopedPathParams): Promise<ScopedPath> {
@@ -813,12 +819,48 @@ async function resolveScopedPath({
     assertWithinWorkspace(canonicalRoot, canonicalPath);
     return { requestedPath, resolvedPath: canonicalPath };
   } catch (error) {
-    if (isMissingEntryError(error)) return { requestedPath, resolvedPath: requestedPath };
-    throw error;
+    if (!isMissingEntryError(error)) throw error;
+    // The entry itself may be a dangling symlink, which callers can still
+    // remove or rename; every directory above it must resolve in the workspace.
+    await assertMissingPathWithinWorkspace(canonicalRoot, path.dirname(requestedPath));
+    return { requestedPath, resolvedPath: requestedPath };
   }
 }
 
-function assertWithinWorkspace(root: string, candidate: string): void {
+/**
+ * Judges a directory path that does not resolve by the nearest entry on it
+ * that exists. That entry must resolve inside the workspace: a dangling
+ * symlink on the way is refused, since creating the path would follow it.
+ */
+async function assertMissingPathWithinWorkspace(
+  canonicalRoot: string,
+  missingPath: string,
+): Promise<void> {
+  let candidate = missingPath;
+  for (;;) {
+    try {
+      await fs.lstat(candidate);
+    } catch (error) {
+      const parent = path.dirname(candidate);
+      if (!isMissingEntryError(error) || parent === candidate) throw error;
+      candidate = parent;
+      continue;
+    }
+    let canonicalCandidate: string;
+    try {
+      canonicalCandidate = await fs.realpath(candidate);
+    } catch (error) {
+      if (isMissingEntryError(error)) {
+        throw new Error(ACCESS_OUTSIDE_WORKSPACE_MESSAGE, { cause: error });
+      }
+      throw error;
+    }
+    assertWithinWorkspace(canonicalRoot, canonicalCandidate);
+    return;
+  }
+}
+
+export function assertWithinWorkspace(root: string, candidate: string): void {
   const relative = path.relative(root, candidate);
   if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) return;
   throw new Error(ACCESS_OUTSIDE_WORKSPACE_MESSAGE);

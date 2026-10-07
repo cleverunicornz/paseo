@@ -318,6 +318,11 @@ export interface CreateAgentOptions {
   owner?: AgentOwner;
 }
 
+/** What a launch knows of its agent before the agent is registered. */
+export interface LaunchingAgent {
+  workspaceId: string | null;
+}
+
 export interface AgentManagerOptions {
   pluginLifecycle?: PluginLifecycle;
   clients?: ProviderClientMap;
@@ -341,6 +346,13 @@ export interface AgentManagerOptions {
   mcpGatewayEnvPassthrough?: readonly string[];
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
+  /**
+   * Writes the agent's tool tree and returns its location, or null when there
+   * is none. It completes before the harness launches, which gets the location
+   * as `PASEO_TOOL_TREE`; a rejection fails the launch. While it runs the
+   * agent is reported by `getLaunchingAgent`.
+   */
+  prepareToolTree?: (agentId: string) => Promise<string | null>;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
@@ -765,6 +777,9 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private mcpGatewayBaseUrl: string | null = null;
+  private readonly prepareToolTree: (agentId: string) => Promise<string | null>;
+  /** Agents whose launch is preparing their tool tree, possibly before they are registered. */
+  private readonly launchingAgents = new Map<string, LaunchingAgent>();
   private readonly agentTokens: AgentTokenRegistry;
   private readonly modelGatewaySettings: ModelGatewaySettings;
   private paseoToolsEnabled = true;
@@ -790,6 +805,7 @@ export class AgentManager {
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
+    this.prepareToolTree = options.prepareToolTree ?? (async () => null);
     this.agentTokens = options.agentTokens ?? new AgentTokenRegistry();
     this.modelGatewaySettings = resolveModelGatewaySettings(options);
     this.configurePaseoTools(options);
@@ -1194,6 +1210,16 @@ export class AgentManager {
   getAgent(id: string): ManagedAgent | null {
     const agent = this.agents.get(id);
     return agent ? { ...agent } : null;
+  }
+
+  /**
+   * An agent whose launch is preparing its tool tree. Its token is already
+   * valid, and the tree lists the gateway's backends as this agent, which may
+   * not be registered yet.
+   */
+  getLaunchingAgent(id: string): LaunchingAgent | null {
+    const launching = this.launchingAgents.get(id);
+    return launching ? { ...launching } : null;
   }
 
   async waitForAgentClose(agentId: string): Promise<void> {
@@ -5289,12 +5315,23 @@ export class AgentManager {
       const transformed = await this.pluginLifecycle.before("agent.session_open", request);
       env = transformed.env;
     }
+    const launching: LaunchingAgent = { workspaceId: opening?.workspaceId ?? null };
+    this.launchingAgents.set(agentId, launching);
+    let toolTreeDir: string | null;
+    try {
+      toolTreeDir = await this.prepareToolTree(agentId);
+    } finally {
+      if (this.launchingAgents.get(agentId) === launching) {
+        this.launchingAgents.delete(agentId);
+      }
+    }
     const context: AgentLaunchContext = {
       agentId,
       env: {
         ...env,
         PASEO_AGENT_ID: agentId,
         PASEO_AGENT_CWD: cwd,
+        ...(toolTreeDir ? { PASEO_TOOL_TREE: toolTreeDir } : {}),
       },
     };
     const modelGateway = this.resolveModelGateway(agentId, client);

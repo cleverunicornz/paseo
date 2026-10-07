@@ -24,6 +24,7 @@ import {
   MCP_GATEWAY_ENV_PASSTHROUGH_ENTRY_PATTERN_SOURCE,
   isAcceptedEnvPassthroughEntry,
 } from "./agent/model-gateway-env.js";
+import { LocalToolsConfigSchema, ToolTreeConfigSchema } from "./local-tools/config.js";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
 export const LogFormatSchema = z.enum(["pretty", "json"]);
@@ -292,6 +293,8 @@ export const PersistedConfigSchema = z
               })
               .strict()
               .optional(),
+            localTools: LocalToolsConfigSchema.optional(),
+            toolTree: ToolTreeConfigSchema.optional(),
           })
           .passthrough()
           .optional(),

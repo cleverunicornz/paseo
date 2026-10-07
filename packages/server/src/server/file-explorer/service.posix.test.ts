@@ -4,7 +4,12 @@ import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { getDownloadableFileInfo, listDirectoryEntries, readExplorerFile } from "./service.js";
+import {
+  getDownloadableFileInfo,
+  listDirectoryEntries,
+  readExplorerFile,
+  resolveScopedPath,
+} from "./service.js";
 import { isPlatform } from "../../test-utils/platform.js";
 
 async function createTempDir(prefix: string): Promise<string> {
@@ -32,6 +37,37 @@ describe.skipIf(isPlatform("win32"))("service POSIX-only", () => {
       expect(names).not.toContain("AGENTS.md");
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a new path under a symlinked directory that resolves outside the workspace", async () => {
+    const root = await createTempDir("paseo-file-explorer-");
+    const outsideRoot = await createTempDir("paseo-file-explorer-outside-");
+
+    try {
+      await symlink(outsideRoot, path.join(root, "outside-link"));
+      await symlink(path.join(outsideRoot, "missing"), path.join(root, "dangling-dir"));
+
+      await expect(
+        resolveScopedPath({ root, relativePath: "outside-link/new/file.txt" }),
+      ).rejects.toThrow("Access outside of workspace is not allowed");
+      await expect(
+        resolveScopedPath({ root, relativePath: "dangling-dir/file.txt" }),
+      ).rejects.toThrow("Access outside of workspace is not allowed");
+      // A dangling link itself stays addressable, so it can be removed.
+      await expect(resolveScopedPath({ root, relativePath: "dangling-dir" })).resolves.toEqual({
+        requestedPath: path.join(root, "dangling-dir"),
+        resolvedPath: path.join(root, "dangling-dir"),
+      });
+      await expect(
+        resolveScopedPath({ root, relativePath: "inside/new/file.txt" }),
+      ).resolves.toEqual({
+        requestedPath: path.join(root, "inside/new/file.txt"),
+        resolvedPath: path.join(root, "inside/new/file.txt"),
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(outsideRoot, { recursive: true, force: true });
     }
   });
 

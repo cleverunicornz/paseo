@@ -22,10 +22,17 @@ export const ProviderCommandSchema = z.discriminatedUnion("mode", [
   ProviderCommandReplaceSchema,
 ]);
 
+/**
+ * Whether the harness keeps its own built-in tools (shell, file edits, web,
+ * sub-agents). `off` leaves the agent with its MCP tools only; unset is `on`.
+ */
+export const ProviderBuiltinToolsSchema = z.enum(["on", "off"]);
+
 export const ProviderRuntimeSettingsSchema = z.object({
   command: ProviderCommandSchema.optional(),
   env: z.record(z.string(), z.string()).optional(),
   disallowedTools: z.array(z.string()).optional(),
+  builtinTools: ProviderBuiltinToolsSchema.optional(),
 });
 
 export const ProviderPaseoToolsPolicySchema = z.object({
@@ -58,6 +65,7 @@ export const ProviderOverrideSchema = z.object({
   models: z.array(ProviderProfileModelSchema).optional(),
   additionalModels: z.array(ProviderProfileModelSchema).optional(),
   disallowedTools: z.array(z.string()).optional(),
+  builtinTools: ProviderBuiltinToolsSchema.optional(),
   paseoTools: ProviderPaseoToolsPolicySchema.optional(),
   enabled: z.boolean().optional(),
   order: z.number().optional(),

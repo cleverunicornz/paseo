@@ -140,6 +140,8 @@ import {
   type PaseoToolHostDependencies,
 } from "./agent/tools/paseo-tools.js";
 import type { PaseoToolRuntimeContext } from "./agent/tools/types.js";
+import type { LocalToolsConfig, ToolTreeConfig } from "./local-tools/config.js";
+import { createLocalToolsRuntime } from "./local-tools/runtime.js";
 import { createAgentProviderRuntime } from "./agent/provider-runtime.js";
 import { bootstrapWorkspaceRegistries } from "./workspace-registry-bootstrap.js";
 import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
@@ -263,6 +265,16 @@ function createAgentMcpBaseUrl(listenTarget: ListenTarget | null): string | null
     "/mcp/agents",
     `http://${formatHostForHttpUrl(host)}:${listenTarget.port}`,
   ).toString();
+}
+
+function isToolsListRequest(body: unknown): boolean {
+  const messages = Array.isArray(body) ? body : [body];
+  return messages.some(
+    (message) =>
+      typeof message === "object" &&
+      message !== null &&
+      (message as { method?: unknown }).method === "tools/list",
+  );
 }
 
 function createLoopbackDaemonUrl(
@@ -416,6 +428,10 @@ export interface PaseoDaemonConfig {
   mcpGatewayModelBackends?: Record<string, string>;
   /** Names and `NAME_*` prefixes a gateway harness may inherit beyond the base variables. */
   mcpGatewayEnvPassthrough?: string[];
+  /** The Codex executable serving the local tools; absent or null, they are off. */
+  localTools?: LocalToolsConfig | null;
+  /** Per-agent tool trees. */
+  toolTree?: ToolTreeConfig;
   browserToolsEnabled?: boolean;
   git?: {
     maxProcessesPerSecond: number;
@@ -952,6 +968,26 @@ export async function createPaseoDaemon(
     const git = daemonConfigStore.get().git;
     if (git) configureGitProcessPolicy(git);
   });
+  const localToolsRuntime = createLocalToolsRuntime({
+    paseoHome: config.paseoHome,
+    localTools: config.localTools,
+    toolTree: config.toolTree,
+    envPassthrough: config.mcpGatewayEnvPassthrough,
+    gatewayBackends: config.mcpGatewayBackends,
+    modelBackends: config.mcpGatewayModelBackends,
+    managedProcesses,
+    logger,
+    issueAgentToken: (agentId) => agentManager.issueAgentToken(agentId),
+    getAgentMcpUrl: () => createAgentMcpBaseUrl(boundListenTarget),
+    getGatewayBaseUrl: () => createLoopbackDaemonUrl(boundListenTarget, MCP_GATEWAY_ROUTE),
+    createAgentCatalog: async (agentId) =>
+      createPaseoToolCatalog(
+        createAgentToolHostDependencies({
+          callerAgentId: agentId,
+          paseoToolPolicy: agentManager.getPaseoToolPolicy(agentId),
+        }),
+      ),
+  });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
   const agentManager = new AgentManager({
     pluginLifecycle: pluginRuntime,
@@ -967,7 +1003,13 @@ export async function createPaseoDaemon(
     mcpGatewayEnvPassthrough: config.mcpGatewayEnvPassthrough,
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
+    prepareToolTree: localToolsRuntime.prepareToolTree,
     logger,
+  });
+  agentManager.subscribe((event) => {
+    if (event.type === "agent_state") {
+      localToolsRuntime.onAgentState({ id: event.agent.id, lifecycle: event.agent.lifecycle });
+    }
   });
   const mcpGatewayBackends: ReadonlyMap<string, McpGatewayBackend> = new Map(
     Object.entries(config.mcpGatewayBackends ?? {}),
@@ -977,15 +1019,20 @@ export async function createPaseoDaemon(
       getBackends: () => mcpGatewayBackends,
       resolveAgent: (token) => {
         const agentId = agentTokens.resolve(token);
-        const agent = agentId ? agentManager.getAgent(agentId) : null;
-        if (!agent) {
+        if (!agentId) {
           return null;
         }
-        return {
-          agentId: agent.id,
-          sessionId: agent.persistence?.sessionId ?? null,
-          workspaceId: agent.workspaceId ?? null,
-        };
+        const agent = agentManager.getAgent(agentId);
+        if (agent) {
+          return {
+            agentId: agent.id,
+            sessionId: agent.persistence?.sessionId ?? null,
+            workspaceId: agent.workspaceId ?? null,
+          };
+        }
+        // Before registration a launch lists the backends for the agent's tool tree.
+        const launching = agentManager.getLaunchingAgent(agentId);
+        return launching ? { agentId, sessionId: null, workspaceId: launching.workspaceId } : null;
       },
       serverId,
       resolveUpstream: (request) => pluginRuntime.before("mcp_gateway.upstream", request),
@@ -1471,6 +1518,7 @@ export async function createPaseoDaemon(
     createPaseoWorktree: createAgentCommandDependencies.createPaseoWorktree,
     browserToolsEnabled: browserToolsPolicy.isEnabled(),
     browserToolsBroker,
+    localTools: localToolsRuntime.host,
     paseoToolPolicy:
       runtime.paseoToolPolicy ??
       (runtime.callerAgentId ? agentManager.getPaseoToolPolicy(runtime.callerAgentId) : undefined),
@@ -1578,6 +1626,9 @@ export async function createPaseoDaemon(
         }
         // The caller is the agent its token names.
         const { server, transport } = await createAgentMcpSession(authorization.callerAgentId);
+        if (authorization.callerAgentId && isToolsListRequest(req.body)) {
+          localToolsRuntime.onToolsListed(authorization.callerAgentId);
+        }
         res.on("close", () => {
           void transport.close();
           void server.close();
@@ -1848,6 +1899,7 @@ export async function createPaseoDaemon(
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
     await closeAllAgents(logger, agentManager);
+    await localToolsRuntime.close();
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();
     await agentStorage.flush().catch(() => undefined);
