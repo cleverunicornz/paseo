@@ -285,10 +285,11 @@ tool the agent is shown: `servers/paseo/` for Paseo's tools and `servers/<backen
 backend's (backends named in `modelBackends` carry model traffic and are left out). Each file exports
 a typed function, and `client.ts` calls the tool through Paseo with the run variables above. The
 harness gets the directory as `PASEO_TOOL_TREE`: `$PASEO_HOME/tool-trees/<agentId>` unless `dir`
-names another parent. Paseo writes the tree with Paseo's tools before the harness starts, so the
-directory exists when the agent first looks. The gateway answers only for a running agent, so the
-backends' files follow once the agent is registered. Paseo checks the tree whenever the agent lists
-its tools, rewriting it only when the list changed.
+names another parent. Paseo writes the whole tree, Paseo's tools and every backend's, before the
+harness starts, so the agent's first listing shows every tool. When a backend cannot be listed then,
+the launch fails with an error naming the backend. Paseo checks the tree again whenever the agent
+lists its tools, rewriting it only when the list changed; a backend that does not answer at that
+point is left out until the next check.
 
 File and function names come from tool names: a character other than a letter, digit or `_`
 becomes `_`, and a file name compares without case. When two tools would share a file or an

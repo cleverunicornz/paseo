@@ -1019,15 +1019,20 @@ export async function createPaseoDaemon(
       getBackends: () => mcpGatewayBackends,
       resolveAgent: (token) => {
         const agentId = agentTokens.resolve(token);
-        const agent = agentId ? agentManager.getAgent(agentId) : null;
-        if (!agent) {
+        if (!agentId) {
           return null;
         }
-        return {
-          agentId: agent.id,
-          sessionId: agent.persistence?.sessionId ?? null,
-          workspaceId: agent.workspaceId ?? null,
-        };
+        const agent = agentManager.getAgent(agentId);
+        if (agent) {
+          return {
+            agentId: agent.id,
+            sessionId: agent.persistence?.sessionId ?? null,
+            workspaceId: agent.workspaceId ?? null,
+          };
+        }
+        // Before registration a launch lists the backends for the agent's tool tree.
+        const launching = agentManager.getLaunchingAgent(agentId);
+        return launching ? { agentId, sessionId: null, workspaceId: launching.workspaceId } : null;
       },
       serverId,
       resolveUpstream: (request) => pluginRuntime.before("mcp_gateway.upstream", request),

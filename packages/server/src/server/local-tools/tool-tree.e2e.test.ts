@@ -100,6 +100,7 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
   let backend: http.Server;
   let port: number;
   let backendHasExtraTool = false;
+  let backendFails = false;
   const launches: RecordedLaunch[] = [];
 
   beforeAll(async () => {
@@ -109,6 +110,10 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
     await mkdir(path.join(root, "static"));
 
     backend = http.createServer((req, res) => {
+      if (backendFails) {
+        res.writeHead(503).end();
+        return;
+      }
       void serveFixtureBackend(req, res, backendHasExtraTool);
     });
     await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
@@ -154,13 +159,15 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
     const tree = path.join(paseoHome, "tool-trees", agent.id);
     const launch = launches.at(-1);
     expect(launch?.context?.env?.PASEO_TOOL_TREE).toBe(tree);
-    // The tree exists with Paseo's tools before the harness starts.
+    // The whole tree, Paseo's tools and every backend's, exists before the harness starts.
     expect(launch?.treeFilesAtLaunch).toEqual(
-      expect.arrayContaining(["client.ts", "servers/paseo/exec.ts", "servers/paseo/read_file.ts"]),
+      expect.arrayContaining([
+        "client.ts",
+        "servers/paseo/exec.ts",
+        "servers/paseo/read_file.ts",
+        "servers/fixture/whoami.ts",
+      ]),
     );
-    // The gateway answers for the agent once it is registered; its backends follow.
-    await waitForPath(path.join(tree, "servers/fixture/whoami.ts"));
-    expect(existsSync(path.join(tree, "servers/paseo/exec.ts"))).toBe(true);
 
     const token = daemon.agentManager.issueAgentToken(agent.id);
     const client = new Client({ name: "tree-test", version: "1.0.0" });
@@ -201,5 +208,24 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
     } finally {
       await client.close();
     }
+  });
+
+  test("an agent whose backends cannot be listed is not launched", async () => {
+    const cwd = path.join(root, "workspace-unlisted");
+    await mkdir(cwd);
+    const launchesBefore = launches.length;
+    backendFails = true;
+    try {
+      await expect(
+        daemon.agentManager.createAgent(
+          { provider: "claude", cwd, title: "Unlisted backend agent" },
+          undefined,
+          { workspaceId: undefined },
+        ),
+      ).rejects.toThrow(/tool tree.*fixture/s);
+    } finally {
+      backendFails = false;
+    }
+    expect(launches.length).toBe(launchesBefore);
   });
 });

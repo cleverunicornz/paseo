@@ -268,6 +268,27 @@ describe.skipIf(!codexPath)("local tools through /mcp/agents (real Codex app ser
     });
   });
 
+  test("exec keeps the byte bound when output is not valid UTF-8", async () => {
+    // Each invalid byte decodes to U+FFFD, three bytes wide.
+    const command = ["sh", "-c", "printf 'a\\377\\377'"];
+    for (const [maxOutputBytes, stdout, truncated] of [
+      [1, "a", true],
+      [3, "a", true],
+      [4, "a�", true],
+      [7, "a��", false],
+    ] as const) {
+      const result = await a.ok("exec", { command, maxOutputBytes });
+      expect(result.stdout).toBe(stdout);
+      expect(Buffer.byteLength(String(result.stdout))).toBeLessThanOrEqual(maxOutputBytes);
+      expect(result.stdoutTruncated).toBe(truncated);
+    }
+    const single = await a.ok("exec", {
+      command: ["sh", "-c", "printf '\\377'"],
+      maxOutputBytes: 1,
+    });
+    expect(single).toMatchObject({ stdout: "", stdoutTruncated: true });
+  });
+
   test("write_file, read_file and list_dir work inside the workspace", async () => {
     expect(
       await a.ok("write_file", { path: "notes/today.txt", content: "alpha\nbeta\ngamma\n" }),

@@ -28,20 +28,18 @@ export interface ToolTreeServiceOptions {
   logger: Logger;
 }
 
-/**
- * What a refresh lists: everything, or Paseo's catalogue alone with the
- * backends as last listed. The gateway answers only for a registered agent,
- * so the tree written before an agent's first launch has no backends yet.
- */
-export type ToolTreeRefreshScope = "all" | "paseo";
+export interface ToolTreeRefreshOptions {
+  /**
+   * Fail when any backend cannot be listed instead of leaving it out. The
+   * tree written before a launch is strict: the agent starts with every tool
+   * or not at all.
+   */
+  strict?: boolean;
+}
 
 interface RefreshState {
   running: Promise<void>;
-  again: ToolTreeRefreshScope | null;
-}
-
-function widerScope(a: ToolTreeRefreshScope | null, b: ToolTreeRefreshScope): ToolTreeRefreshScope {
-  return a === "all" || b === "all" ? "all" : "paseo";
+  again: Required<ToolTreeRefreshOptions> | null;
 }
 
 /**
@@ -51,7 +49,6 @@ function widerScope(a: ToolTreeRefreshScope | null, b: ToolTreeRefreshScope): To
  */
 export class ToolTreeService {
   private readonly refreshes = new Map<string, RefreshState>();
-  private readonly backendServers = new Map<string, ToolTreeServer[]>();
 
   constructor(private readonly options: ToolTreeServiceOptions) {}
 
@@ -62,14 +59,18 @@ export class ToolTreeService {
     return path.join(this.options.rootDir, agentId);
   }
 
-  /** Regenerates the agent's tree; overlapping requests coalesce into one more pass. */
-  refresh(agentId: string, scope: ToolTreeRefreshScope = "all"): Promise<void> {
+  /**
+   * Regenerates the agent's tree; overlapping requests coalesce into one more
+   * pass, strict when any of them is.
+   */
+  refresh(agentId: string, options: ToolTreeRefreshOptions = {}): Promise<void> {
+    const strict = options.strict === true;
     const current = this.refreshes.get(agentId);
     if (current) {
-      current.again = widerScope(current.again, scope);
+      current.again = { strict: strict || current.again?.strict === true };
       return current.running;
     }
-    const state: RefreshState = { running: Promise.resolve(), again: scope };
+    const state: RefreshState = { running: Promise.resolve(), again: { strict } };
     state.running = (async () => {
       try {
         while (state.again) {
@@ -94,45 +95,47 @@ export class ToolTreeService {
 
   async remove(agentId: string): Promise<void> {
     await this.refreshes.get(agentId)?.running.catch(() => undefined);
-    this.backendServers.delete(agentId);
     await rm(this.dirFor(agentId), { recursive: true, force: true });
   }
 
-  private async writeTree(agentId: string, scope: ToolTreeRefreshScope): Promise<void> {
+  private async writeTree(agentId: string, pass: Required<ToolTreeRefreshOptions>): Promise<void> {
     const servers: ToolTreeServer[] = [
       { name: PASEO_TOOL_TREE_SERVER, tools: await this.options.listPaseoTools(agentId) },
+      ...(await this.listBackends(agentId, pass.strict)),
     ];
-    if (scope === "all") {
-      this.backendServers.set(agentId, await this.listBackends(agentId));
-    }
-    servers.push(...(this.backendServers.get(agentId) ?? []));
     const { written } = await writeToolTree(this.dirFor(agentId), servers);
     if (written) {
       this.options.logger.debug({ agentId }, "Tool tree written");
     }
   }
 
-  private async listBackends(agentId: string): Promise<ToolTreeServer[]> {
+  private async listBackends(agentId: string, strict: boolean): Promise<ToolTreeServer[]> {
     const backends = this.options
       .listBackendNames()
       .filter((backend) => backend !== PASEO_TOOL_TREE_SERVER);
-    const listings = await Promise.all(
-      backends.map((backend) =>
-        this.listBackendTools(agentId, backend).catch((error: unknown) => {
-          // A backend that does not answer now is left out until the next refresh.
-          this.options.logger.warn(
-            { err: error, agentId, backend },
-            "Could not list an MCP backend's tools for the tool tree",
-          );
-          return null;
-        }),
-      ),
+    const listings = await Promise.allSettled(
+      backends.map((backend) => this.listBackendTools(agentId, backend)),
     );
     const servers: ToolTreeServer[] = [];
-    backends.forEach((backend, index) => {
-      const tools = listings[index];
-      if (tools) servers.push({ name: backend, tools });
+    const failures: string[] = [];
+    listings.forEach((listing, index) => {
+      const backend = backends[index]!;
+      if (listing.status === "fulfilled") {
+        servers.push({ name: backend, tools: listing.value });
+        return;
+      }
+      const reason =
+        listing.reason instanceof Error ? listing.reason.message : String(listing.reason);
+      failures.push(`${backend}: ${reason}`);
+      // Outside a launch, a backend that does not answer now is left out until the next refresh.
+      this.options.logger.warn(
+        { err: listing.reason, agentId, backend },
+        "Could not list an MCP backend's tools for the tool tree",
+      );
     });
+    if (strict && failures.length > 0) {
+      throw new Error(`Could not list the MCP backends' tools (${failures.join("; ")})`);
+    }
     return servers;
   }
 

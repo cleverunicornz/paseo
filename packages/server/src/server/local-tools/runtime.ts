@@ -33,11 +33,12 @@ export interface LocalToolsRuntime {
   /** Present when the local tools are on. */
   host: LocalToolsHost | null;
   /**
-   * Writes the agent's tree before its harness launches and returns where it
-   * is; null when trees are off or it could not be written.
+   * Writes the agent's whole tree, Paseo's tools and every gateway backend's,
+   * before its harness launches and returns where it is; null when trees are
+   * off. Rejects when the tree cannot be completed: the launch fails.
    */
   prepareToolTree: (agentId: string) => Promise<string | null>;
-  /** An agent appeared or changed: a new agent's tree is written; a closed agent's is removed. */
+  /** An agent changed: a closed agent's tree is removed. */
   onAgentState: (agent: { id: string; lifecycle: string }) => void;
   /** The agent listed its tools: its tree follows what it was shown. */
   onToolsListed: (agentId: string) => void;
@@ -94,8 +95,6 @@ export function createLocalToolsRuntime(options: LocalToolsRuntimeOptions): Loca
   const processes = executor ? new LocalProcessRegistry(executor) : null;
   /** Agents with a tree on disk. */
   const treeAgents = new Set<string>();
-  /** Agents whose tree has listed the gateway's backends since they registered. */
-  const listedAgents = new Set<string>();
 
   function resolveToolTreeDir(agentId: string): string | null {
     return toolTree ? toolTree.dirFor(agentId) : null;
@@ -130,30 +129,23 @@ export function createLocalToolsRuntime(options: LocalToolsRuntimeOptions): Loca
       if (!toolTree) return null;
       treeAgents.add(agentId);
       try {
-        // Before its first launch the agent is unknown to the gateway; its
-        // backends join the tree once it registers (onAgentState).
-        await toolTree.refresh(agentId, "paseo");
+        await toolTree.refresh(agentId, { strict: true });
       } catch (error) {
-        logger.warn({ err: error, agentId }, "Failed to write the agent's tool tree before launch");
-        return null;
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`Could not write the tool tree for agent ${agentId}: ${reason}`, {
+          cause: error,
+        });
       }
       return toolTree.dirFor(agentId);
     },
     onAgentState(agent) {
       if (agent.lifecycle === "closed") {
         void processes?.releaseAgent(agent.id);
-        listedAgents.delete(agent.id);
         if (toolTree && treeAgents.delete(agent.id)) {
           void toolTree.remove(agent.id).catch((error: unknown) => {
             logger.warn({ err: error, agentId: agent.id }, "Failed to remove a tool tree");
           });
         }
-        return;
-      }
-      if (toolTree && !listedAgents.has(agent.id)) {
-        treeAgents.add(agent.id);
-        listedAgents.add(agent.id);
-        toolTree.scheduleRefresh(agent.id);
       }
     },
     onToolsListed(agentId) {

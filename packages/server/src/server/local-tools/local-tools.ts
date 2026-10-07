@@ -126,14 +126,19 @@ function toolResult(value: unknown): PaseoToolResult {
   return { content: [], structuredContent: ensureValidJson(value) };
 }
 
-/** UTF-8 text of at most `maxBytes` bytes, cut on a character start so the cut never decodes wider. */
+/**
+ * Text of at most `maxBytes` UTF-8 bytes. The bound applies to the decoded
+ * text: an invalid byte decodes to U+FFFD, three bytes wide. The cut falls on
+ * a character start.
+ */
 function truncateBytes(bytes: Buffer, maxBytes: number): { text: string; truncated: boolean } {
-  if (bytes.length <= maxBytes) {
-    return { text: bytes.toString("utf8"), truncated: false };
+  const decoded = Buffer.from(bytes.toString("utf8"), "utf8");
+  if (decoded.length <= maxBytes) {
+    return { text: decoded.toString("utf8"), truncated: false };
   }
   let end = maxBytes;
-  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
-  return { text: bytes.subarray(0, end).toString("utf8"), truncated: true };
+  while (end > 0 && ((decoded[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return { text: decoded.subarray(0, end).toString("utf8"), truncated: true };
 }
 
 function displayPath(root: string, target: string): string {
