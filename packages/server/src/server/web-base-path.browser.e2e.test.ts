@@ -24,7 +24,13 @@ beforeAll(async () => {
     sessionRuntime: { timelineDrainMs: 2_000, singleAgent: false, webBasePath: "/s/x/" },
   });
   proxy = await startPrefixProxy({ prefix: "/s/x/", targetPort: daemon.port });
-  browser = await chromium.launch();
+  // CI serves Chromium from the pinned Playwright image (`PLAYWRIGHT_WS_ENDPOINT`);
+  // locally, `CHROMIUM_PATH` names an installed Chromium.
+  const endpoint = process.env.PLAYWRIGHT_WS_ENDPOINT;
+  const executablePath = process.env.CHROMIUM_PATH;
+  browser = endpoint
+    ? await chromium.connect(endpoint)
+    : await chromium.launch(executablePath ? { executablePath } : {});
 }, 60_000);
 
 afterAll(async () => {

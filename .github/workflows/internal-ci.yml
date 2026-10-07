@@ -18,6 +18,9 @@ permissions:
 env:
   ONNXRUNTIME_NODE_INSTALL: skip
   ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+  # Playwright 1.58.2 with its browsers (matches the lockfile's playwright-core), pinned by digest
+  # as in the dashboard's UI tests.
+  PLAYWRIGHT_IMAGE: mcr.microsoft.com/playwright:v1.58.2-noble@sha256:6446946a1d9fd62d9ae501312a2d76a43ee688542b21622056a372959b65d63d
 
 jobs:
   daemon:
@@ -73,11 +76,6 @@ jobs:
           cd packages/app && npx vitest run src/runtime/host-features.test.ts src/runtime/host-runtime.test.ts src/types/host-connection.test.ts src/command-center/workspace-contributions.test.ts
       - name: Build bundled web UI
         run: npm run build:daemon-web-ui
-      - name: Check the bundled web UI under a base path behind a proxy
-        working-directory: packages/server
-        run: |
-          npx playwright install --with-deps chromium
-          npx vitest run src/server/web-base-path.browser.e2e.test.ts --maxWorkers=1
       - name: Pack release packages
         shell: bash
         run: |
@@ -101,3 +99,39 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/internal/main
           gh release create "$RELEASE_TAG" "$RUNNER_TEMP/paseo-release/"* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes 'Source-built daemon packages. Package names and protocol remain compatible with the upstream release. Install all seven packages together; SHA256SUMS and SHA512SUMS bind the assets. SOURCE_COMMIT and NODE_VERSION retain build identity.'
+
+  web-ui-base-path:
+    # The browser comes from the pinned Playwright image, which needs a Docker daemon.
+    runs-on: { group: ci, labels: build-docker }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install verified Node 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --output /tmp/paseo-node.tar.xz https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+          echo 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de  /tmp/paseo-node.tar.xz' | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/paseo-node"
+          tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
+          echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build daemon and bundled web UI
+        run: |
+          npm run build:server
+          npm run build:daemon-web-ui
+      - name: Load the web UI under /s/x/ behind a prefix proxy in Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The image's Chromium, driven by the lockfile's playwright-core over loopback.
+          docker run -d --name playwright-browser --network host --init \
+            -v "$PWD/node_modules:/pw/node_modules:ro" "$PLAYWRIGHT_IMAGE" \
+            node /pw/node_modules/playwright-core/cli.js run-server --port 39123 --host 127.0.0.1
+          trap 'docker logs playwright-browser || true; docker rm -f playwright-browser >/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/39123) 2>/dev/null; then break; fi
+            sleep 1
+          done
+          cd packages/server
+          PLAYWRIGHT_WS_ENDPOINT=ws://127.0.0.1:39123/ npx vitest run src/server/web-base-path.browser.e2e.test.ts --maxWorkers=1

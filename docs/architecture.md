@@ -457,7 +457,7 @@ Providers whose harness can point its model client at another endpoint set `supp
 2. Session routes to `AgentManager.create()`
 3. AgentManager creates a `ManagedAgent`, initializes provider session
 4. Provider runs the agent → emits `AgentStreamEvent` items
-5. Events append to the agent timeline, broadcast to all subscribed clients. Assistant and reasoning chunks coalesce before a row gets its `seq`; `AgentManager.dispatchStream` then hands each live row to plugins as `agent.timeline_item` without waiting, so a slow plugin never delays the agent. Rows replayed from provider history skip the hook.
+5. Events append to the agent timeline, broadcast to all subscribed clients. Assistant and reasoning chunks coalesce before a row gets its `seq`; `AgentManager.dispatchStream` then hands each live row to plugins as `agent.timeline_item` without waiting, so a slow plugin never delays the agent. The plugin runtime tracks each delivery until the plugin answers (`server/plugins/timeline-deliveries.ts`), and shutdown waits for those deliveries before it stops plugins. Rows replayed from provider history skip the hook.
 6. Tool calls are normalized to `ToolCallDetail` (shell, read, edit, write, search, etc.)
 7. Permission requests flow: agent → server → client → user decision → server → agent
 
