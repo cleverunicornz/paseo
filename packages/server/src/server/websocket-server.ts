@@ -1882,7 +1882,8 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(daemonSelfUpdate): added in v0.1.93, remove gate after 2026-12-13.
         daemonSelfUpdate: false,
         // COMPAT(agentForkContext): added in v0.1.102, remove gate after 2026-12-28.
-        agentForkContext: true,
+        // A single-agent daemon refuses forks, so it does not advertise them.
+        agentForkContext: !this.agentManager.isSingleAgent(),
         // COMPAT(agentForkContextCursor): added in v0.1.108, remove gate after 2027-01-14.
         agentForkContextCursor: true,
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
@@ -1937,6 +1938,8 @@ export class VoiceAssistantWebSocketServer {
         agentProfiles: true,
         // COMPAT(agentConfigApply): added in v0.3.2, remove gate after 2027-02-11.
         agentConfigApply: true,
+        // A mode, not a capability: the daemon refuses a second live agent.
+        ...(this.agentManager.isSingleAgent() ? { singleAgent: true } : {}),
       },
     };
   }

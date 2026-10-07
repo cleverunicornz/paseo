@@ -22,7 +22,8 @@ import type { DaemonConfigStore } from "../daemon-config-store.js";
 import { type ManagedPluginCandidate, ManagedPluginSources } from "./managed-source.js";
 import { readPluginManifest } from "./manifest.js";
 import { runPluginBuild } from "./preparation.js";
-import { PluginRuntime } from "./runtime.js";
+import { PluginRuntime, type PluginStopReadinessPart } from "./runtime.js";
+import type { TimelineDrainResult } from "./timeline-deliveries.js";
 import type { PluginProviderMetadata } from "./plugin-process-protocol.js";
 import { readPluginProviderIcon } from "./provider-icon.js";
 
@@ -42,6 +43,14 @@ interface PluginRuntimePort {
   startPlugin(pluginId: string, path: string, canPublish: () => boolean): Promise<void>;
   stopPluginById(pluginId: string): Promise<boolean>;
   stopAll(): Promise<void>;
+  drainTimelineDeliveries?(deadlineMs: number): Promise<TimelineDrainResult>;
+  listStopReadinessProviders?(part: PluginStopReadinessPart): string[];
+  hasPendingTimelineDeliveries?(pluginId: string): boolean;
+  requestStopReadiness?(input: {
+    pluginId: string;
+    part: PluginStopReadinessPart;
+    stopping: boolean;
+  }): Promise<unknown>;
   subscribe(listener: (pluginId: string, error?: string) => void): () => void;
   bindPaseoSessionHost(sessionHost: Parameters<PluginRuntime["bindPaseoSessionHost"]>[0]): void;
 }
@@ -414,6 +423,31 @@ export class PluginService {
 
   invokePluginRpc(pluginId: string, method: string, input: unknown): Promise<unknown> {
     return this.runtime.invoke(pluginId, method, input);
+  }
+
+  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult> {
+    return (
+      this.runtime.drainTimelineDeliveries?.(deadlineMs) ?? Promise.resolve({ status: "drained" })
+    );
+  }
+
+  listStopReadinessProviders(part: PluginStopReadinessPart): string[] {
+    return this.runtime.listStopReadinessProviders?.(part) ?? [];
+  }
+
+  hasPendingTimelineDeliveries(pluginId: string): boolean {
+    return this.runtime.hasPendingTimelineDeliveries?.(pluginId) ?? false;
+  }
+
+  requestStopReadiness(input: {
+    pluginId: string;
+    part: PluginStopReadinessPart;
+    stopping: boolean;
+  }): Promise<unknown> {
+    if (!this.runtime.requestStopReadiness) {
+      return Promise.reject(new Error("Plugin stop readiness is unavailable"));
+    }
+    return this.runtime.requestStopReadiness(input);
   }
 
   async stopAllPlugins(): Promise<void> {

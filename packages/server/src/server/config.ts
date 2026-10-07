@@ -24,6 +24,7 @@ import { hashDaemonPassword } from "./auth.js";
 import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
+import { resolveSessionRuntimeConfig } from "./session-runtime-config.js";
 import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
 import {
   parseMcpGatewayBackends,
@@ -692,6 +693,7 @@ export function resolveConfigFromPersisted(
     mcpGatewayModelBackends: resolveMcpGatewayModelBackends(env, persisted),
     mcpGatewayEnvPassthrough: resolveMcpGatewayEnvPassthrough(env, persisted),
     ...resolveLocalToolsSettings(env, persisted),
+    sessionRuntime: resolveSessionRuntimeConfig(env, persisted),
     browserToolsEnabled,
     git: resolveGitProcessConfig(env, persisted),
     autoArchiveAfterMerge,
@@ -771,9 +773,18 @@ function resolveDaemonOverrideControlledPaths(
 ): string[] {
   return [
     ...resolveCoreDaemonOverridePaths(env, cli),
+    ...resolveSessionRuntimeOverridePaths(env),
     ...resolveRelayOverridePaths(env, cli),
     ...resolveServiceAndWebUiOverridePaths(env, cli),
   ];
+}
+
+function resolveSessionRuntimeOverridePaths(env: NodeJS.ProcessEnv): string[] {
+  const paths: string[] = [];
+  if (env.PASEO_TIMELINE_DRAIN_MS !== undefined) paths.push("daemon.shutdown.timelineDrainMs");
+  if (env.PASEO_SINGLE_AGENT !== undefined) paths.push("daemon.singleAgent");
+  if (env.PASEO_WEB_BASE_PATH !== undefined) paths.push("daemon.web.basePath");
+  return paths;
 }
 
 function resolveCoreDaemonOverridePaths(

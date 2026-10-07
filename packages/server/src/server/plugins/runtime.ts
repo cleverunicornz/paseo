@@ -24,9 +24,11 @@ import type {
   PluginProcessMessage,
   PluginProcessRequest,
   PluginProviderMetadata,
+  PluginStopReadinessCapabilities,
 } from "./plugin-process-protocol.js";
 import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
 import { PluginSessionSocket } from "./session-socket.js";
+import { TimelineDeliveryLedger, type TimelineDrainResult } from "./timeline-deliveries.js";
 
 const CLIENT_ENTRY_FILENAMES = ["index.client.ts", "index.client.tsx"] as const;
 const SERVER_ENTRY_FILENAMES = ["index.server.ts", "index.server.tsx"] as const;
@@ -35,6 +37,14 @@ const MAX_LOG_ENTRIES = 500;
 const MAX_LOG_BYTES = 256 * 1024;
 const MAX_LOG_LINE_BYTES = 16 * 1024;
 const SOFT_SHUTDOWN_TIMEOUT_MS = 2_000;
+const STOP_READINESS_TIMEOUT_MS = 10_000;
+const NO_STOP_READINESS: PluginStopReadinessCapabilities = {
+  timeline: false,
+  wip: false,
+  beginStopping: false,
+};
+
+export type PluginStopReadinessPart = keyof PluginStopReadinessCapabilities;
 
 interface PluginOutputStream {
   on(event: "data", listener: (chunk: Buffer | string) => void): this;
@@ -55,7 +65,7 @@ interface PluginChild {
 interface PendingInvocation {
   resolve: (output: unknown) => void;
   reject: (error: Error) => void;
-  timeout: ReturnType<typeof setTimeout>;
+  timeout: ReturnType<typeof setTimeout> | null;
 }
 
 interface LoadedPlugin {
@@ -65,6 +75,7 @@ interface LoadedPlugin {
   methods: ReadonlySet<string>;
   hooks: { events: string[]; before: string[] };
   providers: readonly PluginProviderMetadata[];
+  stopReadiness: PluginStopReadinessCapabilities;
   child: PluginChild | null;
   outputCapture: PluginOutputCapture | null;
   pending: Map<string, PendingInvocation>;
@@ -291,6 +302,7 @@ export class PluginRuntime {
   private readonly spawnChild: () => PluginChild;
   private sessionHost: PluginPaseoSessionHost | null;
   private readonly listeners = new Set<(pluginId: string, error?: string) => void>();
+  private readonly timelineDeliveries = new TimelineDeliveryLedger();
 
   constructor(
     logger: pino.Logger,
@@ -450,6 +462,10 @@ export class PluginRuntime {
       if (!loaded.hooks.events.includes(name)) {
         continue;
       }
+      if (name === "agent.timeline_item") {
+        this.deliverTimelineItem(loaded, event as PluginLifecycleEvents["agent.timeline_item"]);
+        continue;
+      }
       void this.request(loaded, {
         type: "hook",
         requestId: randomUUID(),
@@ -464,6 +480,94 @@ export class PluginRuntime {
         );
       });
     }
+  }
+
+  /**
+   * A timeline item stays tracked until its plugin answers. It has no per-call
+   * timeout: a slow recorder is waited for, and shutdown bounds the wait with
+   * its drain deadline instead of dropping the item.
+   */
+  private deliverTimelineItem(
+    loaded: LoadedPlugin,
+    event: PluginLifecycleEvents["agent.timeline_item"],
+  ): void {
+    const delivery = {
+      pluginId: loaded.id,
+      agentId: event.agent.id,
+      epoch: event.epoch,
+      seq: event.seq,
+    };
+    this.timelineDeliveries.sent(delivery);
+    let request: Promise<unknown>;
+    try {
+      request = this.request(
+        loaded,
+        {
+          type: "hook",
+          requestId: randomUUID(),
+          kind: "event",
+          name: "agent.timeline_item",
+          input: event,
+        },
+        { timeoutMs: null },
+      );
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    request.then(
+      () => this.timelineDeliveries.acknowledged(delivery),
+      (error) => {
+        this.timelineDeliveries.failed(delivery);
+        this.appendLog(
+          loaded.id,
+          "stderr",
+          `Lifecycle hook agent.timeline_item failed for agent ${delivery.agentId} seq ${delivery.seq}: ${describeError(error)}`,
+        );
+      },
+    );
+  }
+
+  /**
+   * Waits for every timeline item still in flight to any plugin, up to the
+   * deadline. Plugins keep running meanwhile; stop them only afterwards.
+   */
+  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult> {
+    return this.timelineDeliveries.drain(deadlineMs);
+  }
+
+  /** Running plugins that provide a stop-readiness part, by plugin id. */
+  listStopReadinessProviders(part: PluginStopReadinessPart): string[] {
+    return [...this.plugins.values()]
+      .filter((loaded) => loaded.child && loaded.stopReadiness[part])
+      .map((loaded) => loaded.id)
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  hasPendingTimelineDeliveries(pluginId: string): boolean {
+    return this.timelineDeliveries.hasPending(pluginId);
+  }
+
+  async requestStopReadiness(input: {
+    pluginId: string;
+    part: PluginStopReadinessPart;
+    stopping: boolean;
+  }): Promise<unknown> {
+    const loaded = this.plugins.get(input.pluginId);
+    if (!loaded?.stopReadiness[input.part]) {
+      throw new Error(`Plugin ${input.pluginId} does not provide stop readiness ${input.part}`);
+    }
+    const context = {
+      stopping: input.stopping,
+      timeline: this.timelineDeliveries.describe(input.pluginId),
+    };
+    const requestId = randomUUID();
+    return this.request(
+      loaded,
+      input.part === "beginStopping"
+        ? { type: "begin_stopping", requestId, context }
+        : { type: "stop_readiness", requestId, part: input.part, context },
+      { timeoutMs: STOP_READINESS_TIMEOUT_MS },
+    );
   }
 
   async before<Name extends keyof PluginBeforeRequests>(
@@ -517,22 +621,26 @@ export class PluginRuntime {
   private request(
     loaded: LoadedPlugin,
     message: Extract<PluginProcessRequest, { requestId: string }>,
+    options: { timeoutMs: number | null } = { timeoutMs: REQUEST_TIMEOUT_MS },
   ): Promise<unknown> {
     const child = loaded.child;
     const pluginId = loaded.id;
     if (!child) throw new Error(`Plugin ${pluginId} has no server entry`);
     const requestId = message.requestId;
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        loaded.pending.delete(requestId);
-        if (message.type === "hook") {
-          void send(child, { type: "hook.cancel", requestId }).catch(() => {});
-        }
-        reject(new Error(`Plugin RPC timed out: ${pluginId}.${message.type}`));
-      }, REQUEST_TIMEOUT_MS);
+      const timeout =
+        options.timeoutMs === null
+          ? null
+          : setTimeout(() => {
+              loaded.pending.delete(requestId);
+              if (message.type === "hook") {
+                void send(child, { type: "hook.cancel", requestId }).catch(() => {});
+              }
+              reject(new Error(`Plugin RPC timed out: ${pluginId}.${message.type}`));
+            }, options.timeoutMs);
       loaded.pending.set(requestId, { resolve, reject, timeout });
       void send(child, message).catch((error) => {
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         loaded.pending.delete(requestId);
         reject(error);
       });
@@ -566,6 +674,7 @@ export class PluginRuntime {
         methods: new Set(),
         hooks: { events: [], before: [] },
         providers: [],
+        stopReadiness: NO_STOP_READINESS,
         child: null,
         outputCapture: null,
         pending: new Map(),
@@ -674,6 +783,7 @@ export class PluginRuntime {
       methods: new Set(ready.methods),
       hooks: ready.hooks ?? { events: [], before: [] },
       providers: ready.providers ?? [],
+      stopReadiness: ready.stopReadiness ?? NO_STOP_READINESS,
       child,
       outputCapture,
       pending,
@@ -766,7 +876,7 @@ export class PluginRuntime {
     const pending = loaded.pending.get(message.requestId);
     if (!pending) return;
     loaded.pending.delete(message.requestId);
-    clearTimeout(pending.timeout);
+    if (pending.timeout) clearTimeout(pending.timeout);
     if (message.type === "result") pending.resolve(message.output);
     else pending.reject(new Error(message.error));
   }
@@ -1121,7 +1231,7 @@ export class PluginRuntime {
 
   private rejectPending(loaded: LoadedPlugin, message: string): void {
     for (const invocation of loaded.pending.values()) {
-      clearTimeout(invocation.timeout);
+      if (invocation.timeout) clearTimeout(invocation.timeout);
       invocation.reject(new Error(message));
     }
     loaded.pending.clear();

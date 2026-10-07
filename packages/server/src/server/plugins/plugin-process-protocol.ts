@@ -5,6 +5,7 @@ import type {
   ProviderInput,
 } from "@getpaseo/plugin/server/provider";
 import { ProviderEventSchema, ProviderInputSchema } from "@getpaseo/plugin/server/provider";
+import type { PluginStopContext } from "@getpaseo/plugin/server";
 import { z } from "zod";
 
 export interface PluginProviderMetadata {
@@ -14,6 +15,16 @@ export interface PluginProviderMetadata {
   description?: string;
   iconPath?: string;
 }
+
+/** Which stop-readiness parts a plugin's server entry provides. */
+export interface PluginStopReadinessCapabilities {
+  timeline: boolean;
+  wip: boolean;
+  beginStopping: boolean;
+}
+
+/** The stop context as it crosses the process boundary; the child adds its own `paseo`. */
+export type PluginStopContextPayload = Omit<PluginStopContext, "paseo">;
 
 export type PluginProcessRequest =
   | {
@@ -32,6 +43,13 @@ export type PluginProcessRequest =
   | { type: "hook"; requestId: string; kind: "event" | "before"; name: string; input: unknown }
   | { type: "hook.cancel"; requestId: string }
   | { type: "invoke"; requestId: string; method: string; input: unknown }
+  | {
+      type: "stop_readiness";
+      requestId: string;
+      part: "timeline" | "wip";
+      context: PluginStopContextPayload;
+    }
+  | { type: "begin_stopping"; requestId: string; context: PluginStopContextPayload }
   | {
       type: "provider.connect";
       providerId: string;
@@ -57,6 +75,7 @@ export type PluginProcessMessage =
       methods: string[];
       providers: PluginProviderMetadata[];
       hooks?: { events: string[]; before: string[] };
+      stopReadiness?: PluginStopReadinessCapabilities;
     }
   | { type: "result"; requestId: string; output: unknown }
   | { type: "error"; requestId: string; error: string }
@@ -96,6 +115,26 @@ const providerConnectRequestSchema = z
     versions: z.array(z.number().int().positive()),
     capabilities: z.array(z.string()),
   })
+  .strict();
+const stopContextSchema = z
+  .object({
+    stopping: z.boolean(),
+    timeline: z.array(
+      z
+        .object({
+          agentId: z.string(),
+          epoch: z.string(),
+          emittedThrough: z.number().int(),
+          deliveredThrough: z.number().int(),
+          pending: z.number().int().nonnegative(),
+          failed: z.number().int().nonnegative(),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+const stopReadinessCapabilitiesSchema = z
+  .object({ timeline: z.boolean(), wip: z.boolean(), beginStopping: z.boolean() })
   .strict();
 const frameFields = {
   data: z.union([z.string(), z.instanceof(Uint8Array)]),
@@ -143,6 +182,21 @@ export const PluginProcessRequestSchema: z.ZodType<PluginProcessRequest> = z.dis
     z.object({ type: z.literal("hook.cancel"), requestId: z.string() }).strict(),
     z
       .object({
+        type: z.literal("stop_readiness"),
+        requestId: z.string().min(1),
+        part: z.enum(["timeline", "wip"]),
+        context: stopContextSchema,
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("begin_stopping"),
+        requestId: z.string().min(1),
+        context: stopContextSchema,
+      })
+      .strict(),
+    z
+      .object({
         type: z.literal("invoke"),
         requestId: z.string().min(1),
         method: z.string().min(1),
@@ -183,6 +237,7 @@ export const PluginProcessMessageSchema: z.ZodType<PluginProcessMessage> = z.dis
         methods: z.array(z.string()),
         providers: z.array(providerMetadataSchema),
         hooks: hooksSchema.optional(),
+        stopReadiness: stopReadinessCapabilitiesSchema.optional(),
       })
       .strict(),
     z

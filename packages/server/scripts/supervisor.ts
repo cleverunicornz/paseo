@@ -7,7 +7,7 @@ import {
 import { signalProcessTree } from "../src/utils/tree-kill.js";
 
 const WORKER_HEARTBEAT_INTERVAL_MS = 1_000;
-const WORKER_TERMINATION_GRACE_MS = 10_000;
+const DEFAULT_WORKER_TERMINATION_GRACE_MS = 10_000;
 
 interface SupervisorLogFileOptions {
   path: string;
@@ -56,6 +56,13 @@ interface SupervisorOptions {
   onWorkerReady?: (message: { listen: string; serverId: string }) => Promise<void> | void;
   onWorkerExit?: () => Promise<void> | void;
   restartOnCrash?: boolean;
+  /** How long a worker asked to shut down may take before it is killed. */
+  workerTerminationGraceMs?: number;
+  /**
+   * Worker exit statuses that report a shutdown problem; on a requested
+   * shutdown the supervisor exits with them instead of 0.
+   */
+  reportedShutdownExitCodes?: readonly number[];
   onSupervisorExit?: () => Promise<void> | void;
   logFile?: SupervisorLogFileOptions;
 }
@@ -168,6 +175,9 @@ function createDurableLog(
 
 export function runSupervisor(options: SupervisorOptions): SupervisorController {
   const restartOnCrash = options.restartOnCrash ?? false;
+  const workerTerminationGraceMs =
+    options.workerTerminationGraceMs ?? DEFAULT_WORKER_TERMINATION_GRACE_MS;
+  const reportedShutdownExitCodes = new Set(options.reportedShutdownExitCodes ?? []);
   const workerArgs = options.workerArgs ?? process.argv.slice(2);
   const workerEnv = options.workerEnv ?? process.env;
   const workerExecArgv = options.workerExecArgv ?? ["--import", "tsx"];
@@ -257,7 +267,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
           workerPid: currentChild.pid ?? null,
         });
       });
-    }, WORKER_TERMINATION_GRACE_MS);
+    }, workerTerminationGraceMs);
     forceKillTimer.unref();
   };
 
@@ -386,7 +396,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
         if (shuttingDown) {
           log(`Worker exited (${exitDescriptor}). Supervisor shutting down.`);
-          exitSupervisor(0);
+          exitSupervisor(code !== null && reportedShutdownExitCodes.has(code) ? code : 0);
           return;
         }
 

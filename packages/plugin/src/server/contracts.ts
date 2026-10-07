@@ -4,6 +4,7 @@ import type { PluginRpcContract } from "../rpc.js";
 import type { PluginCleanup } from "../contracts.js";
 import type { ProviderRegistration } from "./provider.js";
 import type { PluginLifecycleRegistration } from "./lifecycle.js";
+import type { PluginStopReadinessProvider } from "./stop-readiness.js";
 
 export interface PluginHandlerContext {
   paseo: PaseoApi;
@@ -38,6 +39,8 @@ export interface PluginServerContext extends PluginLifecycleRegistration {
     ) => ZodInput<OutputSchema> | Promise<ZodInput<OutputSchema>>,
   ): void;
   registerProvider(provider: ProviderRegistration): void;
+  /** Call during setup. See `PluginStopReadinessProvider`. */
+  registerStopReadiness(provider: PluginStopReadinessProvider): void;
 }
 
 export type PluginServerContribution = (server: PluginServerContext) => PluginCleanup;

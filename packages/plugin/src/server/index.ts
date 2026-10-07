@@ -18,3 +18,10 @@ export type {
   PluginBeforeRequests,
   PluginLifecycleRegistration,
 } from "./lifecycle.js";
+export type {
+  PluginStopContext,
+  PluginStopReadinessProvider,
+  PluginStopTimelineStream,
+  PluginTimelineStopReadiness,
+  PluginWipStopReadiness,
+} from "./stop-readiness.js";

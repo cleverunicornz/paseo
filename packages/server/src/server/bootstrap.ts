@@ -206,6 +206,12 @@ import { terminateWithTreeKill } from "../utils/tree-kill.js";
 import { withTimeout } from "../utils/promise-timeout.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
+  DEFAULT_SESSION_RUNTIME_CONFIG,
+  type SessionRuntimeConfig,
+} from "./session-runtime-config.js";
+import { StopReadinessService } from "./stop-readiness.js";
+import type { TimelineDrainResult } from "./plugins/timeline-deliveries.js";
+import {
   createRequireBearerMiddleware,
   authorizeAgentMcpRequest,
   type DaemonAuthConfig,
@@ -432,6 +438,8 @@ export interface PaseoDaemonConfig {
   localTools?: LocalToolsConfig | null;
   /** Per-agent tool trees. */
   toolTree?: ToolTreeConfig;
+  /** Shutdown drain, single-agent mode and the web base path. */
+  sessionRuntime?: SessionRuntimeConfig;
   browserToolsEnabled?: boolean;
   git?: {
     maxProcessesPerSecond: number;
@@ -496,6 +504,11 @@ export interface PaseoDaemonConfig {
   };
 }
 
+export interface DaemonStopResult {
+  /** Whether every timeline item reached its plugins before they stopped. */
+  timelineDrain: TimelineDrainResult;
+}
+
 export interface PaseoDaemon {
   config: PaseoDaemonConfig;
   agentManager: AgentManager;
@@ -505,7 +518,7 @@ export interface PaseoDaemon {
   scriptRuntimeStore: WorkspaceScriptRuntimeStore;
   browserToolsBroker: BrowserToolsBroker;
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(): Promise<DaemonStopResult>;
   getListenTarget(): ListenTarget | null;
   getServerId(): string;
 }
@@ -620,6 +633,7 @@ export async function createPaseoDaemon(
   const bootstrapStart = performance.now();
   const elapsed = () => `${(performance.now() - bootstrapStart).toFixed(0)}ms`;
   const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
+  const sessionRuntime = resolveSessionRuntime(config);
   const initialMutableConfig = createInitialMutableDaemonConfig(config);
   const daemonConfigStore = new DaemonConfigStore(config.paseoHome, initialMutableConfig, logger, {
     relayEnabledMutable: config.relayEnabledMutable ?? true,
@@ -1004,7 +1018,28 @@ export async function createPaseoDaemon(
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     prepareToolTree: localToolsRuntime.prepareToolTree,
+    singleAgent: sessionRuntime.singleAgent,
     logger,
+  });
+  const stopReadiness = new StopReadinessService({
+    plugins: pluginRuntime,
+    stopAcceptingWork: () => agentManager.beginStopping(),
+    logger,
+  });
+  // Control endpoints for whatever stops this daemon's host, behind the same
+  // Host allowlist and daemon password as the rest of /api.
+  app.get("/api/stop-readiness", (_req, res) => {
+    stopReadiness.readiness().then(
+      (answer) => res.json(answer),
+      (error: unknown) => {
+        logger.error({ err: error }, "Failed to answer stop readiness");
+        res.status(500).json({ error: "Stop readiness unavailable" });
+      },
+    );
+  });
+  app.post("/api/begin-stopping", (_req, res) => {
+    stopReadiness.beginStopping();
+    res.status(202).json({ stopping: true });
   });
   agentManager.subscribe((event) => {
     if (event.type === "agent_state") {
@@ -1904,6 +1939,12 @@ export async function createPaseoDaemon(
     detachAgentStoragePersistence();
     await agentStorage.flush().catch(() => undefined);
     await agentProviderRuntime.shutdown();
+    // Every agent is closed and its last timeline items emitted. Plugins stay up
+    // until they acknowledged those items or the drain deadline passed.
+    const timelineDrain = await pluginRuntime.drainTimelineDeliveries(
+      sessionRuntime.timelineDrainMs,
+    );
+    reportTimelineDrain(logger, timelineDrain);
     await pluginRuntime.stopAllPlugins();
     terminalManager.killAll();
     await speechService.stop();
@@ -1928,6 +1969,7 @@ export async function createPaseoDaemon(
     if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
       unlinkSync(listenTarget.path);
     }
+    return { timelineDrain };
   };
 
   return {
@@ -1943,6 +1985,23 @@ export async function createPaseoDaemon(
     getListenTarget: () => boundListenTarget,
     getServerId: () => serverId,
   };
+}
+
+function resolveSessionRuntime(config: PaseoDaemonConfig): SessionRuntimeConfig {
+  return config.sessionRuntime ?? DEFAULT_SESSION_RUNTIME_CONFIG;
+}
+
+function reportTimelineDrain(logger: Logger, result: TimelineDrainResult): void {
+  if (result.status === "drained") {
+    logger.info("Timeline drain complete: every timeline item was acknowledged");
+    return;
+  }
+  for (const failure of result.failures) {
+    logger.error(
+      { ...failure, deadlineMs: result.deadlineMs },
+      `Timeline drain failed: plugin ${failure.pluginId} did not acknowledge agent ${failure.agentId} epoch ${failure.epoch} through seq ${failure.highestUnacknowledgedSeq}`,
+    );
+  }
 }
 
 /**
