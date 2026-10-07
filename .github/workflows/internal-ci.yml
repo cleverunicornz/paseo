@@ -136,13 +136,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The image's Chromium, driven by the lockfile's playwright-core over loopback.
-          docker run -d --name playwright-browser --network host --init \
-            -v "$PWD/node_modules:/pw/node_modules:ro" "$PLAYWRIGHT_IMAGE" \
-            node /pw/node_modules/playwright-core/cli.js run-server --port 39123 --host 127.0.0.1
+          # The image's Chromium, driven by the lockfile's playwright-core over loopback. The Docker
+          # daemon does not see this job's files, so the package is copied in, as the dashboard does.
+          docker create --name playwright-browser --network host --init "$PLAYWRIGHT_IMAGE" \
+            node /pw/playwright-core/cli.js run-server --port 39123 --host 127.0.0.1
           trap 'docker logs playwright-browser || true; docker rm -f playwright-browser >/dev/null || true' EXIT
-          for _ in $(seq 1 60); do
+          docker cp node_modules/playwright-core playwright-browser:/pw/playwright-core
+          docker start playwright-browser
+          for attempt in $(seq 1 60); do
             if (exec 3<>/dev/tcp/127.0.0.1/39123) 2>/dev/null; then break; fi
+            if [ "$attempt" = 60 ]; then echo "The browser server did not start" >&2; exit 1; fi
             sleep 1
           done
           cd packages/server
