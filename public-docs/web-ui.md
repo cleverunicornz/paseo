@@ -162,6 +162,29 @@ paseo.example.com {
 
 That's the whole config. Caddy provisions a certificate automatically and preserves `Host` and `X-Forwarded-Proto` by default.
 
+### Under a path prefix
+
+To serve several daemons from one origin, give each a path such as `/s/abc/` and have the proxy forward that path unchanged. Do not strip the prefix.
+
+- Set `daemon.web.basePath` to the path, or `PASEO_WEB_BASE_PATH` in the daemon's environment. The daemon then answers the web UI, `/api`, `/mcp` and `/ws` under it. The page tells the app to connect to `wss://<host>/s/abc/ws`.
+- Requests without the prefix still reach the daemon. Local clients such as the CLI, and agents' loopback MCP URLs, keep using the root paths.
+- The path is made of segments of letters, digits and `. _ ~ -`.
+- Allow the proxy's host name with `PASEO_HOSTNAMES`, and keep `Host` and `X-Forwarded-Proto` as above. When the proxy is not on the daemon's loopback, list it in `daemon.trustedProxies` so `X-Forwarded-Proto` is honored.
+- The web app's install manifest still names `/`, so installing it as an app under a prefix is not supported.
+
+```nginx
+location /s/abc/ {
+  proxy_pass http://10.0.0.12:6767;   # no path after the address: the prefix is forwarded as is
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection $connection_upgrade;
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_buffering off;
+  proxy_read_timeout 3600s;
+}
+```
+
 ## HTTPS and TLS
 
 Terminate TLS at the proxy (or tunnel) and forward to the daemon over plain HTTP on localhost, that's what the configs above do. When the page is served over HTTPS and the proxy passes `X-Forwarded-Proto: https`, the app automatically connects back over `wss://`. You don't configure the scheme anywhere; it follows the edge.

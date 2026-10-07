@@ -44,7 +44,7 @@ export function parseTimelineDrainMs(value: unknown, source: string): number {
 export function parseWebBasePath(value: string, source: string): string {
   const trimmed = value.trim();
   const withSlash = trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
-  if (!WEB_BASE_PATH_PATTERN.test(withSlash) || withSlash.includes("/../")) {
+  if (!WEB_BASE_PATH_PATTERN.test(withSlash) || /\/\.{1,2}\//.test(withSlash)) {
     throw new Error(
       `${source} must be a path such as /s/abc/ made of letters, digits and . _ ~ - segments`,
     );

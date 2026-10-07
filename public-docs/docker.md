@@ -145,7 +145,7 @@ environment:
   PASEO_HOSTNAMES: "paseo.example.com,.lan"
 ```
 
-IPs and `localhost` are allowed by default.
+IPs and `localhost` are allowed by default. To serve the container under a path such as `/s/abc/` on a shared origin, set `PASEO_WEB_BASE_PATH`; see [Under a path prefix](/docs/web-ui#under-a-path-prefix). A container that runs one agent and is stopped by a controller is covered in [Session containers](/docs/session-containers).
 
 ## Security
 

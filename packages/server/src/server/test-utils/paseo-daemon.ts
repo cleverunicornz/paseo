@@ -52,6 +52,8 @@ interface TestPaseoDaemonOptions {
   plugins?: PaseoDaemonConfig["plugins"];
   sessionRuntime?: PaseoDaemonConfig["sessionRuntime"];
   mcpGatewayBackends?: PaseoDaemonConfig["mcpGatewayBackends"];
+  /** `true` (any Host) unless a test checks the allowlist. */
+  hostnames?: PaseoDaemonConfig["hostnames"];
 }
 
 export interface TestPaseoDaemon {
@@ -176,7 +178,7 @@ async function prepareTestDaemonConfig(
     daemonVersion: options.daemonVersion,
     desktopManaged: options.desktopManaged,
     corsAllowedOrigins: options.corsAllowedOrigins ?? [],
-    hostnames: true,
+    hostnames: options.hostnames ?? true,
     mcpEnabled: options.mcpEnabled ?? true,
     staticDir,
     mcpDebug: options.mcpDebug ?? false,

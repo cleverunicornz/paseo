@@ -120,6 +120,7 @@ function notReady(reason: string): StopReadiness {
  */
 export class StopReadinessService {
   private stopWork: AbortController | null = null;
+  private stopWorkRunning = false;
 
   constructor(
     private readonly deps: {
@@ -165,13 +166,19 @@ export class StopReadinessService {
 
   /**
    * Refuses new agents and turns, stops the running turns, then calls the
-   * provider's `stop` and `drain` together. Returns once the work is started.
+   * provider's `stop` and `drain` together. Returns once the work is started;
+   * a request while that work still runs starts nothing new.
    */
   beginStopping(): void {
-    this.stopWork?.abort();
+    // A controller may repeat the request while it polls; work already running
+    // (a push, say) is left to finish rather than restarted.
+    if (this.stopWorkRunning) return;
     const controller = new AbortController();
     this.stopWork = controller;
-    void this.runStopWork(controller.signal);
+    this.stopWorkRunning = true;
+    void this.runStopWork(controller.signal).finally(() => {
+      this.stopWorkRunning = false;
+    });
   }
 
   private async runStopWork(signal: AbortSignal): Promise<void> {
@@ -181,8 +188,8 @@ export class StopReadinessService {
       this.deps.logger.warn({ err: error }, "Failed to stop running turns");
     }
     if (signal.aborted) return;
-    for (const operation of ["stop", "drain"] as const) {
-      for (const pluginId of this.deps.plugins.listStopReadinessProviders(operation)) {
+    const calls = (["stop", "drain"] as const).flatMap((operation) =>
+      this.deps.plugins.listStopReadinessProviders(operation).map((pluginId) =>
         this.deps.plugins
           .requestStopReadiness({ pluginId, operation, signal })
           .catch((error: unknown) => {
@@ -190,9 +197,10 @@ export class StopReadinessService {
               { err: error, pluginId, operation },
               "Stop-readiness provider operation failed",
             );
-          });
-      }
-    }
+          }),
+      ),
+    );
+    await Promise.all(calls);
   }
 
   /**

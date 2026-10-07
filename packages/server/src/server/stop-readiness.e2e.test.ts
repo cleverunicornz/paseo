@@ -17,8 +17,9 @@ async function writeProviderPlugin(input: {
   directory: string;
   id: string;
   extra?: string;
+  stopDelayMs?: number;
 }): Promise<void> {
-  const { directory, id, extra = "" } = input;
+  const { directory, id, extra = "", stopDelayMs = 0 } = input;
   await writeFile(
     path.join(directory, "paseo-plugin.json"),
     JSON.stringify({ id, requirements: { paseo: ">=0.8.0" } }),
@@ -35,6 +36,7 @@ export default function contribute(server) {
     readiness: () => JSON.parse(readFileSync(${answers}, "utf8")),
     stop: async ({ signal }) => {
       log("stop " + signal.aborted);
+      await new Promise((resolve) => setTimeout(resolve, ${stopDelayMs}));
       return { ready: true, ref: "refs/heads/wip/agent", sha: "${SHA}" };
     },
     drain: async () => {
@@ -83,10 +85,14 @@ describe("stop readiness", () => {
   let client: DaemonClient;
   const directories: string[] = [];
 
-  async function installProvider(id: string, extra?: string): Promise<string> {
+  async function installProvider(
+    id: string,
+    extra?: string,
+    stopDelayMs?: number,
+  ): Promise<string> {
     const directory = await mkdtemp(path.join(tmpdir(), "paseo-stop-readiness-"));
     directories.push(directory);
-    await writeProviderPlugin({ directory, id, extra });
+    await writeProviderPlugin({ directory, id, extra, stopDelayMs });
     await setAnswers(directory, { ready: true, timeline: READY_TIMELINE, wip: READY_WIP });
     await client.patchDaemonConfig({ pluginsEnabled: true });
     await client.installDirectoryPlugin(directory);
@@ -234,6 +240,21 @@ describe("stop readiness", () => {
     await expect(
       client.createAgent({ provider: "codex", cwd: directory, title: "Another" }),
     ).rejects.toThrow("Paseo is stopping and accepts no new agents");
+  });
+
+  test("repeating begin-stopping while the stop work runs does not restart it", async () => {
+    const directory = await installProvider("harness", "", 1_500);
+    const begin = () =>
+      fetch(`http://127.0.0.1:${daemon.port}/api/begin-stopping`, { method: "POST" });
+
+    expect((await begin()).status).toBe(202);
+    await expect.poll(() => stopWorkEvents(directory)).toContain("stop false");
+    expect((await begin()).status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+
+    expect((await stopWorkEvents(directory)).filter((line) => line.startsWith("stop"))).toEqual([
+      "stop false",
+    ]);
   });
 });
 

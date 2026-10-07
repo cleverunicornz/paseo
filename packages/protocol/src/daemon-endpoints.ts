@@ -227,7 +227,9 @@ export function normalizeDaemonBasePath(value: string | undefined | null): strin
   if (value === undefined || value === null) return "/";
   const trimmed = value.trim();
   const withSlash = trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
-  return DAEMON_BASE_PATH_PATTERN.test(withSlash) && !withSlash.includes("/../") ? withSlash : null;
+  return DAEMON_BASE_PATH_PATTERN.test(withSlash) && !/\/\.{1,2}\//.test(withSlash)
+    ? withSlash
+    : null;
 }
 
 export function buildDaemonWebSocketUrl(endpoint: string, opts: WebSocketUrlOptions): string {

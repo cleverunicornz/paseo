@@ -135,6 +135,18 @@ Or persist it in `config.json`:
 
 When enabled, open the daemon HTTP origin, for example `http://localhost:6767/`, to load the web app. Static UI files load without daemon auth; API and WebSocket requests still require the configured password.
 
+To serve it under a path such as `/s/abc/` behind a reverse proxy, set `daemon.web.basePath`; see [Under a path prefix](/docs/web-ui#under-a-path-prefix).
+
+## Session containers
+
+| Setting                           | Default  | Purpose                                                                                           |
+| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `daemon.singleAgent`              | `false`  | Run at most one live agent; creating another and forking are refused.                             |
+| `daemon.shutdown.timelineDrainMs` | `300000` | How long shutdown waits for plugins to acknowledge timeline items before it stops them.           |
+| `daemon.web.basePath`             | `/`      | The path a reverse proxy serves the daemon under. [Path prefix](/docs/web-ui#under-a-path-prefix) |
+
+These settings are read at startup. See [Session containers](/docs/session-containers) for the stop-readiness endpoints and what shutdown reports.
+
 ## Logging
 
 Daemon logging uses separate console and file sinks by default:
@@ -246,6 +258,9 @@ Set the persisted value in `config.json`:
 - `PASEO_ALLOWED_HOSTS`, deprecated alias for `PASEO_HOSTNAMES`
 - `PASEO_WEB_UI_ENABLED`, enable or disable the daemon-served web UI
 - `PASEO_WEB_UI_DIST_DIR`, override the daemon web UI build directory
+- `PASEO_WEB_BASE_PATH`, override `daemon.web.basePath`
+- `PASEO_SINGLE_AGENT`, override `daemon.singleAgent` (`true` or `false`)
+- `PASEO_TIMELINE_DRAIN_MS`, override `daemon.shutdown.timelineDrainMs`
 - `PASEO_TRUSTED_PROXIES`, configure trusted reverse proxy ranges for `X-Forwarded-*` headers
 - `PASEO_LOG_CONSOLE_LEVEL`, override `log.console.level`
 - `PASEO_LOG_FILE_LEVEL`, override `log.file.level`
