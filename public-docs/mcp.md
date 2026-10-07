@@ -257,9 +257,11 @@ unless `codexHome` names another absolute path. Paseo is tested with Codex 0.159
 
 A local tool acts in the calling agent's workspace (its working directory) and needs the agent's
 own token. Paths are relative to the workspace. A path that leaves it, directly or through a
-symlink, is refused, and so is a patch that names one. Outputs are bounded: `exec` keeps 64 KiB per
-stream unless `maxOutputBytes` asks for up to 1 MiB, `read_file` returns up to 256 KiB, and
-`list_dir` up to 2,000 entries.
+symlink, is refused. `apply_patch` reads a patch as the Codex executor does, padded headers and a
+heredoc wrapper included, and checks every file it adds, updates, deletes or moves to; one path
+outside the workspace refuses the whole patch. Outputs are bounded and end on a whole UTF-8
+character: `exec` keeps 64 KiB per stream unless `maxOutputBytes` asks for up to 1 MiB, `read_file`
+returns up to 256 KiB, and `list_dir` up to 2,000 entries.
 
 Commands get the environment of a gateway-enabled harness (the base variables plus
 `daemon.mcp.gateway.envPassthrough`) and run without Codex's own sandbox, as the daemon's user. An
@@ -283,8 +285,17 @@ tool the agent is shown: `servers/paseo/` for Paseo's tools and `servers/<backen
 backend's (backends named in `modelBackends` carry model traffic and are left out). Each file exports
 a typed function, and `client.ts` calls the tool through Paseo with the run variables above. The
 harness gets the directory as `PASEO_TOOL_TREE`: `$PASEO_HOME/tool-trees/<agentId>` unless `dir`
-names another parent. Paseo writes the tree when the agent starts and checks it whenever the agent
-lists its tools, rewriting it only when the list changed.
+names another parent. Paseo writes the tree with Paseo's tools before the harness starts, so the
+directory exists when the agent first looks. The gateway answers only for a running agent, so the
+backends' files follow once the agent is registered. Paseo checks the tree whenever the agent lists
+its tools, rewriting it only when the list changed.
+
+File and function names come from tool names: a character other than a letter, digit or `_`
+becomes `_`, and a file name compares without case. When two tools would share a file or an
+exported name, or a tool is named `index` (each server's `index.ts` re-exports all of its tools),
+the tool later in name order gets `_2`, `_3`, and so on; a tool whose name needs no change is
+placed first. `README.md` lists every file with its function and tool. A schema Paseo cannot type
+precisely, such as a `$ref` outside the schema, becomes `unknown`.
 
 An agent lists the directory, reads the files it needs, and runs a script with `exec`:
 
@@ -314,6 +325,14 @@ Set `builtinTools` to `off` on a provider to launch its harness with Paseo's too
   }
 }
 ```
+
+The switch turns off Codex's built-in tools, not what Codex loads from its home. Codex still reads
+MCP servers from `[mcp_servers]` in `$CODEX_HOME/config.toml`, instructions from
+`$CODEX_HOME/AGENTS.md`, and skills from `$CODEX_HOME/skills` and `~/.agents/skills`, plus the
+system-wide config and skills in `/etc/codex`. Paseo changes none of these. For an agent with
+Paseo's tools only, the image that runs Codex provides a `CODEX_HOME` (default `~/.codex`), a home
+directory and an `/etc/codex` with none of them. The workspace's own `AGENTS.md` and `.agents/skills`
+still apply.
 
 ## Mental model
 
