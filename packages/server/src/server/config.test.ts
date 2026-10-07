@@ -287,6 +287,79 @@ describe("server config", () => {
     expect(absent.mcpGatewayEnvPassthrough).toEqual([]);
   });
 
+  test("local tools are on only when a Codex executable is configured", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-local-tools-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: {
+          mcp: {
+            localTools: { codexPath: "/opt/codex/bin/codex", codexHome: "/var/lib/paseo-codex" },
+            toolTree: { enabled: true },
+          },
+        },
+      }),
+    );
+
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    const fromEnv = loadConfig(paseoHome, {
+      env: { PASEO_LOCAL_TOOLS_CODEX_PATH: "/usr/local/bin/codex" },
+    });
+    const absent = loadConfig(await mkdtemp(path.join(os.tmpdir(), "paseo-config-none-")), {
+      env: {},
+    });
+
+    expect(fromFile.localTools).toEqual({
+      codexPath: "/opt/codex/bin/codex",
+      codexHome: "/var/lib/paseo-codex",
+    });
+    expect(fromFile.toolTree).toEqual({ enabled: true });
+    expect(fromEnv.localTools).toEqual({
+      codexPath: "/usr/local/bin/codex",
+      codexHome: "/var/lib/paseo-codex",
+    });
+    expect(fromEnv.configReload?.overrideControlledPaths).toContain(
+      "daemon.mcp.localTools.codexPath",
+    );
+    expect(absent.localTools).toBeNull();
+    expect(absent.toolTree).toEqual({ enabled: false });
+  });
+
+  test("rejects a relative Codex executable path for local tools", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-local-tools-bad-"));
+    roots.push(paseoHome);
+    expect(() => loadConfig(paseoHome, { env: { PASEO_LOCAL_TOOLS_CODEX_PATH: "codex" } })).toThrow(
+      /absolute/,
+    );
+    expect(
+      PersistedConfigSchema.safeParse({
+        daemon: { mcp: { localTools: { codexPath: "bin/codex" } } },
+      }).success,
+    ).toBe(false);
+  });
+
+  test("a provider's harness built-in tools can be turned off", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-builtin-tools-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        agents: { providers: { claude: { builtinTools: "off" }, codex: { builtinTools: "on" } } },
+      }),
+    );
+
+    const config = loadConfig(paseoHome, { env: {} });
+
+    expect(config.providerOverrides?.claude?.builtinTools).toBe("off");
+    expect(config.providerOverrides?.codex?.builtinTools).toBe("on");
+    expect(
+      PersistedConfigSchema.safeParse({
+        agents: { providers: { claude: { builtinTools: "none" } } },
+      }).success,
+    ).toBe(false);
+  });
+
   test.each([
     ["non-JSON", "TOOL_SETTING"],
     ["a non-array", '{"TOOL_SETTING":true}'],
