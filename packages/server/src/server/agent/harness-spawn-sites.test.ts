@@ -14,9 +14,13 @@ import { describe, expect, test } from "vitest";
  * and dynamic imports, `require`, side-effect imports and re-exports. In that
  * closure a package may be loaded only from `PERMITTED_PACKAGES`, a module that
  * can start a process (any module that loads one) only for the names reviewed
- * in `REVIEWED_IMPORTS`, and no code may reach a process through a runtime
- * global (`Bun.spawn`, `process.getBuiltinModule`, a computed `import()`).
- * Everything else fails, so a new route to a process needs a review here.
+ * in `REVIEWED_IMPORTS`, which the importer may not export again, and no code
+ * may reach a process through a runtime global (`Bun.spawn`,
+ * `process.getBuiltinModule`, a computed `import()`).
+ *
+ * It is a tripwire for ordinary code, not a boundary against code written to
+ * evade it: a receiver alias (`const p = process`), a computed member
+ * (`process[name]`) or a reviewed name passed on through a value slips past.
  */
 
 const AGENT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -104,12 +108,18 @@ interface ModuleLoad {
   specifier: string;
   /** The value names loaded; `*` for a whole module (namespace, `import()`, `export *`). */
   names: readonly string[];
+  /** Set for `export … from`: the names pass on to other modules, so no review admits them. */
+  reexport?: boolean;
+  /** An import's local bindings, each to the name it loads. */
+  locals?: ReadonlyMap<string, string>;
 }
 
 interface ModuleFacts {
   loads: ModuleLoad[];
   /** Runtime routes to a process that need no import. */
   runtimeRoutes: string[];
+  /** Local bindings the module exports (`export { name }`, `export default name`). */
+  exportedLocals: Set<string>;
 }
 
 const RUNTIME_PROCESS_MEMBERS = new Set([
@@ -123,18 +133,21 @@ function specifierOf(node: ts.Expression | undefined): string | null {
   return node && ts.isStringLiteralLike(node) ? node.text : null;
 }
 
-function importClauseNames(clause: ts.ImportClause | undefined): string[] {
-  if (!clause) return ["*"];
-  if (clause.isTypeOnly) return [];
-  const names: string[] = clause.name ? ["default"] : [];
+function importLoad(specifier: string, clause: ts.ImportClause | undefined): ModuleLoad {
+  if (!clause) return { specifier, names: ["*"] };
+  if (clause.isTypeOnly) return { specifier, names: [] };
+  const locals = new Map<string, string>();
+  if (clause.name) locals.set(clause.name.text, "default");
   const bindings = clause.namedBindings;
-  if (bindings && ts.isNamespaceImport(bindings)) names.push("*");
+  if (bindings && ts.isNamespaceImport(bindings)) locals.set(bindings.name.text, "*");
   if (bindings && ts.isNamedImports(bindings)) {
     for (const element of bindings.elements) {
-      if (!element.isTypeOnly) names.push((element.propertyName ?? element.name).text);
+      if (!element.isTypeOnly) {
+        locals.set(element.name.text, (element.propertyName ?? element.name).text);
+      }
     }
   }
-  return names;
+  return { specifier, names: [...locals.values()], locals };
 }
 
 function exportClauseNames(node: ts.ExportDeclaration): string[] {
@@ -150,11 +163,11 @@ function exportClauseNames(node: ts.ExportDeclaration): string[] {
 function moduleLoadOf(node: ts.Node): ModuleLoad | null | undefined {
   if (ts.isImportDeclaration(node)) {
     const specifier = specifierOf(node.moduleSpecifier);
-    return specifier ? { specifier, names: importClauseNames(node.importClause) } : undefined;
+    return specifier ? importLoad(specifier, node.importClause) : undefined;
   }
   if (ts.isExportDeclaration(node)) {
     const specifier = specifierOf(node.moduleSpecifier);
-    return specifier ? { specifier, names: exportClauseNames(node) } : undefined;
+    return specifier ? { specifier, names: exportClauseNames(node), reexport: true } : undefined;
   }
   if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
     const specifier = specifierOf(node.moduleReference.expression);
@@ -170,6 +183,14 @@ function moduleLoadOf(node: ts.Node): ModuleLoad | null | undefined {
   return specifier ? { specifier, names: ["*"] } : null;
 }
 
+function memberRoute(target: string, member: string | null): string | undefined {
+  if (/(^|\.)Bun$/.test(target)) return `${target}.${member ?? "[…]"}`;
+  if (/(^|\.)process$/.test(target) && member && RUNTIME_PROCESS_MEMBERS.has(member)) {
+    return `${target}.${member}`;
+  }
+  return undefined;
+}
+
 /** A route to a process through a runtime global: `Bun.*`, `process.getBuiltinModule`, `eval`. */
 function runtimeRouteOf(node: ts.Node, file: ts.SourceFile): string | undefined {
   if (
@@ -179,25 +200,43 @@ function runtimeRouteOf(node: ts.Node, file: ts.SourceFile): string | undefined 
   ) {
     return `${node.expression.text}()`;
   }
+  if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer) {
+    const target = node.initializer.getText(file);
+    for (const element of node.name.elements) {
+      const key = element.propertyName ?? element.name;
+      const route = memberRoute(
+        target,
+        ts.isIdentifier(key) || ts.isStringLiteralLike(key) ? key.text : null,
+      );
+      if (route) return route;
+    }
+    return undefined;
+  }
   if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) {
     return undefined;
   }
-  const target = node.expression.getText(file);
-  const member = ts.isPropertyAccessExpression(node)
-    ? node.name.text
-    : specifierOf(node.argumentExpression);
-  if (/(^|\.)Bun$/.test(target)) return `${target}.${member ?? "[…]"}`;
-  if (/(^|\.)process$/.test(target) && member && RUNTIME_PROCESS_MEMBERS.has(member)) {
-    return `${target}.${member}`;
-  }
-  return undefined;
+  return memberRoute(
+    node.expression.getText(file),
+    ts.isPropertyAccessExpression(node) ? node.name.text : specifierOf(node.argumentExpression),
+  );
 }
 
 /** Every module a source loads, and every runtime route it takes to a process. */
 function readModuleFacts(fileName: string, source: string): ModuleFacts {
   const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
-  const facts: ModuleFacts = { loads: [], runtimeRoutes: [] };
+  const facts: ModuleFacts = { loads: [], runtimeRoutes: [], exportedLocals: new Set() };
   const visit = (node: ts.Node) => {
+    if (ts.isExportDeclaration(node) && !node.moduleSpecifier && !node.isTypeOnly) {
+      const clause = node.exportClause;
+      for (const element of clause && ts.isNamedExports(clause) ? clause.elements : []) {
+        if (!element.isTypeOnly) {
+          facts.exportedLocals.add((element.propertyName ?? element.name).text);
+        }
+      }
+    }
+    if (ts.isExportAssignment(node) && ts.isIdentifier(node.expression)) {
+      facts.exportedLocals.add(node.expression.text);
+    }
     const load = moduleLoadOf(node);
     if (load === null) facts.runtimeRoutes.push("load of a computed module");
     else if (load && load.names.length > 0) facts.loads.push(load);
@@ -302,9 +341,15 @@ function findProcessRoutes(tree: SourceTree, roots: readonly string[]): string[]
         if (isLocal) pending.push(target);
         continue;
       }
-      const reviewed = reviewedNames(module, importer);
+      const reviewed = entry.reexport ? new Set<string>() : reviewedNames(module, importer);
+      const prefix = entry.reexport ? "export " : "";
       for (const name of entry.names) {
-        if (!reviewed.has(name)) routes.push(`${importer}: ${name} from ${module}`);
+        if (!reviewed.has(name)) routes.push(`${importer}: ${prefix}${name} from ${module}`);
+      }
+      for (const [local, name] of entry.locals ?? []) {
+        if (reviewed.has(name) && facts.exportedLocals.has(local)) {
+          routes.push(`${importer}: export ${name} from ${module}`);
+        }
       }
     }
   }
@@ -394,8 +439,8 @@ describe("harness modules reach a process only through the harness spawn helpers
         `${harness}: query from @anthropic-ai/claude-agent-sdk`,
         `${harness}: spawnProcess from utils/spawn.ts`,
         `${harness}: relay from server/agent/providers/claude/relay.ts`,
-        `${harness}: probe from server/agent/providers/claude/reexport.ts`,
-        `${harness}: * from server/agent/providers/claude/star.ts`,
+        `${harness}: export probe from server/agent/providers/claude/reexport.ts`,
+        `${harness}: export * from server/agent/providers/claude/star.ts`,
         `${harness}: * from child_process`,
         `${harness}: * from server/agent/late.ts`,
         `${harness}: load of a computed module`,
@@ -403,6 +448,33 @@ describe("harness modules reach a process only through the harness spawn helpers
         `${harness}: Bun.spawn`,
         `${harness}: globalThis.Bun.spawnSync`,
         `${harness}: Function()`,
+      ].sort(),
+    );
+  });
+
+  test("a reviewed name stays in its importer, and destructured runtime members are routes", () => {
+    const query = "server/agent/providers/claude/query.ts";
+    const consumer = "server/agent/providers/claude/consumer.ts";
+    const tree = virtualTree({
+      [query]: [
+        'export { query } from "@anthropic-ai/claude-agent-sdk";',
+        'import { spawnProcess } from "../../../../utils/spawn.js";',
+        "export { spawnProcess as run };",
+        "const { env } = process;",
+        "const { getBuiltinModule: load } = process;",
+        "const { spawn } = Bun;",
+      ].join("\n"),
+      [consumer]: 'import { query, run } from "./query.js";',
+      "utils/spawn.ts": 'import { spawn } from "node:child_process";',
+    });
+
+    const roots = [query, consumer].map((path) => resolve(SRC_DIR, path));
+    expect(findProcessRoutes(tree, roots)).toEqual(
+      [
+        `${query}: export query from @anthropic-ai/claude-agent-sdk`,
+        `${query}: export spawnProcess from utils/spawn.ts`,
+        `${query}: process.getBuiltinModule`,
+        `${query}: Bun.spawn`,
       ].sort(),
     );
   });

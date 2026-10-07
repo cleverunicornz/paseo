@@ -31,8 +31,8 @@ import {
  * The only way a harness module (Claude Code, Codex) starts a process from its
  * harness binary. Each helper takes the process's `HarnessSpawnEnv`, which only
  * `resolveHarnessSpawnEnv` produces, so every harness process gets its
- * provider's harness environment. `harness-spawn-sites.test.ts` keeps harness
- * modules on these helpers.
+ * provider's harness environment. `harness-spawn-sites.test.ts` is a tripwire
+ * that fails when a harness module reaches a process another ordinary way.
  */
 
 type WithoutEnv<T> = Omit<T, keyof SpawnEnvOptions>;
