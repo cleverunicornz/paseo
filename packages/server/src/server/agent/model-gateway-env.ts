@@ -1,13 +1,16 @@
 import type { ProcessEnvRecord } from "../paseo-env.js";
+import type { SpawnEnvOptions } from "../../utils/spawn.js";
 
 /**
- * The environment of a harness whose model traffic goes through the daemon's
- * gateway is built, not inherited. From the daemon's environment and provider
- * runtime settings it keeps only these base variables and the configured
- * pass-through; Paseo's own launch values are kept as for any agent; then come
- * `NO_PROXY`/`no_proxy` and the harness's gateway values. A refused name (model
- * credentials, provider selectors, credential files, proxies) never passes,
- * whatever its source.
+ * The environment of every process the daemon starts from the harness binary
+ * of a provider whose model traffic goes through the daemon's gateway is
+ * built, not inherited: probes, diagnostics, catalogue and listing
+ * app-servers, draft sessions and agent sessions alike. From the daemon's
+ * environment and provider runtime settings it keeps only these base
+ * variables and the configured pass-through; Paseo's own launch values are
+ * kept as for any agent; an agent session then adds `NO_PROXY`/`no_proxy` and
+ * its gateway values. A refused name (model credentials, provider selectors,
+ * credential files, proxies) never passes, whatever its source.
  */
 const BASE_ENV_NAMES = new Set([
   // Executable lookup: the harness and the tools it runs.
@@ -191,22 +194,63 @@ function gatewayHost(baseUrl: string): string {
   return new URL(baseUrl).hostname.replace(/^\[(.*)\]$/, "$1");
 }
 
-export interface ModelGatewayEnvInput {
+/**
+ * How a provider's harness processes get their environment. A provider whose
+ * model traffic goes through the gateway gets `allowlist` for every harness
+ * process; every other provider inherits as before.
+ */
+export type HarnessEnvironment =
+  | { kind: "inherited" }
+  | {
+      kind: "allowlist";
+      /** Configured names and `NAME_*` prefixes a harness may inherit beyond the base variables. */
+      envPassthrough: readonly string[];
+    };
+
+export const INHERITED_HARNESS_ENVIRONMENT: HarnessEnvironment = { kind: "inherited" };
+
+/**
+ * The harness environment of each provider under the daemon's model-gateway
+ * configuration: `allowlist` for a provider that names a model backend.
+ */
+export function resolveHarnessEnvironment(
+  provider: string,
+  config: {
+    modelBackends?: Readonly<Record<string, string>>;
+    envPassthrough?: readonly string[];
+  },
+): HarnessEnvironment {
+  if (!config.modelBackends || !Object.hasOwn(config.modelBackends, provider)) {
+    return INHERITED_HARNESS_ENVIRONMENT;
+  }
+  return { kind: "allowlist", envPassthrough: [...(config.envPassthrough ?? [])] };
+}
+
+/** An agent session's gateway route: the gateway URL and the harness's own gateway values. */
+export interface HarnessGatewayValues {
+  baseUrl: string;
+  values: Record<string, string>;
+}
+
+export interface AllowlistedHarnessEnvInput {
   /** The daemon's environment and provider runtime settings, in increasing precedence. */
   inherited: ReadonlyArray<ProcessEnvRecord | undefined>;
   /** Paseo's launch values for this agent (per-agent and plugin-supplied values). */
-  launchEnv: Record<string, string> | undefined;
-  baseUrl: string;
+  launchEnv?: ProcessEnvRecord;
   envPassthrough: readonly string[];
-  /** The harness's own gateway values. */
-  gatewayValues: Record<string, string>;
+  /** Set for an agent session that sends its model traffic to the gateway. */
+  gateway?: HarnessGatewayValues;
 }
 
 /**
- * The complete environment of a gateway harness. The caller launches with it
- * as-is: nothing else is inherited or overlaid.
+ * The complete environment of a harness process under the allowlist. The
+ * caller launches with it as-is: nothing else is inherited or overlaid. A
+ * process without a gateway route (a probe, a listing app-server, a draft
+ * session) gets the same variables minus `NO_PROXY` and the gateway values.
  */
-export function buildModelGatewayEnv(input: ModelGatewayEnvInput): Record<string, string> {
+export function buildAllowlistedHarnessEnv(
+  input: AllowlistedHarnessEnvInput,
+): Record<string, string> {
   const env: Record<string, string> = {};
   for (const source of input.inherited) {
     for (const [name, value] of Object.entries(source ?? {})) {
@@ -221,12 +265,52 @@ export function buildModelGatewayEnv(input: ModelGatewayEnvInput): Record<string
     }
   }
   for (const [name, value] of Object.entries(input.launchEnv ?? {})) {
-    if (!isRefusedHarnessEnvName(name)) {
+    if (value !== undefined && !isRefusedHarnessEnvName(name)) {
       env[name] = value;
     }
   }
-  const noProxy = [...new Set([...LOOPBACK_HOSTS, gatewayHost(input.baseUrl)])].join(",");
+  if (!input.gateway) {
+    return env;
+  }
+  const noProxy = [...new Set([...LOOPBACK_HOSTS, gatewayHost(input.gateway.baseUrl)])].join(",");
   env.NO_PROXY = noProxy;
   env.no_proxy = noProxy;
-  return Object.assign(env, input.gatewayValues);
+  return Object.assign(env, input.gateway.values);
+}
+
+declare const harnessSpawnEnvBrand: unique symbol;
+
+/**
+ * Spawn environment options for a harness process. Only
+ * `resolveHarnessSpawnEnv` produces one, and the harness spawn helpers in
+ * `harness-process.ts` accept nothing else.
+ */
+export type HarnessSpawnEnv = SpawnEnvOptions & { readonly [harnessSpawnEnvBrand]: true };
+
+export interface HarnessSpawnEnvInput {
+  /** The spawn environment this process has always used under `inherited`. */
+  inherited: SpawnEnvOptions;
+  /** Provider runtime settings environment. */
+  settingsEnv?: ProcessEnvRecord;
+  /** Paseo's launch values, for an agent session. */
+  launchEnv?: ProcessEnvRecord;
+  /** The gateway route, for an agent session that has one. */
+  gateway?: HarnessGatewayValues;
+}
+
+/** The spawn environment of one harness process under its provider's harness environment. */
+export function resolveHarnessSpawnEnv(
+  environment: HarnessEnvironment,
+  input: HarnessSpawnEnvInput,
+): HarnessSpawnEnv {
+  if (environment.kind === "inherited") {
+    return input.inherited as HarnessSpawnEnv;
+  }
+  const env = buildAllowlistedHarnessEnv({
+    inherited: [process.env, input.settingsEnv],
+    launchEnv: input.launchEnv,
+    envPassthrough: environment.envPassthrough,
+    gateway: input.gateway,
+  });
+  return { env, envMode: "internal" } as HarnessSpawnEnv;
 }

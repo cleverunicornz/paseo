@@ -648,7 +648,7 @@ export interface AgentLaunchContext {
   /**
    * Runtime-only model gateway for this launch. Never persisted; a provider
    * that receives it points its model client at the gateway and builds the
-   * harness environment with `buildModelGatewayEnv` instead of inheriting one.
+   * harness environment with `buildAllowlistedHarnessEnv` instead of inheriting one.
    */
   modelGateway?: AgentModelGateway;
 }

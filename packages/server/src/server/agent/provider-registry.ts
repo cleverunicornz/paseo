@@ -36,6 +36,7 @@ import type {
 } from "./provider-launch-config.js";
 import { ClaudeAgentClient } from "./providers/claude/agent.js";
 import { CodexAppServerAgentClient } from "./providers/codex-app-server-agent.js";
+import { resolveHarnessEnvironment, type HarnessEnvironment } from "./model-gateway-env.js";
 import { CopilotACPAgentClient } from "./providers/copilot-acp-agent.js";
 import { CursorACPAgentClient } from "./providers/cursor-acp-agent.js";
 import { GenericACPAgentClient } from "./providers/generic-acp-agent.js";
@@ -107,6 +108,14 @@ export interface ProviderDefinition extends AgentProviderDefinition {
 
 export interface BuildProviderRegistryOptions {
   runtimeSettings?: AgentProviderRuntimeSettingsMap;
+  /**
+   * The MCP gateway backend each provider's model traffic goes to, by provider
+   * id. Every harness process of a named provider starts from the allowlisted
+   * environment.
+   */
+  mcpGatewayModelBackends?: Readonly<Record<string, string>>;
+  /** Names and `NAME_*` prefixes a gateway provider's harness may inherit beyond the base variables. */
+  mcpGatewayEnvPassthrough?: readonly string[];
   providerOverrides?: Record<string, ProviderOverride>;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   managedProcesses?: ManagedProcessRegistry;
@@ -121,6 +130,7 @@ interface ProviderClientFactoryOptions extends Pick<
 > {
   openCodeBridge?: OpenCodeBridge;
   providerParams?: unknown;
+  harnessEnvironment?: HarnessEnvironment;
   customProvider?: {
     id: string;
     label: string;
@@ -143,6 +153,7 @@ interface ResolvedProvider {
   enabled: boolean;
   derivedFromProviderId: string | null;
   providerParams?: unknown;
+  harnessEnvironment: HarnessEnvironment;
   createBaseClient: (logger: Logger) => AgentClient;
   contract: ProviderContract;
 }
@@ -194,15 +205,17 @@ const HUB_E2E_PROVIDER_CONTRACT: ProviderContract = {
 };
 
 const PROVIDER_CLIENT_FACTORIES: Record<string, ProviderClientFactory> = {
-  claude: (logger, runtimeSettings) =>
+  claude: (logger, runtimeSettings, options) =>
     new ClaudeAgentClient({
       logger,
       runtimeSettings,
+      harnessEnvironment: options?.harnessEnvironment,
     }),
   codex: (logger, runtimeSettings, options) =>
     new CodexAppServerAgentClient(logger, runtimeSettings, {
       workspaceGitService: options?.workspaceGitService,
       customProvider: options?.customProvider,
+      harnessEnvironment: options?.harnessEnvironment,
     }),
   copilot: (logger, runtimeSettings) =>
     new CopilotACPAgentClient({
@@ -236,6 +249,19 @@ const PROVIDER_CLIENT_FACTORIES: Record<string, ProviderClientFactory> = {
   mock: (logger) => new MockLoadTestAgentClient(logger),
   "mock-slow": () => new MockSlowProviderClient(),
 };
+
+function resolveProviderHarnessEnvironment(
+  providerId: string,
+  options: Pick<
+    BuildProviderRegistryOptions,
+    "mcpGatewayModelBackends" | "mcpGatewayEnvPassthrough"
+  >,
+): HarnessEnvironment {
+  return resolveHarnessEnvironment(providerId, {
+    modelBackends: options.mcpGatewayModelBackends,
+    envPassthrough: options.mcpGatewayEnvPassthrough,
+  });
+}
 
 function getCursorACPCommand(
   runtimeSettings: ProviderRuntimeSettings | undefined,
@@ -719,7 +745,12 @@ function buildResolvedBuiltinProviders(
   runtimeSettings: AgentProviderRuntimeSettingsMap | undefined,
   options: Pick<
     BuildProviderRegistryOptions,
-    "workspaceGitService" | "managedProcesses" | "ompRuntime" | "openCodeBridge"
+    | "workspaceGitService"
+    | "managedProcesses"
+    | "ompRuntime"
+    | "openCodeBridge"
+    | "mcpGatewayModelBackends"
+    | "mcpGatewayEnvPassthrough"
   >,
   isDev: boolean,
 ): Map<string, ResolvedProvider> {
@@ -736,6 +767,7 @@ function buildResolvedBuiltinProviders(
       runtimeSettings?.[definition.id],
       toRuntimeSettings(override),
     );
+    const harnessEnvironment = resolveProviderHarnessEnvironment(definition.id, options);
 
     resolvedProviders.set(definition.id, {
       definition: applyOverrideToDefinition(definition, override),
@@ -746,6 +778,7 @@ function buildResolvedBuiltinProviders(
       enabled: override?.enabled ?? definition.enabledByDefault ?? true,
       derivedFromProviderId: null,
       providerParams: override?.params,
+      harnessEnvironment,
       createBaseClient: (logger) =>
         factory(logger, mergedRuntimeSettings, {
           workspaceGitService: options.workspaceGitService,
@@ -753,6 +786,7 @@ function buildResolvedBuiltinProviders(
           ompRuntime: options.ompRuntime,
           openCodeBridge: options.openCodeBridge,
           providerParams: override?.params,
+          harnessEnvironment,
         }),
       contract: PROVIDER_CONTRACTS[definition.id] ?? UNSUPPORTED_PROVIDER_CONTRACT,
     });
@@ -764,7 +798,10 @@ function buildResolvedBuiltinProviders(
 function addDerivedProviders(
   resolvedProviders: Map<string, ResolvedProvider>,
   providerOverrides: Record<string, ProviderOverride>,
-  options: Pick<BuildProviderRegistryOptions, "managedProcesses" | "openCodeBridge">,
+  options: Pick<
+    BuildProviderRegistryOptions,
+    "managedProcesses" | "openCodeBridge" | "mcpGatewayModelBackends" | "mcpGatewayEnvPassthrough"
+  >,
 ): void {
   for (const [providerId, override] of Object.entries(providerOverrides)) {
     if (resolvedProviders.has(providerId) || BUILTIN_PROVIDER_IDS.includes(providerId)) {
@@ -801,6 +838,7 @@ function addDerivedProviders(
         enabled: override.enabled !== false,
         derivedFromProviderId: null,
         providerParams: override.params,
+        harnessEnvironment: resolveProviderHarnessEnvironment(providerId, options),
         createBaseClient: (logger) => {
           const acpOptions = {
             logger,
@@ -847,6 +885,7 @@ function addDerivedProviders(
     const baseDefinition = baseProvider.definition;
     const baseFactory = getProviderClientFactory(baseProviderId);
     const providerParams = override.params ?? baseProvider.providerParams;
+    const harnessEnvironment = resolveProviderHarnessEnvironment(providerId, options);
 
     resolvedProviders.set(providerId, {
       definition: createDerivedDefinition(providerId, baseDefinition, override),
@@ -857,11 +896,13 @@ function addDerivedProviders(
       enabled: override.enabled !== false,
       derivedFromProviderId: baseProviderId,
       providerParams,
+      harnessEnvironment,
       createBaseClient: (logger) =>
         baseFactory(logger, mergedRuntimeSettings, {
           managedProcesses: options.managedProcesses,
           openCodeBridge: options.openCodeBridge,
           providerParams,
+          harnessEnvironment,
           customProvider: {
             id: providerId,
             label: override.label ?? providerId,
@@ -887,12 +928,16 @@ export function buildProviderRegistry(
       managedProcesses: options?.managedProcesses,
       ompRuntime: options?.ompRuntime,
       openCodeBridge: options?.openCodeBridge,
+      mcpGatewayModelBackends: options?.mcpGatewayModelBackends,
+      mcpGatewayEnvPassthrough: options?.mcpGatewayEnvPassthrough,
     },
     options?.isDev === true,
   );
   addDerivedProviders(resolvedProviders, providerOverrides, {
     managedProcesses: options?.managedProcesses,
     openCodeBridge: options?.openCodeBridge,
+    mcpGatewayModelBackends: options?.mcpGatewayModelBackends,
+    mcpGatewayEnvPassthrough: options?.mcpGatewayEnvPassthrough,
   });
 
   return Object.fromEntries(

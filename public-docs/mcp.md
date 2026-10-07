@@ -180,9 +180,9 @@ named provider launches against `<daemon>/mcp/backends/<backend>` with its per-a
 
 ### The harness environment
 
-A gateway-enabled harness inherits nothing from the daemon's environment except the documented base variables. Launch values and configured pass-through are trusted configuration, passed as given apart from the refused names. Provider credentials are never inherited, and the per-agent token is valid only at the agent's own daemon.
+Every process Paseo's Claude Code or Codex provider starts from a named provider's binary gets this environment: agent sessions, draft sessions, availability and version probes, the diagnostic's `which` and login-shell lookups and `claude auth status` check, and the Codex app-servers that list models, list importable sessions and archive threads. None of them inherits anything from the daemon's environment except the documented base variables. Launch values and configured pass-through are trusted configuration, passed as given apart from the refused names. Provider credentials are never inherited, and the per-agent token is valid only at the agent's own daemon.
 
-The harness's environment consists of:
+An agent session's environment consists of:
 
 - the base variables, from the daemon's environment and the provider's runtime settings: `PATH`,
   `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, and on Windows
@@ -193,6 +193,16 @@ The harness's environment consists of:
   `agent.create`/`agent.session_open` hooks;
 - `NO_PROXY` and `no_proxy`, set to `127.0.0.1`, `localhost`, `::1` and the gateway host;
 - its gateway values from the table above.
+
+A probe, a listing or archive app-server, or a draft session (the daemon listing a provider's
+commands or features before an agent exists) gets only the base variables and the configured
+pass-through. Providers not named in `modelBackends` inherit the daemon's environment as before.
+
+General command runners keep the daemon's environment, even when the command they run is `claude`
+or `codex`: worktree setup and teardown scripts, terminals and terminal profiles, and plugin
+callback processes. To keep credentials away from them too, keep the credentials out of the
+daemon's environment. Store them as files that your hooks read per request; the
+`mcp_gateway.upstream` hook can read the proxy client key that way.
 
 Refused names never pass, from any source, in any case: names starting with `ANTHROPIC_`,
 `OPENAI_`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `CLOUDSDK_`, `CLOUD_ML_`, `VERTEX_`,

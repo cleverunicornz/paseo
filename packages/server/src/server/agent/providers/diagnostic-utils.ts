@@ -8,7 +8,7 @@ import {
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../provider-launch-config.js";
-import { execCommand } from "../../../utils/spawn.js";
+import { execCommand, type SpawnEnvOptions } from "../../../utils/spawn.js";
 
 export interface DiagnosticEntry {
   label: string;
@@ -138,10 +138,11 @@ export function toDiagnosticErrorMessage(error: unknown): string {
 export async function resolveBinaryVersion(
   binaryPath: string,
   signal?: AbortSignal,
+  env: SpawnEnvOptions = createProviderEnvSpec(),
 ): Promise<string> {
   try {
     const { stdout } = await execCommand(binaryPath, ["--version"], {
-      ...createProviderEnvSpec(),
+      ...env,
       timeout: 5_000,
       signal,
     });
@@ -160,6 +161,8 @@ export interface BinaryDiagnosticVersionCommand {
 export interface BinaryDiagnosticRowsOptions {
   binaryLabel?: string;
   versionCommand?: BinaryDiagnosticVersionCommand;
+  /** The version command's spawn environment, replacing the one built from `versionCommand.env`. */
+  versionEnv?: SpawnEnvOptions;
 }
 
 export interface CommandResolutionDiagnosticRowsOptions {
@@ -169,6 +172,8 @@ export interface CommandResolutionDiagnosticRowsOptions {
   pathext?: string;
   platform?: NodeJS.Platform;
   shell?: string;
+  /** The `which` and login-shell lookups' spawn environment. */
+  probeEnv?: SpawnEnvOptions;
 }
 
 const COMMAND_PROBE_TIMEOUT_MS = 3_000;
@@ -287,9 +292,14 @@ function formatCommandProbeError(error: unknown): string {
   return toDiagnosticErrorMessage(error);
 }
 
-async function runCommandProbe(command: string, args: string[]): Promise<string> {
+async function runCommandProbe(
+  command: string,
+  args: string[],
+  env: SpawnEnvOptions = {},
+): Promise<string> {
   try {
     const { stdout, stderr } = await execCommand(command, args, {
+      ...env,
       timeout: COMMAND_PROBE_TIMEOUT_MS,
       killSignal: "SIGKILL",
       maxBuffer: COMMAND_PROBE_MAX_BUFFER,
@@ -300,22 +310,28 @@ async function runCommandProbe(command: string, args: string[]): Promise<string>
   }
 }
 
-async function buildPosixCommandProbeRows(binaryName: string): Promise<DiagnosticEntry[]> {
+async function buildPosixCommandProbeRows(
+  binaryName: string,
+  env?: SpawnEnvOptions,
+): Promise<DiagnosticEntry[]> {
   const shell = resolveShellValue();
   const typeCommand = `type -a ${shellToken(binaryName)}`;
   return [
     {
       label: `which -a ${binaryName}`,
-      value: await runCommandProbe("/usr/bin/which", ["-a", binaryName]),
+      value: await runCommandProbe("/usr/bin/which", ["-a", binaryName], env),
     },
     {
       label: `${path.basename(shell)} -lc type -a ${binaryName}`,
-      value: await runCommandProbe(shell, ["-lc", typeCommand]),
+      value: await runCommandProbe(shell, ["-lc", typeCommand], env),
     },
   ];
 }
 
-async function buildWindowsCommandProbeRows(binaryName: string): Promise<DiagnosticEntry[]> {
+async function buildWindowsCommandProbeRows(
+  binaryName: string,
+  env?: SpawnEnvOptions,
+): Promise<DiagnosticEntry[]> {
   const powershellCommand = [
     "$ErrorActionPreference = 'Continue';",
     `Get-Command -All ${JSON.stringify(binaryName)} |`,
@@ -326,22 +342,23 @@ async function buildWindowsCommandProbeRows(binaryName: string): Promise<Diagnos
   return [
     {
       label: `where.exe ${binaryName}`,
-      value: await runCommandProbe("where.exe", [binaryName]),
+      value: await runCommandProbe("where.exe", [binaryName], env),
     },
     {
       label: `powershell Get-Command -All ${binaryName}`,
-      value: await runCommandProbe("powershell.exe", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        powershellCommand,
-      ]),
+      value: await runCommandProbe(
+        "powershell.exe",
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
+        env,
+      ),
     },
   ];
 }
 
-async function buildCommandProbeRows(binaryNames: readonly string[]): Promise<DiagnosticEntry[]> {
+async function buildCommandProbeRows(
+  binaryNames: readonly string[],
+  env?: SpawnEnvOptions,
+): Promise<DiagnosticEntry[]> {
   const searchableNames = resolveSearchableNames(binaryNames);
   if (searchableNames.length === 0) {
     return [];
@@ -351,8 +368,8 @@ async function buildCommandProbeRows(binaryNames: readonly string[]): Promise<Di
   for (const binaryName of searchableNames) {
     rows.push(
       ...(process.platform === "win32"
-        ? await buildWindowsCommandProbeRows(binaryName)
-        : await buildPosixCommandProbeRows(binaryName)),
+        ? await buildWindowsCommandProbeRows(binaryName, env)
+        : await buildPosixCommandProbeRows(binaryName, env)),
     );
   }
   return rows;
@@ -384,14 +401,19 @@ export async function buildCommandResolutionDiagnosticRows(
       label: "PATH matches",
       value: await formatPathMatches(options),
     },
-    ...(includeCommandProbes ? await buildCommandProbeRows(options.knownBinaryNames) : []),
+    ...(includeCommandProbes
+      ? await buildCommandProbeRows(options.knownBinaryNames, options.probeEnv)
+      : []),
   ];
 }
 
-async function resolveCommandVersion(invocation: BinaryDiagnosticVersionCommand): Promise<string> {
+async function resolveCommandVersion(
+  invocation: BinaryDiagnosticVersionCommand,
+  env: SpawnEnvOptions = createProviderEnvSpec({ runtimeSettings: { env: invocation.env } }),
+): Promise<string> {
   try {
     const { stdout, stderr } = await execCommand(invocation.command, invocation.args, {
-      ...createProviderEnvSpec({ runtimeSettings: { env: invocation.env } }),
+      ...env,
       timeout: 5_000,
     });
     return stdout.trim() || stderr.trim() || "unknown";
@@ -409,12 +431,15 @@ export async function buildBinaryDiagnosticRows(
   const binaryLabel = options.binaryLabel ?? defaultBinaryLabel;
   let version = "unknown";
   if (options.versionCommand && availability.available) {
-    version = await resolveCommandVersion(options.versionCommand);
+    version = await resolveCommandVersion(options.versionCommand, options.versionEnv);
   } else if (availability.available) {
-    version = await resolveCommandVersion({
-      command: availability.resolvedPath ?? launch.command,
-      args: [...launch.args, "--version"],
-    });
+    version = await resolveCommandVersion(
+      {
+        command: availability.resolvedPath ?? launch.command,
+        args: [...launch.args, "--version"],
+      },
+      options.versionEnv,
+    );
   }
   return [
     {

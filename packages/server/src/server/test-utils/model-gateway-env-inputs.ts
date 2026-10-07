@@ -144,6 +144,27 @@ export function expectedGatewayEnv(input: {
   return Object.assign(expected, input.gatewayValues);
 }
 
+/**
+ * The complete environment of a harness process started without a gateway
+ * route of its own (a probe, a catalogue or listing app-server, a draft
+ * session): the documented base variables from the daemon's environment,
+ * configured pass-through, and Paseo's launch values when it has any. It holds
+ * no more than a gateway session's environment.
+ */
+export function expectedAllowlistedEnv(input: {
+  daemonEnv: NodeJS.ProcessEnv;
+  launchValues?: Record<string, string>;
+}): Record<string, string> {
+  const expected: Record<string, string> = {};
+  for (const [name, value] of Object.entries(input.daemonEnv)) {
+    if (value !== undefined && isDocumentedBaseName(name)) {
+      expected[name] = value;
+    }
+  }
+  Object.assign(expected, PASSTHROUGH_INPUTS.daemon, PASSTHROUGH_INPUTS.settings);
+  return Object.assign(expected, input.launchValues);
+}
+
 /** Sets every daemon-side input on `process.env`; returns a restore function. */
 export function inheritOnDaemonProcess(): () => void {
   const values: Record<string, string> = {
