@@ -86,6 +86,7 @@ not retain non-Git directories.
 | `server/agent/mcp-server.ts`    | Thin MCP adapter that registers the Paseo tool catalog with the MCP SDK        |
 | `server/agent/agent-tokens.ts`  | Per-agent tokens; the only source of caller identity on daemon MCP routes      |
 | `server/mcp-gateway/`           | Proxies agent MCP and model traffic to named backends with daemon-set identity |
+| `server/local-tools/`           | Local tools on `/mcp/agents` through a Codex app server executor; tool trees   |
 | `server/agent/providers/`       | Provider adapters (see "Agent providers" below)                                |
 | `server/orchestration-skills/`  | Bundled catalog, host selection, convergence, and skill-directory transactions |
 | `server/relay-transport.ts`     | Outbound relay connection with E2E encryption                                  |

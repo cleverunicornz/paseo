@@ -12,13 +12,16 @@ category: Orchestration
 
 ## Configuration
 
-| Setting                             | Default | Purpose                                                                                                                   |
-| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `daemon.mcp.enabled`                | `true`  | Run the MCP server.                                                                                                       |
-| `daemon.mcp.injectIntoAgents`       | `false` | Give agents launched by Paseo access to its tools.                                                                        |
-| `daemon.mcp.gateway.backends`       | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon)                   |
-| `daemon.mcp.gateway.modelBackends`  | `{}`    | Send a provider's model traffic through a gateway backend. [Model traffic](#send-model-traffic-through-the-gateway)       |
-| `daemon.mcp.gateway.envPassthrough` | `[]`    | Trusted variables a gateway-enabled harness inherits beyond the base set. [Harness environment](#the-harness-environment) |
+| Setting                              | Default | Purpose                                                                                                                          |
+| ------------------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `daemon.mcp.enabled`                 | `true`  | Run the MCP server.                                                                                                              |
+| `daemon.mcp.injectIntoAgents`        | `false` | Give agents launched by Paseo access to its tools.                                                                               |
+| `daemon.mcp.gateway.backends`        | `{}`    | Name the MCP servers agents reach through the daemon. [Gateway](#reach-mcp-backends-through-the-daemon)                          |
+| `daemon.mcp.gateway.modelBackends`   | `{}`    | Send a provider's model traffic through a gateway backend. [Model traffic](#send-model-traffic-through-the-gateway)              |
+| `daemon.mcp.gateway.envPassthrough`  | `[]`    | Trusted variables a gateway-enabled harness inherits beyond the base set. [Harness environment](#the-harness-environment)        |
+| `daemon.mcp.localTools.codexPath`    | unset   | Serve the local tools (commands, files, patches, processes, search, git) through a Codex app server. [Local tools](#local-tools) |
+| `daemon.mcp.toolTree.enabled`        | `false` | Give each agent its tools as TypeScript files it can call from code. [Tool tree](#tool-tree)                                     |
+| `agents.providers.<id>.builtinTools` | `on`    | `off` launches the harness without its own built-in tools. [Built-in tools](#harness-built-in-tools)                             |
 
 Depending on the provider, Paseo delivers tools through its native tool interface or MCP. The capabilities are the same. Start a new agent or reload an existing one after changing injection settings.
 
@@ -237,6 +240,81 @@ reach the provider only at launch: agent records never hold them, and the per-ag
 when the agent closes. A launch fails when the provider cannot use the gateway (providers other
 than Claude Code and Codex) or the daemon does not listen on TCP.
 
+## Local tools
+
+Paseo can serve the tools an agent needs to work in its workspace: running commands, reading and
+writing files, applying patches, running long-lived processes, searching, and git. The daemon runs
+one Codex app server as their executor, with no model and no login. Name the Codex executable to
+turn them on:
+
+```json
+{ "daemon": { "mcp": { "localTools": { "codexPath": "/usr/local/bin/codex" } } } }
+```
+
+`PASEO_LOCAL_TOOLS_CODEX_PATH` replaces `codexPath`. The executor starts on the first call, starts
+again on the next call after it exits, and uses its own Codex home: `$PASEO_HOME/local-tools/codex-home`
+unless `codexHome` names another absolute path. Paseo is tested with Codex 0.159.2.
+
+A local tool acts in the calling agent's workspace (its working directory) and needs the agent's
+own token. Paths are relative to the workspace. A path that leaves it, directly or through a
+symlink, is refused, and so is a patch that names one. Outputs are bounded: `exec` keeps 64 KiB per
+stream unless `maxOutputBytes` asks for up to 1 MiB, `read_file` returns up to 256 KiB, and
+`list_dir` up to 2,000 entries.
+
+Commands get the environment of a gateway-enabled harness (the base variables plus
+`daemon.mcp.gateway.envPassthrough`) and run without Codex's own sandbox, as the daemon's user. An
+`exec` or `process_spawn` run also gets these variables, so code the agent runs calls Paseo's tools
+as that agent:
+
+| Variable                | Value                                     |
+| ----------------------- | ----------------------------------------- |
+| `PASEO_AGENT_TOKEN`     | The calling agent's token.                |
+| `PASEO_MCP_URL`         | The daemon's `/mcp/agents` URL.           |
+| `PASEO_MCP_GATEWAY_URL` | The gateway's `/mcp/backends` URL.        |
+| `PASEO_TOOL_TREE`       | The agent's tool tree, when trees are on. |
+| `PASEO_AGENT_ID`        | The calling agent's ID.                   |
+
+The values travel with that run's request to the executor. Paseo writes none of them to a file.
+
+## Tool tree
+
+With `daemon.mcp.toolTree.enabled`, Paseo writes each agent a directory with one TypeScript file per
+tool the agent is shown: `servers/paseo/` for Paseo's tools and `servers/<backend>/` for each gateway
+backend's (backends named in `modelBackends` carry model traffic and are left out). Each file exports
+a typed function, and `client.ts` calls the tool through Paseo with the run variables above. The
+harness gets the directory as `PASEO_TOOL_TREE`: `$PASEO_HOME/tool-trees/<agentId>` unless `dir`
+names another parent. Paseo writes the tree when the agent starts and checks it whenever the agent
+lists its tools, rewriting it only when the list changed.
+
+An agent lists the directory, reads the files it needs, and runs a script with `exec`:
+
+```ts
+import { readFile } from "/home/me/.paseo/tool-trees/<agentId>/servers/paseo/read_file.ts";
+
+const pkg = await readFile({ path: "package.json" });
+console.log(JSON.parse(pkg.content).version);
+```
+
+Run it with `node --experimental-strip-types script.ts` or `bun script.ts`.
+
+## Harness built-in tools
+
+Set `builtinTools` to `off` on a provider to launch its harness with Paseo's tools only. Pair it with
+[local tools](#local-tools) so the agent can still run commands and edit files.
+
+| Harness     | Launch                                                                                                                                       |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | `--tools ""` (no built-in tool) and `--strict-mcp-config` (only the MCP servers Paseo passes).                                               |
+| Codex       | `--disable shell_tool --disable unified_exec`. Codex registers `apply_patch` per model and has no switch for it, so that one built-in stays. |
+
+```json
+{
+  "agents": {
+    "providers": { "claude": { "builtinTools": "off" }, "codex": { "builtinTools": "off" } }
+  }
+}
+```
+
 ## Mental model
 
 Workspaces decide where work happens; agent parentage decides who owns the work.
@@ -337,6 +415,30 @@ Before delegating, read each profile's `notes` and choose the profile the user n
 | `notes`                         | Selection guidance for the orchestrator; supply the task in `initialPrompt` |
 
 Omit absent optional settings. If no profile fits, use provider discovery to choose available settings.
+
+### Local
+
+Available when [local tools](#local-tools) are on.
+
+| Tool            | Function                                                                         |
+| --------------- | -------------------------------------------------------------------------------- |
+| `exec`          | Run a command (argv) in the workspace and return its exit code and output.       |
+| `read_file`     | Read a file, optionally a range of lines; binary files come back base64-encoded. |
+| `write_file`    | Create or replace a file, creating missing directories.                          |
+| `list_dir`      | List a directory's entries.                                                      |
+| `apply_patch`   | Apply a patch in Codex's `apply_patch` format.                                   |
+| `process_spawn` | Start a long-running process.                                                    |
+| `process_write` | Write to a process's stdin, or close it.                                         |
+| `process_read`  | Return a process's new output, waiting for some if asked.                        |
+| `process_kill`  | Stop a process.                                                                  |
+| `process_list`  | List the caller's processes.                                                     |
+| `search`        | Search file contents with ripgrep.                                               |
+| `find_files`    | Fuzzy-find files by name.                                                        |
+| `git_status`    | Working tree status.                                                             |
+| `git_diff`      | Unstaged, staged, or ref changes.                                                |
+| `git_log`       | Recent commits.                                                                  |
+| `git_commit`    | Commit given paths, every tracked change, or what is staged.                     |
+| `git_push`      | Push a branch.                                                                   |
 
 ### Providers
 
