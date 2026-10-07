@@ -75,6 +75,7 @@ import {
 } from "../provider-launch-config.js";
 import {
   buildHarnessBinaryDiagnosticRows,
+  buildHarnessCommandResolutionDiagnosticRows,
   checkHarnessLaunchAvailable,
   findHarnessExecutable,
   probeHarnessExecutable,
@@ -103,11 +104,7 @@ import {
   type ProviderImageOutput,
 } from "./provider-image-output.js";
 import { normalizeProviderReplayTimestamp } from "../provider-history-timestamps.js";
-import {
-  formatProviderDiagnostic,
-  formatProviderDiagnosticError,
-  buildCommandResolutionDiagnosticRows,
-} from "./diagnostic-utils.js";
+import { formatProviderDiagnostic, formatProviderDiagnosticError } from "./diagnostic-utils.js";
 import { appendOrReplaceGrowingAssistantMessage, runProviderTurn } from "./provider-runner.js";
 import {
   MODE_APPLIES_NEXT_TURN_NOTICE,
@@ -7489,7 +7486,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       const launch = await resolveCodexLaunch(this.runtimeSettings);
       const availability = await checkCodexLaunchAvailable(launch, this.probeEnv());
       const entries: Array<{ label: string; value: string }> = [
-        ...(await buildCommandResolutionDiagnosticRows(launch, {
+        ...(await buildHarnessCommandResolutionDiagnosticRows(launch, this.probeEnv(), {
           knownBinaryNames: ["codex"],
         })),
         ...(await buildHarnessBinaryDiagnosticRows(

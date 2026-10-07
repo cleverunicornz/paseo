@@ -172,6 +172,8 @@ export interface CommandResolutionDiagnosticRowsOptions {
   pathext?: string;
   platform?: NodeJS.Platform;
   shell?: string;
+  /** The `which` and login-shell lookups' spawn environment. */
+  probeEnv?: SpawnEnvOptions;
 }
 
 const COMMAND_PROBE_TIMEOUT_MS = 3_000;
@@ -290,9 +292,14 @@ function formatCommandProbeError(error: unknown): string {
   return toDiagnosticErrorMessage(error);
 }
 
-async function runCommandProbe(command: string, args: string[]): Promise<string> {
+async function runCommandProbe(
+  command: string,
+  args: string[],
+  env: SpawnEnvOptions = {},
+): Promise<string> {
   try {
     const { stdout, stderr } = await execCommand(command, args, {
+      ...env,
       timeout: COMMAND_PROBE_TIMEOUT_MS,
       killSignal: "SIGKILL",
       maxBuffer: COMMAND_PROBE_MAX_BUFFER,
@@ -303,22 +310,28 @@ async function runCommandProbe(command: string, args: string[]): Promise<string>
   }
 }
 
-async function buildPosixCommandProbeRows(binaryName: string): Promise<DiagnosticEntry[]> {
+async function buildPosixCommandProbeRows(
+  binaryName: string,
+  env?: SpawnEnvOptions,
+): Promise<DiagnosticEntry[]> {
   const shell = resolveShellValue();
   const typeCommand = `type -a ${shellToken(binaryName)}`;
   return [
     {
       label: `which -a ${binaryName}`,
-      value: await runCommandProbe("/usr/bin/which", ["-a", binaryName]),
+      value: await runCommandProbe("/usr/bin/which", ["-a", binaryName], env),
     },
     {
       label: `${path.basename(shell)} -lc type -a ${binaryName}`,
-      value: await runCommandProbe(shell, ["-lc", typeCommand]),
+      value: await runCommandProbe(shell, ["-lc", typeCommand], env),
     },
   ];
 }
 
-async function buildWindowsCommandProbeRows(binaryName: string): Promise<DiagnosticEntry[]> {
+async function buildWindowsCommandProbeRows(
+  binaryName: string,
+  env?: SpawnEnvOptions,
+): Promise<DiagnosticEntry[]> {
   const powershellCommand = [
     "$ErrorActionPreference = 'Continue';",
     `Get-Command -All ${JSON.stringify(binaryName)} |`,
@@ -329,22 +342,23 @@ async function buildWindowsCommandProbeRows(binaryName: string): Promise<Diagnos
   return [
     {
       label: `where.exe ${binaryName}`,
-      value: await runCommandProbe("where.exe", [binaryName]),
+      value: await runCommandProbe("where.exe", [binaryName], env),
     },
     {
       label: `powershell Get-Command -All ${binaryName}`,
-      value: await runCommandProbe("powershell.exe", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        powershellCommand,
-      ]),
+      value: await runCommandProbe(
+        "powershell.exe",
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
+        env,
+      ),
     },
   ];
 }
 
-async function buildCommandProbeRows(binaryNames: readonly string[]): Promise<DiagnosticEntry[]> {
+async function buildCommandProbeRows(
+  binaryNames: readonly string[],
+  env?: SpawnEnvOptions,
+): Promise<DiagnosticEntry[]> {
   const searchableNames = resolveSearchableNames(binaryNames);
   if (searchableNames.length === 0) {
     return [];
@@ -354,8 +368,8 @@ async function buildCommandProbeRows(binaryNames: readonly string[]): Promise<Di
   for (const binaryName of searchableNames) {
     rows.push(
       ...(process.platform === "win32"
-        ? await buildWindowsCommandProbeRows(binaryName)
-        : await buildPosixCommandProbeRows(binaryName)),
+        ? await buildWindowsCommandProbeRows(binaryName, env)
+        : await buildPosixCommandProbeRows(binaryName, env)),
     );
   }
   return rows;
@@ -387,7 +401,9 @@ export async function buildCommandResolutionDiagnosticRows(
       label: "PATH matches",
       value: await formatPathMatches(options),
     },
-    ...(includeCommandProbes ? await buildCommandProbeRows(options.knownBinaryNames) : []),
+    ...(includeCommandProbes
+      ? await buildCommandProbeRows(options.knownBinaryNames, options.probeEnv)
+      : []),
   ];
 }
 

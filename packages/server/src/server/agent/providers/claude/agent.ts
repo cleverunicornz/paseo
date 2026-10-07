@@ -61,11 +61,7 @@ import {
 } from "./subagents/workflow-replay-source.js";
 import { readClaudeWorkflowResultFile } from "./subagents/workflow-output.js";
 import { buildClaudeFeatures, claudeModelSupportsFastMode } from "./feature-definitions.js";
-import {
-  buildCommandResolutionDiagnosticRows,
-  formatProviderDiagnostic,
-  formatProviderDiagnosticError,
-} from "../diagnostic-utils.js";
+import { formatProviderDiagnostic, formatProviderDiagnosticError } from "../diagnostic-utils.js";
 import { appendOrReplaceGrowingAssistantMessage, runProviderTurn } from "../provider-runner.js";
 import {
   applyClaudeToolPolicy,
@@ -148,6 +144,7 @@ import {
 } from "../../model-gateway-env.js";
 import {
   buildHarnessBinaryDiagnosticRows,
+  buildHarnessCommandResolutionDiagnosticRows,
   checkHarnessLaunchAvailable,
   execHarnessCommand,
 } from "../../harness-process.js";
@@ -1708,9 +1705,11 @@ export class ClaudeAgentClient implements AgentClient {
 
       return {
         diagnostic: formatProviderDiagnostic("Claude Code", [
-          ...(await buildCommandResolutionDiagnosticRows(launch, {
-            knownBinaryNames: ["claude"],
-          })),
+          ...(await buildHarnessCommandResolutionDiagnosticRows(
+            launch,
+            claudeProbeEnv(this.harnessEnvironment, this.runtimeSettings, {}),
+            { knownBinaryNames: ["claude"] },
+          )),
           ...(await buildHarnessBinaryDiagnosticRows(
             launch,
             availability,

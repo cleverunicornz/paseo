@@ -20,8 +20,10 @@ import {
 } from "./provider-launch-config.js";
 import {
   buildBinaryDiagnosticRows,
+  buildCommandResolutionDiagnosticRows,
   resolveBinaryVersion,
   type BinaryDiagnosticRowsOptions,
+  type CommandResolutionDiagnosticRowsOptions,
   type DiagnosticEntry,
 } from "./providers/diagnostic-utils.js";
 
@@ -88,4 +90,13 @@ export function buildHarnessBinaryDiagnosticRows(
   options: Omit<BinaryDiagnosticRowsOptions, "versionEnv"> = {},
 ): Promise<DiagnosticEntry[]> {
   return buildBinaryDiagnosticRows(launch, availability, { ...options, versionEnv: env });
+}
+
+/** The `which` and `$SHELL -lc 'type -a …'` lookups of the harness binary run with `env`. */
+export function buildHarnessCommandResolutionDiagnosticRows(
+  launch: ResolvedProviderLaunch,
+  env: HarnessSpawnEnv,
+  options: Omit<CommandResolutionDiagnosticRowsOptions, "probeEnv">,
+): Promise<DiagnosticEntry[]> {
+  return buildCommandResolutionDiagnosticRows(launch, { ...options, probeEnv: env });
 }
