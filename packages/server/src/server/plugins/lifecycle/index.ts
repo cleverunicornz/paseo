@@ -253,13 +253,20 @@ export class PluginHookHandlers implements PluginLifecycleRegistration {
         }
         return request;
       }
+      // Every handler runs; the delivery is acknowledged only when all of them
+      // resolved, so the daemon can tell a recorded timeline item from a lost one.
+      const failures: string[] = [];
       for (const handler of this.events.get(name) ?? []) {
         controller.signal.throwIfAborted();
         try {
           await handler(structuredClone(input), { paseo, signal: controller.signal });
         } catch (error) {
           console.error(`Lifecycle hook ${name} failed`, error);
+          failures.push(error instanceof Error ? error.message : String(error));
         }
+      }
+      if (failures.length > 0) {
+        throw new Error(`Lifecycle hook ${name} failed: ${failures.join("; ")}`);
       }
       return null;
     } finally {

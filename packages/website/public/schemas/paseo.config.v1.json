@@ -251,6 +251,30 @@
                 }
               },
               "additionalProperties": false
+            },
+            "shutdown": {
+              "type": "object",
+              "properties": {
+                "timelineDrainMs": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 86400000
+                }
+              },
+              "additionalProperties": false
+            },
+            "singleAgent": {
+              "type": "boolean"
+            },
+            "web": {
+              "type": "object",
+              "properties": {
+                "basePath": {
+                  "type": "string",
+                  "pattern": "^\\/(?:[A-Za-z0-9._~-]+\\/)*(?:[A-Za-z0-9._~-]+)?$"
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false

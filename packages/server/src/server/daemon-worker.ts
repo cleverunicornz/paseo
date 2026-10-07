@@ -6,6 +6,11 @@ import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
+import {
+  DEFAULT_TIMELINE_DRAIN_MS,
+  SHUTDOWN_GRACE_MS,
+  TIMELINE_DRAIN_FAILED_EXIT_CODE,
+} from "./session-runtime-config.js";
 
 process.title = "Paseo Daemon";
 
@@ -161,13 +166,16 @@ async function main() {
       );
 
       shutdownPromise = (async () => {
+        // Shutdown waits for plugins to acknowledge timeline items, so the hard
+        // deadline covers that drain plus the rest of the teardown.
+        const drainMs = config.sessionRuntime?.timelineDrainMs ?? DEFAULT_TIMELINE_DRAIN_MS;
         const forceExit = setTimeout(() => {
           logger.warn(
             { signal, reason, ...getProcessDiagnostics() },
             "Forcing shutdown - HTTP server didn't close in time",
           );
           process.exit(1);
-        }, 10000);
+        }, drainMs + SHUTDOWN_GRACE_MS);
 
         try {
           if (!daemon) {
@@ -175,9 +183,16 @@ async function main() {
             clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop();
+          const result = await daemon.stop();
           clearTimeout(forceExit);
           logger.info("Server closed");
+          if (result.timelineDrain.status === "failed") {
+            logger.error(
+              { exitCode: TIMELINE_DRAIN_FAILED_EXIT_CODE },
+              "Exiting with the timeline-drain-failed status",
+            );
+            return TIMELINE_DRAIN_FAILED_EXIT_CODE;
+          }
           return options?.successExitCode ?? 0;
         } catch (err) {
           clearTimeout(forceExit);

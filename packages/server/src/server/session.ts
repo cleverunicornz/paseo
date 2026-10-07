@@ -7966,6 +7966,9 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.fork_context.request" }>,
   ): Promise<void> {
     try {
+      if (this.agentManager.isSingleAgent()) {
+        throw new Error("This Paseo runs one agent at a time; forking an agent is unavailable");
+      }
       const snapshot = await ensureAgentLoaded(msg.agentId, {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,

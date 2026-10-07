@@ -76,6 +76,31 @@ describe("normalizeStoredHostProfile", () => {
     expect(profile?.connections[0]).not.toHaveProperty("password");
   });
 
+  it("keeps a direct TCP connection's base path as part of its identity", () => {
+    const profile = normalizeStoredHostProfile({
+      serverId: "srv_prefixed",
+      label: "Prefixed",
+      connections: [
+        {
+          id: "direct:dash.example:443/s/abc/",
+          type: "directTcp",
+          endpoint: "dash.example:443",
+          useTls: true,
+          basePath: "/s/abc/",
+        },
+      ],
+      preferredConnectionId: "direct:dash.example:443/s/abc/",
+    });
+
+    expect(profile?.connections[0]).toEqual({
+      id: "direct:dash.example:443/s/abc/",
+      type: "directTcp",
+      endpoint: "dash.example:443",
+      useTls: true,
+      basePath: "/s/abc/",
+    });
+  });
+
   it("moves a stored direct TCP password to the host profile", () => {
     const profile = normalizeStoredHostProfile({
       serverId: "srv_legacy",

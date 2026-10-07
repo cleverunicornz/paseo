@@ -33,7 +33,7 @@ import { useWorkspaceClipboardActions } from "@/hooks/use-workspace-clipboard-ac
 import { useToast } from "@/contexts/toast-context";
 import { type ShortcutOverrides } from "@/keyboard/keyboard-shortcuts";
 import { useKeyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatcher-context";
-import { useHostFeature } from "@/runtime/host-features";
+import { useAgentCreationBlocked, useHostFeature } from "@/runtime/host-features";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import { useWorkspaceDirectory, useWorkspaceFields } from "@/stores/session-store-hooks";
 import {
@@ -195,6 +195,7 @@ export function useWorkspaceCommandCenterActions(): void {
   const isPinned = fields?.pinnedAt != null;
   const isCompact = useIsCompactFormFactor();
   const canPin = useHostFeature(serverId, "workspacePinning");
+  const canCreateAgent = !useAgentCreationBlocked(serverId);
   const persistenceKey =
     serverId && fields
       ? buildWorkspaceTabPersistenceKey({ serverId, workspaceId: fields.id })
@@ -289,6 +290,7 @@ export function useWorkspaceCommandCenterActions(): void {
           isGit,
           canPin,
           canShowSetup,
+          canCreateAgent,
         },
         activeTabKind,
         activeTabIndex,
@@ -310,6 +312,7 @@ export function useWorkspaceCommandCenterActions(): void {
       activeTabKind,
       canPin,
       canShowSetup,
+      canCreateAgent,
       copyBranchName,
       copyPath,
       currentBranch,

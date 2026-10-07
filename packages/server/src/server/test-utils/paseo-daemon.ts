@@ -50,6 +50,10 @@ interface TestPaseoDaemonOptions {
   autoArchiveAfterMerge?: boolean;
   pluginsEnabled?: PaseoDaemonConfig["pluginsEnabled"];
   plugins?: PaseoDaemonConfig["plugins"];
+  sessionRuntime?: PaseoDaemonConfig["sessionRuntime"];
+  mcpGatewayBackends?: PaseoDaemonConfig["mcpGatewayBackends"];
+  /** `true` (any Host) unless a test checks the allowlist. */
+  hostnames?: PaseoDaemonConfig["hostnames"];
 }
 
 export interface TestPaseoDaemon {
@@ -174,7 +178,7 @@ async function prepareTestDaemonConfig(
     daemonVersion: options.daemonVersion,
     desktopManaged: options.desktopManaged,
     corsAllowedOrigins: options.corsAllowedOrigins ?? [],
-    hostnames: true,
+    hostnames: options.hostnames ?? true,
     mcpEnabled: options.mcpEnabled ?? true,
     staticDir,
     mcpDebug: options.mcpDebug ?? false,
@@ -203,6 +207,13 @@ async function prepareTestDaemonConfig(
     autoArchiveAfterMerge: options.autoArchiveAfterMerge,
     pluginsEnabled: options.pluginsEnabled,
     plugins: options.plugins,
+    mcpGatewayBackends: options.mcpGatewayBackends,
+    // Tests close daemons whose plugins may never answer; keep the drain short.
+    sessionRuntime: options.sessionRuntime ?? {
+      timelineDrainMs: 2_000,
+      singleAgent: false,
+      webBasePath: "/",
+    },
   };
   return { config, paseoHomeRoot, paseoHome, staticDir };
 }

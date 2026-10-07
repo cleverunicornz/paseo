@@ -304,6 +304,67 @@ external `href` or `xlink:href` references are rejected. Fragment references suc
 allowed. Paseo reads and sanitizes the file when the plugin starts; the string is never an inline
 SVG or URL.
 
+### Stop readiness
+
+A controller that stops the daemon's host asks `GET /api/stop-readiness` first and calls
+`POST /api/begin-stopping` ([Session containers](/docs/session-containers)). The answer comes from
+the one plugin that registers a stop-readiness provider during setup:
+
+```ts
+import type { PluginStopReadinessProvider } from "@getpaseo/plugin/server";
+
+const provider: PluginStopReadinessProvider = {
+  // Every GET /api/stop-readiness. Carry no credential.
+  readiness: () => ({
+    ready: recorder.caughtUp() && wip.pushed(),
+    timeline: {
+      ready: recorder.caughtUp(),
+      epoch: recorder.epoch(), // the agent's timeline epoch, a string; null before any item
+      emitted_through: recorder.lastSeen(),
+      acknowledged_through: recorder.lastSaved(),
+    },
+    wip: wip.pushed()
+      ? { ready: true, ref: "refs/heads/wip/agent-1", sha: wip.sha() }
+      : { ready: false, reason: "WIP commit not pushed yet" },
+  }),
+  // On begin-stopping, after running turns are cancelled. May run again on a later request.
+  stop: ({ signal }) => wip.commitAndPush({ signal }),
+  // On begin-stopping, alongside stop, and at shutdown, where the deadline aborts the signal.
+  drain: ({ signal }) => recorder.flush({ signal }),
+};
+
+if (typeof server.registerStopReadiness === "function") server.registerStopReadiness(provider);
+```
+
+- `readiness` may return a promise and has 10 seconds to answer.
+- `stop` and `drain` are optional. They run until they settle or their signal aborts.
+- The daemon recomputes `ready`. While any plugin has a timeline item pending or failed, `timeline`
+  is not ready with reason `N timeline items not acknowledged`. Its `epoch`, `emitted_through` and
+  `acknowledged_through` then come from the daemon's own record.
+- It refuses an answer of another shape, or a `ref` that is not a plain ref name or a `sha` that is not a full commit id.
+- It redacts URL user information in a `reason`.
+
+### Gateway calls
+
+`server.mcp.callTool()` calls a [gateway backend](/docs/mcp#reach-mcp-backends-through-the-daemon)
+for an agent, without your plugin holding a token:
+
+```ts
+const result = await server.mcp.callTool({
+  backend: "memory",
+  tool: "remember",
+  arguments: { text: "deploy finished" },
+  onBehalfOf: event.agent.id,
+  timeoutMs: 60_000, // optional, 1 to 600000
+});
+// { content, structuredContent?, isError? }
+```
+
+The daemon makes the call as that agent's own request to `/mcp/backends/memory`. It goes through
+the same `mcp_gateway.upstream` hooks, including your own, and the backend sees the agent's
+`X-Paseo-*` identity headers. The agent must be live; any other id is refused. Your plugin sees the
+result or an error message, never the agent's token.
+
 ## Entry point and cleanup
 
 Each present entry default-exports one contribution function and returns cleanup. Client entries
@@ -492,10 +553,22 @@ server.on("agent.timeline_item", async (event) => {
 
 The daemon emits one event per live timeline row it streams to its clients, once, in `seq` order.
 Rows loaded from provider history on resume or import are not delivered. Callbacks start in order
-but can overlap, so key records on `agent.id`, `epoch` and `seq` rather than arrival order. Delivery
-never waits for a callback and a failed delivery is not retried: a consumer that misses rows, or
-starts late, reads the agent's timeline from its last `seq` with the SDK. Internal utility agents
-emit nothing.
+but can overlap, so key records on `agent.id`, `epoch` and `seq` rather than arrival order. Internal
+utility agents emit nothing.
+
+The agent never waits for a callback. The daemon does track each item until your callbacks for it
+resolve: that is the acknowledgement. This event has no hook timeout. A callback that throws leaves
+the item unacknowledged. The daemon then offers the same event again:
+
+- on each `GET /api/stop-readiness` and `POST /api/begin-stopping`, once the item failed at least
+  2 seconds before;
+- once more when shutdown starts its drain.
+
+During ordinary work a failed item is not retried. So make your handler idempotent on `agent.id`,
+`epoch` and `seq`, and retry inside it what you need to keep sooner. At shutdown the daemon waits
+for unacknowledged items up to its drain deadline before it stops plugins, and reports any left over
+([Session containers](/docs/session-containers)). A consumer that misses rows, or starts late,
+reads the agent's timeline from its last `seq` with the SDK.
 
 ### Answer a permission request
 
@@ -689,18 +762,18 @@ saved; environment overrides are not persisted with it.
 
 ### Context and cleanup
 
-| Contract                           | Behavior                                                                                                  |
-| ---------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `context.paseo`                    | Existing SDK connected to this daemon                                                                     |
-| `context.signal`                   | Aborted on invocation timeout or plugin stop; pass to external requests                                   |
-| Input data                         | Detached snapshot; change state through returned requests or SDK commands                                 |
-| Registration result                | Idempotent remover, e.g. `const remove = server.on(...); remove();`                                       |
-| Reload, disable, removal, shutdown | Remaining registrations removed                                                                           |
-| Unknown hook name                  | Registration fails                                                                                        |
-| Hook timeout                       | 30 seconds; aborts the signal. A before hook fails the pending operation; an event handler logs an error. |
-| Event-handler error                | Logged against plugin; original operation continues                                                       |
-| Event delivery                     | Live, best effort; no replay, persistence, or automatic retry                                             |
-| Event concurrency                  | Different events may overlap; callback completion order is not guaranteed                                 |
+| Contract                           | Behavior                                                                                                                                  |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `context.paseo`                    | Existing SDK connected to this daemon                                                                                                     |
+| `context.signal`                   | Aborted on invocation timeout or plugin stop; pass to external requests                                                                   |
+| Input data                         | Detached snapshot; change state through returned requests or SDK commands                                                                 |
+| Registration result                | Idempotent remover, e.g. `const remove = server.on(...); remove();`                                                                       |
+| Reload, disable, removal, shutdown | Remaining registrations removed                                                                                                           |
+| Unknown hook name                  | Registration fails                                                                                                                        |
+| Hook timeout                       | 30 seconds; aborts the signal. A before hook fails the pending operation; an event handler logs an error. `agent.timeline_item` has none. |
+| Event-handler error                | Logged against plugin; original operation continues. An `agent.timeline_item` stays unacknowledged.                                       |
+| Event delivery                     | Live, best effort; no replay, persistence, or automatic retry                                                                             |
+| Event concurrency                  | Different events may overlap; callback completion order is not guaranteed                                                                 |
 
 ### Complete examples
 

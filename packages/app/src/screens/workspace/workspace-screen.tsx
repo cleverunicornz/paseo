@@ -113,6 +113,7 @@ import { createWorkspaceBrowser, useBrowserStore } from "@/desktop/browser/store
 import { getDesktopHost } from "@/desktop/host";
 import { buildProviderCommand } from "@/utils/provider-command-templates";
 import { generateDraftId } from "@/stores/draft-keys";
+import { useAgentCreationBlocked } from "@/runtime/host-features";
 import { resolveWorkspaceRouteId } from "@/utils/workspace-identity";
 import { useOpenAgentTabLabels } from "@/subagents/use-open-agent-tab-labels";
 import {
@@ -2379,11 +2380,14 @@ function WorkspaceScreenContent({
     [tabFallbackLabels, tabs],
   );
 
+  // Keyboard shortcuts and command-center actions all land here.
+  const agentCreationBlocked = useAgentCreationBlocked(normalizedServerId);
   const handleCreateDraftTab = useCallback(
     (input?: { paneId?: string }) => {
+      if (agentCreationBlocked) return;
       openWorkspaceDraftTab({ paneId: input?.paneId });
     },
-    [openWorkspaceDraftTab],
+    [agentCreationBlocked, openWorkspaceDraftTab],
   );
 
   const handleCreateTerminal = useStableEvent((input?: { paneId?: string }) => {

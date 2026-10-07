@@ -139,7 +139,9 @@ agent's `Authorization` and every `X-Paseo-*` header, then sets:
 
 Paseo holds no backend credential. A plugin supplies one per request through the
 [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks); without one the request goes
-upstream with no `Authorization`. Unknown backend names get `404`, a missing or unknown token gets
+upstream with no `Authorization`. A plugin can call a backend for a live agent with
+[`server.mcp.callTool()`](/docs/plugins/reference#gateway-calls); that call takes this same path,
+hooks and headers, and the plugin never holds the agent's token. Unknown backend names get `404`, a missing or unknown token gets
 `401`, an unreachable backend gets `502`, and a backend that sends no response headers within its
 `responseTimeoutMs` gets `504`. Backend responses, including errors, pass through unchanged.
 

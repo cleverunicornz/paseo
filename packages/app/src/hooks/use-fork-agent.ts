@@ -117,6 +117,12 @@ function buildForkDraftTabTarget(
   return setup ? { kind: "draft", draftId, setup } : { kind: "draft", draftId };
 }
 
+/** A single-agent host refuses forks, so the fork menu is not offered there. */
+export function useForkOffered(serverId: string, readOnly: boolean): boolean {
+  const isSingleAgentHost = useHostFeature(serverId, "singleAgent");
+  return !readOnly && !isSingleAgentHost;
+}
+
 /**
  * Shared fork driver behind both turn-footer fork affordances: the completed
  * turn's footer (which supplies a boundary pinned to that turn) and the

@@ -253,7 +253,10 @@ function resolveDaemonDownloadTarget(daemon?: HostProfile): DownloadTarget {
   let parsed: URL;
   try {
     parsed = new URL(
-      buildDaemonWebSocketUrl(connection.endpoint, { useTls: connection.useTls ?? false }),
+      buildDaemonWebSocketUrl(connection.endpoint, {
+        useTls: connection.useTls ?? false,
+        basePath: connection.basePath,
+      }),
     );
   } catch {
     return { baseUrl: null, authHeader: null, authCredentials: null };
@@ -277,7 +280,8 @@ function resolveDaemonDownloadTarget(daemon?: HostProfile): DownloadTarget {
 
   parsed.pathname = parsed.pathname.replace(/\/ws\/?$/, "/");
 
-  const baseUrl = parsed.origin;
+  // Keeps the daemon's base path; `buildDownloadUrl` resolves against it.
+  const baseUrl = `${parsed.origin}${parsed.pathname}`;
   const authHeader = authCredentials
     ? `Basic ${btoa(`${authCredentials.username}:${authCredentials.password}`)}`
     : null;
@@ -290,7 +294,7 @@ function buildDownloadUrl(
   token: string,
   authCredentials: { username: string; password: string } | null,
 ): string {
-  const url = new URL("/api/files/download", baseUrl);
+  const url = new URL("api/files/download", baseUrl);
   url.searchParams.set("token", token);
   if (authCredentials) {
     url.username = authCredentials.username;

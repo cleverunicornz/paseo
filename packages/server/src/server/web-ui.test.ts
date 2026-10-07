@@ -73,6 +73,7 @@ function createApp(options: {
   enabled: boolean;
   distDir: string | null;
   publicDir?: string;
+  basePath?: string;
 }): express.Application {
   const app = express();
   app.use(
@@ -81,6 +82,7 @@ function createApp(options: {
       distDir: options.distDir,
       label: "test-label",
       logger,
+      ...(options.basePath ? { basePath: options.basePath } : {}),
     }),
   );
   app.get("/api/health", (_req, res) => res.json({ ok: true }));
@@ -155,6 +157,33 @@ describe("daemon web UI route module", () => {
     expect(res.body).toContain('"listen":"localhost:');
     expect(res.body).toContain('"useTls":false');
     expect(res.body).toContain('"label":"test-label"');
+  });
+
+  test("under a base path the index references, hint and runtime base carry the prefix", async () => {
+    await writeFile(
+      path.join(distDir, "index.html"),
+      '<html><head><link rel="icon" href="/favicon.ico" /><link href="//cdn.example/x.css"></head><body><script src="/_expo/static/js/web/index-0123456789abcdef0123.js" defer></script></body></html>',
+    );
+    const app = createApp({ enabled: true, distDir, publicDir, basePath: "/s/abc/" });
+
+    const res = await request(app, "GET", "/", { host: "dash.example" });
+
+    expect(res.body).toContain('href="/s/abc/favicon.ico"');
+    expect(res.body).toContain('src="/s/abc/_expo/static/js/web/index-0123456789abcdef0123.js"');
+    expect(res.body).toContain('href="//cdn.example/x.css"');
+    expect(res.body).toContain('window.__PASEO_WEB_BASE_PATH__="/s/abc"');
+    // Behind a proxy on the default port the hint still names a port.
+    expect(res.body).toContain('"listen":"dash.example:80"');
+    expect(res.body).toContain('"basePath":"/s/abc/"');
+  });
+
+  test("at the origin root the index is unchanged and the runtime base is empty", async () => {
+    const app = createApp({ enabled: true, distDir, publicDir });
+
+    const res = await request(app, "GET", "/");
+
+    expect(res.body).toContain('window.__PASEO_WEB_BASE_PATH__=""');
+    expect(res.body).not.toContain('"basePath"');
   });
 
   test("injects hint before closing head tag", async () => {

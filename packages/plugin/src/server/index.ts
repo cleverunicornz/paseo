@@ -18,3 +18,11 @@ export type {
   PluginBeforeRequests,
   PluginLifecycleRegistration,
 } from "./lifecycle.js";
+export type {
+  PluginStopReadiness,
+  PluginStopReadinessProvider,
+  PluginStopSignalContext,
+  PluginTimelineStopReadiness,
+  PluginWipStopReadiness,
+} from "./stop-readiness.js";
+export type { PluginMcpApi, PluginMcpToolCall, PluginMcpToolResult } from "./mcp.js";

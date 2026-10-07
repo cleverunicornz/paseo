@@ -322,6 +322,12 @@ Server entries register lifecycle observers with `server.on()` and request trans
 owns callback shapes, ordering, and failure behavior. `plugin-examples/lifecycle-logger` registers every
 hook except `agent.timeline_item`, whose volume would crowd its bounded log; `plugin-examples/lifecycle-actions` demonstrates common automation callbacks.
 
+`agent.timeline_item` deliveries have no per-call timeout, unlike every other hook. A recorder's
+answer is the only evidence an item was kept, so a timeout would turn a slow write into a silent
+loss. Shutdown bounds the wait instead (`daemon.shutdown.timelineDrainMs`), and anything still
+unanswered is reported, never dropped quietly. Keep that asymmetry if you add another hook a
+plugin records from.
+
 Emit from the operation owner, not a client subscription. Provider history replay must not trigger
 live hooks. Observers must not be awaited inside agent mutations: a callback can send a prompt or
 answer a permission through its own daemon session. Awaiting it there deadlocks that command.

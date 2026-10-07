@@ -24,9 +24,17 @@ import type {
   PluginProcessMessage,
   PluginProcessRequest,
   PluginProviderMetadata,
+  PluginStopReadinessCapabilities,
+  PluginStopReadinessOperation,
 } from "./plugin-process-protocol.js";
 import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
 import { PluginSessionSocket } from "./session-socket.js";
+import {
+  TimelineDeliveryLedger,
+  type TimelineDelivery,
+  type TimelineDrainResult,
+  type UnacknowledgedTimeline,
+} from "./timeline-deliveries.js";
 
 const CLIENT_ENTRY_FILENAMES = ["index.client.ts", "index.client.tsx"] as const;
 const SERVER_ENTRY_FILENAMES = ["index.server.ts", "index.server.tsx"] as const;
@@ -35,6 +43,24 @@ const MAX_LOG_ENTRIES = 500;
 const MAX_LOG_BYTES = 256 * 1024;
 const MAX_LOG_LINE_BYTES = 16 * 1024;
 const SOFT_SHUTDOWN_TIMEOUT_MS = 2_000;
+const STOP_READINESS_TIMEOUT_MS = 10_000;
+const NO_STOP_READINESS: PluginStopReadinessCapabilities = {
+  readiness: false,
+  stop: false,
+  drain: false,
+};
+
+/** One gateway tool call a plugin asked the daemon to make on behalf of an agent. */
+export interface PluginGatewayToolCall {
+  pluginId: string;
+  backend: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  onBehalfOf: string;
+  timeoutMs: number;
+}
+
+export type PluginGatewayToolCaller = (call: PluginGatewayToolCall) => Promise<unknown>;
 
 interface PluginOutputStream {
   on(event: "data", listener: (chunk: Buffer | string) => void): this;
@@ -55,7 +81,7 @@ interface PluginChild {
 interface PendingInvocation {
   resolve: (output: unknown) => void;
   reject: (error: Error) => void;
-  timeout: ReturnType<typeof setTimeout>;
+  timeout: ReturnType<typeof setTimeout> | null;
 }
 
 interface LoadedPlugin {
@@ -65,6 +91,7 @@ interface LoadedPlugin {
   methods: ReadonlySet<string>;
   hooks: { events: string[]; before: string[] };
   providers: readonly PluginProviderMetadata[];
+  stopReadiness: PluginStopReadinessCapabilities;
   child: PluginChild | null;
   outputCapture: PluginOutputCapture | null;
   pending: Map<string, PendingInvocation>;
@@ -291,6 +318,8 @@ export class PluginRuntime {
   private readonly spawnChild: () => PluginChild;
   private sessionHost: PluginPaseoSessionHost | null;
   private readonly listeners = new Set<(pluginId: string, error?: string) => void>();
+  private readonly timelineDeliveries = new TimelineDeliveryLedger();
+  private gatewayToolCaller: PluginGatewayToolCaller | null = null;
 
   constructor(
     logger: pino.Logger,
@@ -300,6 +329,11 @@ export class PluginRuntime {
     this.logger = logger.child({ module: "plugins" });
     this.spawnChild = dependencies.spawnChild ?? spawnPluginChild;
     this.sessionHost = dependencies.sessionHost ?? null;
+  }
+
+  /** How `server.mcp.callTool` reaches the gateway; bound once the agent manager exists. */
+  bindGatewayToolCaller(caller: PluginGatewayToolCaller): void {
+    this.gatewayToolCaller = caller;
   }
 
   bindPaseoSessionHost(sessionHost: PluginPaseoSessionHost): void {
@@ -450,6 +484,10 @@ export class PluginRuntime {
       if (!loaded.hooks.events.includes(name)) {
         continue;
       }
+      if (name === "agent.timeline_item") {
+        this.deliverTimelineItem(loaded, event as PluginLifecycleEvents["agent.timeline_item"]);
+        continue;
+      }
       void this.request(loaded, {
         type: "hook",
         requestId: randomUUID(),
@@ -464,6 +502,167 @@ export class PluginRuntime {
         );
       });
     }
+  }
+
+  /**
+   * A timeline item stays tracked until its plugin answers. It has no per-call
+   * timeout: a slow recorder is waited for, and shutdown bounds the wait with
+   * its drain deadline instead of dropping the item.
+   */
+  private deliverTimelineItem(
+    loaded: LoadedPlugin,
+    event: PluginLifecycleEvents["agent.timeline_item"],
+  ): void {
+    const delivery = {
+      pluginId: loaded.id,
+      agentId: event.agent.id,
+      epoch: event.epoch,
+      seq: event.seq,
+    };
+    this.timelineDeliveries.sent(delivery, event);
+    this.dispatchTimelineItem(loaded, delivery, event);
+  }
+
+  private dispatchTimelineItem(
+    loaded: LoadedPlugin,
+    delivery: TimelineDelivery,
+    event: PluginLifecycleEvents["agent.timeline_item"],
+  ): void {
+    let request: Promise<unknown>;
+    try {
+      request = this.request(
+        loaded,
+        {
+          type: "hook",
+          requestId: randomUUID(),
+          kind: "event",
+          name: "agent.timeline_item",
+          input: event,
+        },
+        { timeoutMs: null },
+      );
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    request.then(
+      () => this.timelineDeliveries.acknowledged(delivery),
+      (error) => {
+        this.timelineDeliveries.failed(delivery);
+        this.appendLog(
+          loaded.id,
+          "stderr",
+          `Lifecycle hook agent.timeline_item failed for agent ${delivery.agentId} seq ${delivery.seq}: ${describeError(error)}`,
+        );
+      },
+    );
+  }
+
+  /**
+   * Offers each failed timeline item again, unchanged, to its plugin if that
+   * plugin still subscribes, once it failed at least `minAgeMs` ago. A
+   * recorder that recovered acknowledges it; one that throws again leaves it
+   * failed for the next offer.
+   */
+  reofferFailedTimelineItems(minAgeMs: number): void {
+    for (const loaded of this.plugins.values()) {
+      if (!loaded.child || !loaded.hooks.events.includes("agent.timeline_item")) continue;
+      for (const { delivery, event } of this.timelineDeliveries.takeFailed(loaded.id, minAgeMs)) {
+        this.dispatchTimelineItem(loaded, delivery, event);
+      }
+    }
+  }
+
+  /**
+   * Offers every failed item once more, then waits for every timeline item
+   * still in flight to any plugin, up to the deadline. Plugins keep running
+   * meanwhile; stop them only afterwards.
+   */
+  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult> {
+    this.reofferFailedTimelineItems(0);
+    return this.timelineDeliveries.drain(deadlineMs);
+  }
+
+  /** Running plugins that registered a stop-readiness provider with this operation, by id. */
+  listStopReadinessProviders(operation: PluginStopReadinessOperation): string[] {
+    return [...this.plugins.values()]
+      .filter((loaded) => loaded.child && loaded.stopReadiness[operation])
+      .map((loaded) => loaded.id)
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  /** Pending and failed timeline items of every plugin; null when all are acknowledged. */
+  unacknowledgedTimeline(): UnacknowledgedTimeline | null {
+    return this.timelineDeliveries.unacknowledged();
+  }
+
+  /**
+   * `readiness` answers within a short timeout. `stop` and `drain` run until
+   * the provider settles them; aborting `signal` aborts the provider's signal.
+   */
+  async requestStopReadiness(input: {
+    pluginId: string;
+    operation: PluginStopReadinessOperation;
+    signal?: AbortSignal;
+  }): Promise<unknown> {
+    const loaded = this.plugins.get(input.pluginId);
+    if (!loaded?.stopReadiness[input.operation]) {
+      throw new Error(
+        `Plugin ${input.pluginId} does not provide stop readiness ${input.operation}`,
+      );
+    }
+    const requestId = randomUUID();
+    const cancel = () => {
+      if (loaded.child?.connected) {
+        void send(loaded.child, { type: "stop_readiness.cancel", requestId }).catch(() => {});
+      }
+    };
+    input.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      return await this.request(
+        loaded,
+        { type: "stop_readiness", requestId, operation: input.operation },
+        { timeoutMs: input.operation === "readiness" ? STOP_READINESS_TIMEOUT_MS : null },
+      );
+    } finally {
+      input.signal?.removeEventListener("abort", cancel);
+    }
+  }
+
+  private answerGatewayToolCall(
+    loaded: LoadedPlugin,
+    message: Extract<PluginProcessMessage, { type: "mcp.call_tool" }>,
+  ): void {
+    const caller = this.gatewayToolCaller;
+    const call = caller
+      ? caller({
+          pluginId: loaded.id,
+          backend: message.backend,
+          tool: message.tool,
+          arguments: message.arguments,
+          onBehalfOf: message.onBehalfOf,
+          timeoutMs: message.timeoutMs,
+        })
+      : Promise.reject(new Error("Gateway tool calls are unavailable"));
+    void call
+      .then(
+        (result): PluginProcessRequest => ({
+          type: "mcp.call_tool.result",
+          callId: message.callId,
+          ok: true,
+          result,
+        }),
+        (error: unknown): PluginProcessRequest => ({
+          type: "mcp.call_tool.result",
+          callId: message.callId,
+          ok: false,
+          error: describeError(error),
+        }),
+      )
+      .then((answer) => {
+        if (loaded.child?.connected) return send(loaded.child, answer);
+        return undefined;
+      })
+      .catch(() => undefined);
   }
 
   async before<Name extends keyof PluginBeforeRequests>(
@@ -517,22 +716,26 @@ export class PluginRuntime {
   private request(
     loaded: LoadedPlugin,
     message: Extract<PluginProcessRequest, { requestId: string }>,
+    options: { timeoutMs: number | null } = { timeoutMs: REQUEST_TIMEOUT_MS },
   ): Promise<unknown> {
     const child = loaded.child;
     const pluginId = loaded.id;
     if (!child) throw new Error(`Plugin ${pluginId} has no server entry`);
     const requestId = message.requestId;
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        loaded.pending.delete(requestId);
-        if (message.type === "hook") {
-          void send(child, { type: "hook.cancel", requestId }).catch(() => {});
-        }
-        reject(new Error(`Plugin RPC timed out: ${pluginId}.${message.type}`));
-      }, REQUEST_TIMEOUT_MS);
+      const timeout =
+        options.timeoutMs === null
+          ? null
+          : setTimeout(() => {
+              loaded.pending.delete(requestId);
+              if (message.type === "hook") {
+                void send(child, { type: "hook.cancel", requestId }).catch(() => {});
+              }
+              reject(new Error(`Plugin RPC timed out: ${pluginId}.${message.type}`));
+            }, options.timeoutMs);
       loaded.pending.set(requestId, { resolve, reject, timeout });
       void send(child, message).catch((error) => {
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         loaded.pending.delete(requestId);
         reject(error);
       });
@@ -566,6 +769,7 @@ export class PluginRuntime {
         methods: new Set(),
         hooks: { events: [], before: [] },
         providers: [],
+        stopReadiness: NO_STOP_READINESS,
         child: null,
         outputCapture: null,
         pending: new Map(),
@@ -674,6 +878,7 @@ export class PluginRuntime {
       methods: new Set(ready.methods),
       hooks: ready.hooks ?? { events: [], before: [] },
       providers: ready.providers ?? [],
+      stopReadiness: ready.stopReadiness ?? NO_STOP_READINESS,
       child,
       outputCapture,
       pending,
@@ -762,11 +967,15 @@ export class PluginRuntime {
       this.handleProviderMessage(loaded, message);
       return;
     }
+    if (message.type === "mcp.call_tool") {
+      this.answerGatewayToolCall(loaded, message);
+      return;
+    }
     if (message.type !== "result" && message.type !== "error") return;
     const pending = loaded.pending.get(message.requestId);
     if (!pending) return;
     loaded.pending.delete(message.requestId);
-    clearTimeout(pending.timeout);
+    if (pending.timeout) clearTimeout(pending.timeout);
     if (message.type === "result") pending.resolve(message.output);
     else pending.reject(new Error(message.error));
   }
@@ -1121,7 +1330,7 @@ export class PluginRuntime {
 
   private rejectPending(loaded: LoadedPlugin, message: string): void {
     for (const invocation of loaded.pending.values()) {
-      clearTimeout(invocation.timeout);
+      if (invocation.timeout) clearTimeout(invocation.timeout);
       invocation.reject(new Error(message));
     }
     loaded.pending.clear();

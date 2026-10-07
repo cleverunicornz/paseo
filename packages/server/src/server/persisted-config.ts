@@ -25,6 +25,10 @@ import {
   isAcceptedEnvPassthroughEntry,
 } from "./agent/model-gateway-env.js";
 import { LocalToolsConfigSchema, ToolTreeConfigSchema } from "./local-tools/config.js";
+import { MAX_TIMELINE_DRAIN_MS } from "./session-runtime-config.js";
+
+/** A base path with or without its trailing slash; `session-runtime-config` normalizes it. */
+const WEB_BASE_PATH_INPUT_PATTERN = /^\/(?:[A-Za-z0-9._~-]+\/)*(?:[A-Za-z0-9._~-]+)?$/;
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
 export const LogFormatSchema = z.enum(["pretty", "json"]);
@@ -344,6 +348,19 @@ export const PersistedConfigSchema = z
           .strict()
           .optional(),
         auth: DaemonAuthSchema.optional(),
+        shutdown: z
+          .object({
+            timelineDrainMs: z.number().int().min(0).max(MAX_TIMELINE_DRAIN_MS).optional(),
+          })
+          .strict()
+          .optional(),
+        singleAgent: z.boolean().optional(),
+        web: z
+          .object({
+            basePath: z.string().regex(WEB_BASE_PATH_INPUT_PATTERN).optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .transform(({ allowedHosts, ...daemon }) => {

@@ -30,6 +30,57 @@ export function selectHostFeature(
   return hostSupportsFeature(state.sessions[serverId]?.serverInfo, feature);
 }
 
+interface AgentCreationSessionState {
+  sessions: Record<
+    string,
+    | {
+        serverInfo: DaemonServerInfo | null;
+        agents: ReadonlyMap<string, { archivedAt?: Date | null }>;
+      }
+    | undefined
+  >;
+}
+
+/**
+ * A single-agent host refuses a second live agent, so every way of starting
+ * one is withdrawn once it has a live agent.
+ */
+export function selectAgentCreationBlocked(
+  state: AgentCreationSessionState,
+  serverId: string,
+): boolean {
+  const session = state.sessions[serverId];
+  if (!hostSupportsFeature(session?.serverInfo, "singleAgent")) return false;
+  for (const agent of session?.agents.values() ?? []) {
+    if (!agent.archivedAt) return true;
+  }
+  return false;
+}
+
+/**
+ * True when there is at least one host and every one refuses another agent,
+ * so app-wide ways of starting one (add a project, import a session) lead
+ * nowhere.
+ */
+export function selectEveryHostAgentCreationBlocked(
+  state: AgentCreationSessionState,
+  serverIds: readonly string[],
+): boolean {
+  return (
+    serverIds.length > 0 &&
+    serverIds.every((serverId) => selectAgentCreationBlocked(state, serverId))
+  );
+}
+
+export function useEveryHostAgentCreationBlocked(serverIds: readonly string[]): boolean {
+  return useSessionStore((state) => selectEveryHostAgentCreationBlocked(state, serverIds));
+}
+
+export function useAgentCreationBlocked(serverId: string | null | undefined): boolean {
+  const normalizedServerId = serverId?.trim() ?? "";
+  return useSessionStore((state) => selectAgentCreationBlocked(state, normalizedServerId));
+}
+
 export function useHostFeature(
   serverId: string | null | undefined,
   feature: HostFeatureName,

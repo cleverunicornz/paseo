@@ -39,6 +39,66 @@ describe("server config", () => {
     expect(standaloneConfig.desktopManaged).toBe(false);
   });
 
+  test("loads the session runtime settings from the config file, and lets the environment replace them", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-session-runtime-"));
+    roots.push(paseoHome);
+
+    expect(loadConfig(paseoHome, { env: {} }).sessionRuntime).toEqual({
+      timelineDrainMs: 300_000,
+      singleAgent: false,
+      webBasePath: "/",
+    });
+
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        daemon: {
+          shutdown: { timelineDrainMs: 60_000 },
+          singleAgent: true,
+          web: { basePath: "/s/abc" },
+          hostnames: ["file.example"],
+        },
+      }),
+    );
+    const fromFile = loadConfig(paseoHome, { env: {} });
+    expect(fromFile.sessionRuntime).toEqual({
+      timelineDrainMs: 60_000,
+      singleAgent: true,
+      webBasePath: "/s/abc/",
+    });
+
+    const fromEnv = loadConfig(paseoHome, {
+      env: {
+        PASEO_TIMELINE_DRAIN_MS: "1500",
+        PASEO_SINGLE_AGENT: "false",
+        PASEO_WEB_BASE_PATH: "/s/xyz/",
+        PASEO_HOSTNAMES: "dash.example,.proxy.example",
+      },
+    });
+    expect(fromEnv.sessionRuntime).toEqual({
+      timelineDrainMs: 1_500,
+      singleAgent: false,
+      webBasePath: "/s/xyz/",
+    });
+    // The allowlist from the environment adds to the file's.
+    expect(fromEnv.hostnames).toEqual(["file.example", "dash.example", ".proxy.example"]);
+  });
+
+  test("refuses a base path or drain deadline it cannot use", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-session-runtime-bad-"));
+    roots.push(paseoHome);
+
+    expect(() => loadConfig(paseoHome, { env: { PASEO_WEB_BASE_PATH: "/s/../x/" } })).toThrow(
+      "PASEO_WEB_BASE_PATH must be a path",
+    );
+    expect(() => loadConfig(paseoHome, { env: { PASEO_WEB_BASE_PATH: "s/x/" } })).toThrow(
+      "PASEO_WEB_BASE_PATH must be a path",
+    );
+    expect(() => loadConfig(paseoHome, { env: { PASEO_TIMELINE_DRAIN_MS: "-1" } })).toThrow(
+      "PASEO_TIMELINE_DRAIN_MS must be an integer",
+    );
+  });
+
   test("loads the provider catalog refresh timeout", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-provider-timeout-"));
     roots.push(paseoHome);

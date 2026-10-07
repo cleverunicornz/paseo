@@ -93,6 +93,7 @@ import {
 } from "./provider-subagents/store.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { extractAttention } from "../persistence-hooks.js";
+import { AgentAdmission } from "./agent-admission.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -357,6 +358,8 @@ export interface AgentManagerOptions {
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
+  /** At most one live public agent; a second create, import or resume is refused. */
+  singleAgent?: boolean;
   beforeSteerUnavailableFallback?: (input: {
     agentId: string;
     expectedTurnId: string;
@@ -796,6 +799,7 @@ export class AgentManager {
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
+  private readonly admission: AgentAdmission;
 
   constructor(options: AgentManagerOptions) {
     this.pluginLifecycle = options.pluginLifecycle;
@@ -819,6 +823,12 @@ export class AgentManager {
         options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
     };
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
+    this.admission = new AgentAdmission({
+      singleAgent: options.singleAgent === true,
+      listPublicAgentIds: () =>
+        [...this.agents.values()].filter((agent) => !agent.internal).map((agent) => agent.id),
+      isArchived: async (agentId) => Boolean((await this.registry?.get(agentId))?.archivedAt),
+    });
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
@@ -898,6 +908,43 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+  }
+
+  /**
+   * From here on no new agent and no new turn starts. Agents already live keep
+   * running their current turn, and can still be reloaded or resumed.
+   */
+  beginStopping(): void {
+    this.admission.beginStopping();
+  }
+
+  isStopping(): boolean {
+    return this.admission.isStopping;
+  }
+
+  /** Cancels every public agent's running turn; turns that refuse to stop are logged. */
+  async stopRunningTurns(): Promise<void> {
+    const running = [...this.agents.values()].filter(
+      (agent) => !agent.internal && this.hasInFlightRun(agent.id),
+    );
+    const outcomes = await Promise.allSettled(
+      running.map((agent) => this.cancelAgentRun(agent.id)),
+    );
+    outcomes.forEach((outcome, index) => {
+      if (outcome.status === "rejected" || outcome.value.status === "refused") {
+        this.logger.warn(
+          {
+            agentId: running[index]!.id,
+            err: outcome.status === "rejected" ? outcome.reason : null,
+          },
+          "A running turn did not stop",
+        );
+      }
+    });
+  }
+
+  isSingleAgent(): boolean {
+    return this.admission.singleAgent;
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1297,6 +1344,21 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
+    const release = config.internal
+      ? () => {}
+      : await this.admission.admitAgent(resolvedAgentId, "new");
+    try {
+      return await this.createAdmittedAgent(config, resolvedAgentId, options);
+    } finally {
+      release();
+    }
+  }
+
+  private async createAdmittedAgent(
+    config: AgentSessionConfig,
+    resolvedAgentId: string,
+    options: CreateAgentOptions,
+  ): Promise<ManagedAgent> {
     if (this.pluginLifecycle && !config.internal) {
       const request = await this.pluginLifecycle.before("agent.create", {
         config,
@@ -1422,7 +1484,33 @@ export class AgentManager {
       ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
       : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
+    const release =
+      purpose === "history" || mergedConfig.internal
+        ? () => {}
+        : await this.admission.admitAgent(resolvedAgentId, "existing");
+    try {
+      return await this.resumeAdmittedAgent({
+        handle,
+        mergedConfig,
+        resolvedAgentId,
+        options,
+        currentResumeOptions,
+        purpose,
+      });
+    } finally {
+      release();
+    }
+  }
 
+  private async resumeAdmittedAgent(input: {
+    handle: AgentPersistenceHandle;
+    mergedConfig: AgentSessionConfig;
+    resolvedAgentId: string;
+    options: Parameters<AgentManager["resumeAgentFromPersistence"]>[3];
+    currentResumeOptions: AgentResumeSessionOptions | undefined;
+    purpose: AgentResumePurpose;
+  }): Promise<ManagedAgent> {
+    const { handle, mergedConfig, resolvedAgentId, options, currentResumeOptions, purpose } = input;
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       mergedConfig,
       { purpose },
@@ -1484,6 +1572,18 @@ export class AgentManager {
   }): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
+    const release = await this.admission.admitAgent(resolvedAgentId, "new");
+    try {
+      return await this.importAdmittedSession(input, resolvedAgentId);
+    } finally {
+      release();
+    }
+  }
+
+  private async importAdmittedSession(
+    input: Parameters<AgentManager["importProviderSession"]>[0],
+    resolvedAgentId: string,
+  ): Promise<ManagedAgent> {
     this.requireEnabledProvider(input.provider);
 
     const client = await this.requireAvailableClient({ provider: input.provider });
@@ -2413,6 +2513,7 @@ export class AgentManager {
    * broadcast like normal timeline events.
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
+    this.admission.assertAcceptingTurns();
     const agent = this.requireSessionAgent(agentId);
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
@@ -2531,6 +2632,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.admission.assertAcceptingTurns();
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -2728,6 +2830,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
+    this.admission.assertAcceptingTurns();
     const snapshot = this.requireAgent(agentId);
     if (
       snapshot.lifecycle !== "running" &&
@@ -2760,6 +2863,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<SteerResult> {
+    this.admission.assertAcceptingTurns();
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId || !agent.session.steerActiveTurn) {
@@ -2788,6 +2892,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
+    this.admission.assertAcceptingTurns();
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId) {

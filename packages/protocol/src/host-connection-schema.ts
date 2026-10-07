@@ -6,6 +6,8 @@ export const DirectTcpHostConnectionSchema = z.object({
   endpoint: z.string(),
   useTls: z.boolean().optional().default(false),
   password: z.string().optional(),
+  /** The path a reverse proxy serves the daemon under, such as `/s/abc/`. Absent means `/`. */
+  basePath: z.string().optional(),
 });
 
 export type DirectTcpHostConnection = z.input<typeof DirectTcpHostConnectionSchema>;

@@ -39,8 +39,11 @@ export interface PluginTimelineItemAgent extends PluginHookAgent {
 
 /**
  * One timeline row as the daemon streams it to its clients: after assistant
- * and reasoning chunks are coalesced, once per row, in `seq` order. Delivery to
- * plugins is best-effort and never waits for a handler; a consumer that misses
+ * and reasoning chunks are coalesced, once per row, in `seq` order. The agent
+ * never waits for a handler. A delivery is acknowledged when every handler for
+ * it resolved; one that throws leaves it unacknowledged until the daemon offers
+ * the same event again (on stop-readiness polls and at the shutdown drain).
+ * Shutdown waits for unacknowledged deliveries up to its drain deadline. A consumer that misses
  * rows catches up from the agent's timeline by `seq` within `epoch`.
  */
 export interface PluginTimelineItemEvent {

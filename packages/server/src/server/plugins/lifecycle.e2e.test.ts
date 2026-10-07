@@ -456,7 +456,7 @@ test("a provider that never acknowledges session.close does not hold the daemon 
 
   // Without a deadline on each agent close, stop() never returns here and the
   // test fails by timing out.
-  await expect(daemon.daemon.stop()).resolves.toBeUndefined();
+  await expect(daemon.daemon.stop()).resolves.toEqual({ timelineDrain: { status: "drained" } });
 }, 90_000);
 
 const repoRoot = fileURLToPath(new URL("../../../../../", import.meta.url));

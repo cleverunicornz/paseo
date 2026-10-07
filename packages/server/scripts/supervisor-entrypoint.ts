@@ -15,6 +15,11 @@ import { loadPersistedConfig } from "../src/server/persisted-config.js";
 import { runSupervisor } from "./supervisor.js";
 import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
 import { applySherpaLoaderEnv } from "../src/server/speech/providers/local/sherpa/sherpa-runtime-env.js";
+import {
+  resolveSessionRuntimeConfig,
+  SHUTDOWN_GRACE_MS,
+  TIMELINE_DRAIN_FAILED_EXIT_CODE,
+} from "../src/server/session-runtime-config.js";
 
 process.title = "Paseo Supervisor";
 
@@ -113,6 +118,7 @@ async function main(): Promise<void> {
   const paseoHome = resolvePaseoHome(workerEnv);
   const persistedConfig = loadPersistedConfig(paseoHome);
   const supervisorLogFile = resolveSupervisorLogFile(paseoHome, persistedConfig, workerEnv);
+  const { timelineDrainMs } = resolveSessionRuntimeConfig(workerEnv, persistedConfig);
 
   try {
     await acquirePidLock(paseoHome, null, {
@@ -171,6 +177,9 @@ async function main(): Promise<void> {
         })
       : undefined,
     restartOnCrash: true,
+    // The worker's own deadline is the drain plus its teardown; this one comes after it.
+    workerTerminationGraceMs: timelineDrainMs + 2 * SHUTDOWN_GRACE_MS,
+    reportedShutdownExitCodes: [TIMELINE_DRAIN_FAILED_EXIT_CODE],
     logFile: supervisorLogFile,
     onWorkerReady: async ({ listen, serverId }) => {
       await updatePidLock(paseoHome, { listen, serverId }, { ownerPid: process.pid });

@@ -15,6 +15,19 @@ export interface PluginProviderMetadata {
   iconPath?: string;
 }
 
+/** Which stop-readiness operations a plugin's server entry provides. */
+export interface PluginStopReadinessCapabilities {
+  readiness: boolean;
+  stop: boolean;
+  drain: boolean;
+}
+
+export type PluginStopReadinessOperation = keyof PluginStopReadinessCapabilities;
+
+export type PluginMcpCallResult =
+  | { type: "mcp.call_tool.result"; callId: string; ok: true; result: unknown }
+  | { type: "mcp.call_tool.result"; callId: string; ok: false; error: string };
+
 export type PluginProcessRequest =
   | {
       type: "initialize";
@@ -32,6 +45,9 @@ export type PluginProcessRequest =
   | { type: "hook"; requestId: string; kind: "event" | "before"; name: string; input: unknown }
   | { type: "hook.cancel"; requestId: string }
   | { type: "invoke"; requestId: string; method: string; input: unknown }
+  | { type: "stop_readiness"; requestId: string; operation: PluginStopReadinessOperation }
+  | { type: "stop_readiness.cancel"; requestId: string }
+  | PluginMcpCallResult
   | {
       type: "provider.connect";
       providerId: string;
@@ -57,10 +73,20 @@ export type PluginProcessMessage =
       methods: string[];
       providers: PluginProviderMetadata[];
       hooks?: { events: string[]; before: string[] };
+      stopReadiness?: PluginStopReadinessCapabilities;
     }
   | { type: "result"; requestId: string; output: unknown }
   | { type: "error"; requestId: string; error: string }
   | { type: "fatal"; error: string }
+  | {
+      type: "mcp.call_tool";
+      callId: string;
+      backend: string;
+      tool: string;
+      arguments: Record<string, unknown>;
+      onBehalfOf: string;
+      timeoutMs: number;
+    }
   | {
       type: "provider.connected";
       connectionId: string;
@@ -96,6 +122,9 @@ const providerConnectRequestSchema = z
     versions: z.array(z.number().int().positive()),
     capabilities: z.array(z.string()),
   })
+  .strict();
+const stopReadinessCapabilitiesSchema = z
+  .object({ readiness: z.boolean(), stop: z.boolean(), drain: z.boolean() })
   .strict();
 const frameFields = {
   data: z.union([z.string(), z.instanceof(Uint8Array)]),
@@ -143,6 +172,32 @@ export const PluginProcessRequestSchema: z.ZodType<PluginProcessRequest> = z.dis
     z.object({ type: z.literal("hook.cancel"), requestId: z.string() }).strict(),
     z
       .object({
+        type: z.literal("stop_readiness"),
+        requestId: z.string().min(1),
+        operation: z.enum(["readiness", "stop", "drain"]),
+      })
+      .strict(),
+    z.object({ type: z.literal("stop_readiness.cancel"), requestId: z.string().min(1) }).strict(),
+    z.discriminatedUnion("ok", [
+      z
+        .object({
+          type: z.literal("mcp.call_tool.result"),
+          callId: z.string().min(1),
+          ok: z.literal(true),
+          result: z.unknown(),
+        })
+        .strict(),
+      z
+        .object({
+          type: z.literal("mcp.call_tool.result"),
+          callId: z.string().min(1),
+          ok: z.literal(false),
+          error: z.string(),
+        })
+        .strict(),
+    ]),
+    z
+      .object({
         type: z.literal("invoke"),
         requestId: z.string().min(1),
         method: z.string().min(1),
@@ -183,6 +238,7 @@ export const PluginProcessMessageSchema: z.ZodType<PluginProcessMessage> = z.dis
         methods: z.array(z.string()),
         providers: z.array(providerMetadataSchema),
         hooks: hooksSchema.optional(),
+        stopReadiness: stopReadinessCapabilitiesSchema.optional(),
       })
       .strict(),
     z
@@ -192,6 +248,17 @@ export const PluginProcessMessageSchema: z.ZodType<PluginProcessMessage> = z.dis
       .object({ type: z.literal("error"), requestId: z.string().min(1), error: z.string() })
       .strict(),
     z.object({ type: z.literal("fatal"), error: z.string() }).strict(),
+    z
+      .object({
+        type: z.literal("mcp.call_tool"),
+        callId: z.string().min(1),
+        backend: z.string().min(1),
+        tool: z.string().min(1),
+        arguments: z.record(z.string(), z.unknown()),
+        onBehalfOf: z.string().min(1),
+        timeoutMs: z.number().int().min(1).max(600_000),
+      })
+      .strict(),
     z
       .object({
         type: z.literal("provider.connected"),

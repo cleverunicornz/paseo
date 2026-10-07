@@ -206,6 +206,13 @@ import { terminateWithTreeKill } from "../utils/tree-kill.js";
 import { withTimeout } from "../utils/promise-timeout.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
+  DEFAULT_SESSION_RUNTIME_CONFIG,
+  type SessionRuntimeConfig,
+} from "./session-runtime-config.js";
+import { StopReadinessService, type ShutdownDrainResult } from "./stop-readiness.js";
+import { createWebBasePathMiddleware, stripUpgradeBasePath } from "./web-base-path.js";
+import { createPluginGatewayToolCaller } from "./mcp-gateway/plugin-tool-call.js";
+import {
   createRequireBearerMiddleware,
   authorizeAgentMcpRequest,
   type DaemonAuthConfig,
@@ -432,6 +439,8 @@ export interface PaseoDaemonConfig {
   localTools?: LocalToolsConfig | null;
   /** Per-agent tool trees. */
   toolTree?: ToolTreeConfig;
+  /** Shutdown drain, single-agent mode and the web base path. */
+  sessionRuntime?: SessionRuntimeConfig;
   browserToolsEnabled?: boolean;
   git?: {
     maxProcessesPerSecond: number;
@@ -496,6 +505,11 @@ export interface PaseoDaemonConfig {
   };
 }
 
+export interface DaemonStopResult {
+  /** Whether every timeline item reached its plugins before they stopped. */
+  timelineDrain: ShutdownDrainResult;
+}
+
 export interface PaseoDaemon {
   config: PaseoDaemonConfig;
   agentManager: AgentManager;
@@ -505,7 +519,7 @@ export interface PaseoDaemon {
   scriptRuntimeStore: WorkspaceScriptRuntimeStore;
   browserToolsBroker: BrowserToolsBroker;
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(): Promise<DaemonStopResult>;
   getListenTarget(): ListenTarget | null;
   getServerId(): string;
 }
@@ -554,6 +568,7 @@ function mountWebUi(app: express.Application, config: PaseoDaemonConfig, logger:
       distDir: config.webUi?.distDir ?? null,
       label: getHostname(),
       logger,
+      basePath: resolveSessionRuntime(config).webBasePath,
     }),
   );
 }
@@ -620,6 +635,7 @@ export async function createPaseoDaemon(
   const bootstrapStart = performance.now();
   const elapsed = () => `${(performance.now() - bootstrapStart).toFixed(0)}ms`;
   const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
+  const sessionRuntime = resolveSessionRuntime(config);
   const initialMutableConfig = createInitialMutableDaemonConfig(config);
   const daemonConfigStore = new DaemonConfigStore(config.paseoHome, initialMutableConfig, logger, {
     relayEnabledMutable: config.relayEnabledMutable ?? true,
@@ -732,6 +748,9 @@ export async function createPaseoDaemon(
     },
     logger,
   });
+
+  // A reverse proxy forwards `<basePath>...` unchanged; route it without the prefix.
+  app.use(createWebBasePathMiddleware(sessionRuntime.webBasePath));
 
   // Service proxy classifies service hosts before daemon auth/route fallthrough.
   // Registered service hosts proxy directly; known service namespaces without a
@@ -892,6 +911,10 @@ export async function createPaseoDaemon(
   });
 
   const httpServer = createHTTPServer(app);
+  // First upgrade listener, so every WebSocket route sees the path without the prefix.
+  httpServer.prependListener("upgrade", (req) => {
+    stripUpgradeBasePath(req, sessionRuntime.webBasePath);
+  });
 
   // Script proxy WebSocket upgrade handler — must be registered before the
   // VoiceAssistantWebSocketServer attaches its own "upgrade" listener so that
@@ -1004,7 +1027,38 @@ export async function createPaseoDaemon(
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     prepareToolTree: localToolsRuntime.prepareToolTree,
+    singleAgent: sessionRuntime.singleAgent,
     logger,
+  });
+  const stopReadiness = new StopReadinessService({
+    plugins: pluginRuntime,
+    stopAgentWork: async () => {
+      agentManager.beginStopping();
+      await agentManager.stopRunningTurns();
+    },
+    logger,
+  });
+  pluginRuntime.bindGatewayToolCaller(
+    createPluginGatewayToolCaller({
+      getGatewayBaseUrl: () => createLoopbackDaemonUrl(boundListenTarget, MCP_GATEWAY_ROUTE),
+      isLiveAgent: (agentId) => agentManager.getAgent(agentId) !== null,
+      issueAgentToken: (agentId) => agentManager.issueAgentToken(agentId),
+    }),
+  );
+  // Control endpoints for whatever stops this daemon's host, behind the same
+  // Host allowlist and daemon password as the rest of /api.
+  app.get("/api/stop-readiness", (_req, res) => {
+    stopReadiness.readiness().then(
+      (answer) => res.json(answer),
+      (error: unknown) => {
+        logger.error({ err: error }, "Failed to answer stop readiness");
+        res.status(500).json({ error: "Stop readiness unavailable" });
+      },
+    );
+  });
+  app.post("/api/begin-stopping", (_req, res) => {
+    stopReadiness.beginStopping();
+    res.status(202).json({ stopping: true });
   });
   agentManager.subscribe((event) => {
     if (event.type === "agent_state") {
@@ -1904,6 +1958,10 @@ export async function createPaseoDaemon(
     detachAgentStoragePersistence();
     await agentStorage.flush().catch(() => undefined);
     await agentProviderRuntime.shutdown();
+    // Every agent is closed and its last timeline items emitted. Plugins stay up
+    // until they acknowledged those items or the drain deadline passed.
+    const timelineDrain = await stopReadiness.drainForShutdown(sessionRuntime.timelineDrainMs);
+    reportTimelineDrain(logger, timelineDrain);
     await pluginRuntime.stopAllPlugins();
     terminalManager.killAll();
     await speechService.stop();
@@ -1928,6 +1986,7 @@ export async function createPaseoDaemon(
     if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
       unlinkSync(listenTarget.path);
     }
+    return { timelineDrain };
   };
 
   return {
@@ -1943,6 +2002,29 @@ export async function createPaseoDaemon(
     getListenTarget: () => boundListenTarget,
     getServerId: () => serverId,
   };
+}
+
+function resolveSessionRuntime(config: PaseoDaemonConfig): SessionRuntimeConfig {
+  return config.sessionRuntime ?? DEFAULT_SESSION_RUNTIME_CONFIG;
+}
+
+function reportTimelineDrain(logger: Logger, result: ShutdownDrainResult): void {
+  if (result.status === "drained") {
+    logger.info("Timeline drain complete: every timeline item was acknowledged");
+    return;
+  }
+  for (const failure of result.failures) {
+    logger.error(
+      { ...failure, deadlineMs: result.deadlineMs },
+      `Timeline drain failed: plugin ${failure.pluginId} did not acknowledge agent ${failure.agentId} epoch ${failure.epoch} through seq ${failure.highestUnacknowledgedSeq}`,
+    );
+  }
+  for (const failure of result.providerFailures) {
+    logger.error(
+      { ...failure, deadlineMs: result.deadlineMs },
+      `Timeline drain failed: plugin ${failure.pluginId} did not finish its drain (${failure.reason})`,
+    );
+  }
 }
 
 /**

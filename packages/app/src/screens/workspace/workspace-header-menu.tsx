@@ -32,6 +32,7 @@ import {
   resolveTerminalProfiles,
 } from "@getpaseo/protocol/terminal-profiles";
 import { buildSettingsHostSectionRoute } from "@/utils/host-routes";
+import { useAgentCreationBlocked } from "@/runtime/host-features";
 import type { Theme } from "@/styles/theme";
 
 const ThemedEllipsis = withUnistyles(Ellipsis);
@@ -226,6 +227,7 @@ export function WorkspaceHeaderMenuMobile({
   const { t } = useTranslation();
   const router = useRouter();
   const { config } = useDaemonConfig(normalizedServerId);
+  const agentCreationBlocked = useAgentCreationBlocked(normalizedServerId);
   const profiles = useMemo(
     () => resolveTerminalProfiles(config?.terminalProfiles),
     [config?.terminalProfiles],
@@ -252,13 +254,15 @@ export function WorkspaceHeaderMenuMobile({
         testID="workspace-header-menu"
         sheetTitle={t("workspace.header.actions.workspaceActions")}
       >
-        <DropdownMenuItem
-          testID="workspace-header-new-agent"
-          leading={MENU_NEW_AGENT_ICON}
-          onSelect={onCreateDraftTab}
-        >
-          {t("workspace.header.actions.newAgent")}
-        </DropdownMenuItem>
+        {agentCreationBlocked ? null : (
+          <DropdownMenuItem
+            testID="workspace-header-new-agent"
+            leading={MENU_NEW_AGENT_ICON}
+            onSelect={onCreateDraftTab}
+          >
+            {t("workspace.header.actions.newAgent")}
+          </DropdownMenuItem>
+        )}
         {showCreateBrowserTab ? (
           <DropdownMenuItem
             testID="workspace-header-new-browser"

@@ -99,7 +99,7 @@ import {
 } from "@/workspace/file-open";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useStableEvent } from "@/hooks/use-stable-event";
-import { useForkAgent } from "@/hooks/use-fork-agent";
+import { useForkAgent, useForkOffered } from "@/hooks/use-fork-agent";
 import { isWeb } from "@/constants/platform";
 import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
@@ -381,6 +381,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     );
     const streamHead = providedStreamHead ?? sessionStreamHead;
     const forkAgent = useForkAgent({ serverId: resolvedServerId, toast, readOnly });
+    const forkUnavailable = !useForkOffered(resolvedServerId, readOnly);
     const supportsAgentForkContextCursor = useSessionStore(
       (state) =>
         state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkContextCursor === true,
@@ -917,12 +918,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           layoutItem,
           strategy: streamRenderStrategy,
           supportsTimelineCursor: supportsAgentForkContextCursor,
-          onForkAssistantTurn: readOnly ? undefined : handleForkAssistantTurn,
+          onForkAssistantTurn: forkUnavailable ? undefined : handleForkAssistantTurn,
         });
       },
       [
         handleForkAssistantTurn,
-        readOnly,
+        forkUnavailable,
         renderStreamItemContent,
         streamRenderStrategy,
         supportsAgentForkContextCursor,
@@ -951,14 +952,14 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             host={bottomTurnFooterHost}
             strategy={streamRenderStrategy}
             supportsTimelineCursor={supportsAgentForkContextCursor}
-            onForkAssistantTurn={readOnly ? undefined : handleForkAssistantTurn}
-            onForkInFlightTurn={readOnly ? undefined : handleForkInFlightTurn}
+            onForkAssistantTurn={forkUnavailable ? undefined : handleForkAssistantTurn}
+            onForkInFlightTurn={forkUnavailable ? undefined : handleForkInFlightTurn}
           />
         ) : null,
       [
         handleForkAssistantTurn,
         handleForkInFlightTurn,
-        readOnly,
+        forkUnavailable,
         isTurnActive,
         baseRenderModel.turnTiming.runningStartedAt,
         bottomTurnFooterHost,
