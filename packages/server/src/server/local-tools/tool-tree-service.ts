@@ -28,9 +28,20 @@ export interface ToolTreeServiceOptions {
   logger: Logger;
 }
 
+/**
+ * What a refresh lists: everything, or Paseo's catalogue alone with the
+ * backends as last listed. The gateway answers only for a registered agent,
+ * so the tree written before an agent's first launch has no backends yet.
+ */
+export type ToolTreeRefreshScope = "all" | "paseo";
+
 interface RefreshState {
   running: Promise<void>;
-  again: boolean;
+  again: ToolTreeRefreshScope | null;
+}
+
+function widerScope(a: ToolTreeRefreshScope | null, b: ToolTreeRefreshScope): ToolTreeRefreshScope {
+  return a === "all" || b === "all" ? "all" : "paseo";
 }
 
 /**
@@ -40,6 +51,7 @@ interface RefreshState {
  */
 export class ToolTreeService {
   private readonly refreshes = new Map<string, RefreshState>();
+  private readonly backendServers = new Map<string, ToolTreeServer[]>();
 
   constructor(private readonly options: ToolTreeServiceOptions) {}
 
@@ -51,19 +63,20 @@ export class ToolTreeService {
   }
 
   /** Regenerates the agent's tree; overlapping requests coalesce into one more pass. */
-  refresh(agentId: string): Promise<void> {
+  refresh(agentId: string, scope: ToolTreeRefreshScope = "all"): Promise<void> {
     const current = this.refreshes.get(agentId);
     if (current) {
-      current.again = true;
+      current.again = widerScope(current.again, scope);
       return current.running;
     }
-    const state: RefreshState = { running: Promise.resolve(), again: false };
+    const state: RefreshState = { running: Promise.resolve(), again: scope };
     state.running = (async () => {
       try {
-        do {
-          state.again = false;
-          await this.writeTree(agentId);
-        } while (state.again);
+        while (state.again) {
+          const pass = state.again;
+          state.again = null;
+          await this.writeTree(agentId, pass);
+        }
       } finally {
         this.refreshes.delete(agentId);
       }
@@ -81,29 +94,46 @@ export class ToolTreeService {
 
   async remove(agentId: string): Promise<void> {
     await this.refreshes.get(agentId)?.running.catch(() => undefined);
+    this.backendServers.delete(agentId);
     await rm(this.dirFor(agentId), { recursive: true, force: true });
   }
 
-  private async writeTree(agentId: string): Promise<void> {
+  private async writeTree(agentId: string, scope: ToolTreeRefreshScope): Promise<void> {
     const servers: ToolTreeServer[] = [
       { name: PASEO_TOOL_TREE_SERVER, tools: await this.options.listPaseoTools(agentId) },
     ];
-    for (const backend of this.options.listBackendNames()) {
-      if (backend === PASEO_TOOL_TREE_SERVER) continue;
-      try {
-        servers.push({ name: backend, tools: await this.listBackendTools(agentId, backend) });
-      } catch (error) {
-        // A backend that does not answer now is left out until the next refresh.
-        this.options.logger.warn(
-          { err: error, agentId, backend },
-          "Could not list an MCP backend's tools for the tool tree",
-        );
-      }
+    if (scope === "all") {
+      this.backendServers.set(agentId, await this.listBackends(agentId));
     }
+    servers.push(...(this.backendServers.get(agentId) ?? []));
     const { written } = await writeToolTree(this.dirFor(agentId), servers);
     if (written) {
       this.options.logger.debug({ agentId }, "Tool tree written");
     }
+  }
+
+  private async listBackends(agentId: string): Promise<ToolTreeServer[]> {
+    const backends = this.options
+      .listBackendNames()
+      .filter((backend) => backend !== PASEO_TOOL_TREE_SERVER);
+    const listings = await Promise.all(
+      backends.map((backend) =>
+        this.listBackendTools(agentId, backend).catch((error: unknown) => {
+          // A backend that does not answer now is left out until the next refresh.
+          this.options.logger.warn(
+            { err: error, agentId, backend },
+            "Could not list an MCP backend's tools for the tool tree",
+          );
+          return null;
+        }),
+      ),
+    );
+    const servers: ToolTreeServer[] = [];
+    backends.forEach((backend, index) => {
+      const tools = listings[index];
+      if (tools) servers.push({ name: backend, tools });
+    });
+    return servers;
   }
 
   private async listBackendTools(agentId: string, backend: string): Promise<ToolTreeTool[]> {

@@ -249,6 +249,25 @@ describe.skipIf(!codexPath)("local tools through /mcp/agents (real Codex app ser
     expect(result.stdoutTruncated).toBe(true);
   });
 
+  test("exec cuts output on a whole UTF-8 character, never past the byte bound", async () => {
+    const command = ["sh", "-c", "printf 'a\\303\\251\\303\\251'"];
+    for (const [maxOutputBytes, stdout] of [
+      [1, "a"],
+      [2, "a"],
+      [3, "aé"],
+      [4, "aé"],
+    ] as const) {
+      const result = await a.ok("exec", { command, maxOutputBytes });
+      expect(result.stdout).toBe(stdout);
+      expect(Buffer.byteLength(String(result.stdout))).toBeLessThanOrEqual(maxOutputBytes);
+      expect(result.stdoutTruncated).toBe(true);
+    }
+    expect(await a.ok("exec", { command, maxOutputBytes: 5 })).toMatchObject({
+      stdout: "aéé",
+      stdoutTruncated: false,
+    });
+  });
+
   test("write_file, read_file and list_dir work inside the workspace", async () => {
     expect(
       await a.ok("write_file", { path: "notes/today.txt", content: "alpha\nbeta\ngamma\n" }),
@@ -350,6 +369,64 @@ describe.skipIf(!codexPath)("local tools through /mcp/agents (real Codex app ser
     expect(existsSync(path.join(root, "escape.txt"))).toBe(false);
     expect(existsSync(path.join(root, "moved.txt"))).toBe(false);
     expect(await readdir(outsideDir)).toEqual(["secret.txt"]);
+  });
+
+  test("apply_patch judges every path in every patch form the executor accepts", async () => {
+    const secret = path.join(outsideDir, "secret.txt");
+    await writeFile(path.join(a.cwd, "move-me.txt"), "one\n");
+    const wrap = (...body: string[]) =>
+      ["*** Begin Patch", ...body, "*** End Patch", ""].join("\n");
+    const escaping = [
+      wrap("  *** Add File: ../padded-add.txt", "+x"),
+      wrap("\t*** Add File: ../tab-add.txt", "+x"),
+      wrap(" *** Add File: ../nbsp-add.txt", "+x"),
+      wrap("*** Add File: in.txt", "+x", " *** Add File: ../after-add.txt", "+x"),
+      wrap(`  *** Delete File: ${secret}`),
+      wrap(` *** Update File: ${secret}`, "@@", "-outside", "+changed"),
+      ["<<'EOF'", wrap("  *** Add File: ../heredoc-add.txt", "+x").trim(), "EOF", ""].join("\n"),
+      wrap("*** Add File: crlf.txt", "+x", "*** Add File: ../crlf-add.txt", "+x").replaceAll(
+        "\n",
+        "\r\n",
+      ),
+      wrap(
+        "*** Update File: move-me.txt",
+        "*** End of File",
+        "*** Move to: ../moved-after-eof.txt",
+        "@@",
+        " one",
+      ),
+      wrap("*** Update File: move-me.txt", "*** Move to: ../moved-padded.txt   ", "@@", " one"),
+    ];
+    for (const patch of escaping) {
+      expect(await a.error("apply_patch", { patch }), patch).toMatch(/outside/);
+    }
+    expect(await readdir(outsideDir)).toEqual(["secret.txt"]);
+    expect(await readFile(secret, "utf8")).toBe("outside\n");
+    expect((await readdir(root)).filter((name) => name.endsWith(".txt"))).toEqual([]);
+    expect(existsSync(path.join(a.cwd, "in.txt"))).toBe(false);
+    expect(existsSync(path.join(a.cwd, "crlf.txt"))).toBe(false);
+    expect(await readFile(path.join(a.cwd, "move-me.txt"), "utf8")).toBe("one\n");
+
+    expect(
+      await a.error("apply_patch", {
+        patch: wrap("*** Environment ID: remote", "*** Add File: env.txt", "+x"),
+      }),
+    ).toMatch(/Environment ID/);
+
+    const padded = [
+      "<<'EOF'",
+      "*** Begin Patch",
+      "  *** Add File: padded/one.txt",
+      "+one",
+      "\t*** Add File: padded/two.txt",
+      "+two",
+      "*** End Patch",
+      "EOF",
+      "",
+    ].join("\r\n");
+    expect(await a.ok("apply_patch", { patch: padded })).toMatchObject({ exitCode: 0 });
+    expect(await readFile(path.join(a.cwd, "padded/one.txt"), "utf8")).toBe("one\n");
+    expect(await readFile(path.join(a.cwd, "padded/two.txt"), "utf8")).toBe("two\n");
   });
 
   test("process tools run, feed, read and kill a long-running process of the caller only", async () => {

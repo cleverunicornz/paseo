@@ -2,7 +2,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -41,14 +41,27 @@ async function waitForPath(target: string, timeoutMs = 15_000): Promise<void> {
   }
 }
 
+interface RecordedLaunch {
+  context: AgentLaunchContext | undefined;
+  /** The tree's files that existed when the harness was started. */
+  treeFilesAtLaunch: string[];
+}
+
 function recordLaunchContexts(
   clients: Record<string, AgentClient>,
-  seen: Array<AgentLaunchContext | undefined>,
+  seen: RecordedLaunch[],
 ): Record<string, AgentClient> {
   const claude = clients.claude!;
   const recording = Object.create(claude) as AgentClient;
   recording.createSession = (config, launchContext, options) => {
-    seen.push(launchContext);
+    const tree = launchContext?.env?.PASEO_TOOL_TREE;
+    const treeFilesAtLaunch =
+      tree && existsSync(tree)
+        ? readdirSync(tree, { recursive: true, encoding: "utf8" }).map((entry) =>
+            entry.split(path.sep).join("/"),
+          )
+        : [];
+    seen.push({ context: launchContext, treeFilesAtLaunch });
     return claude.createSession(config, launchContext, options);
   };
   return { ...clients, claude: recording };
@@ -87,7 +100,7 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
   let backend: http.Server;
   let port: number;
   let backendHasExtraTool = false;
-  const launches: Array<AgentLaunchContext | undefined> = [];
+  const launches: RecordedLaunch[] = [];
 
   beforeAll(async () => {
     root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paseo-tool-tree-e2e-")));
@@ -139,12 +152,15 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
       { workspaceId: undefined },
     );
     const tree = path.join(paseoHome, "tool-trees", agent.id);
-    expect(launches.at(-1)?.env?.PASEO_TOOL_TREE).toBe(tree);
-
+    const launch = launches.at(-1);
+    expect(launch?.context?.env?.PASEO_TOOL_TREE).toBe(tree);
+    // The tree exists with Paseo's tools before the harness starts.
+    expect(launch?.treeFilesAtLaunch).toEqual(
+      expect.arrayContaining(["client.ts", "servers/paseo/exec.ts", "servers/paseo/read_file.ts"]),
+    );
+    // The gateway answers for the agent once it is registered; its backends follow.
     await waitForPath(path.join(tree, "servers/fixture/whoami.ts"));
     expect(existsSync(path.join(tree, "servers/paseo/exec.ts"))).toBe(true);
-    expect(existsSync(path.join(tree, "servers/paseo/read_file.ts"))).toBe(true);
-    expect(existsSync(path.join(tree, "client.ts"))).toBe(true);
 
     const token = daemon.agentManager.issueAgentToken(agent.id);
     const client = new Client({ name: "tree-test", version: "1.0.0" });

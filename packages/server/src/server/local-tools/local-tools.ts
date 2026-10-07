@@ -12,6 +12,7 @@ import type {
   PaseoToolResult,
 } from "../agent/tools/types.js";
 import type { CodexExecutor } from "./codex-executor.js";
+import { parsePatch, renderPatch } from "./patch-format.js";
 import type { LocalProcessRegistry } from "./local-processes.js";
 
 const DEFAULT_EXEC_TIMEOUT_MS = 120_000;
@@ -27,7 +28,6 @@ const BINARY_SAMPLE_BYTES = 8192;
 const MAX_PATCH_BYTES = 120 * 1024;
 const DEFAULT_PROCESS_READ_CHARS = 64 * 1024;
 const MAX_PROCESS_WAIT_MS = 30_000;
-const PATCH_PATH_HEADER = /^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/;
 
 type RegisterTool = (
   name: string,
@@ -67,8 +67,12 @@ export interface RegisterLocalToolsOptions {
 
 interface CommandExecResponse {
   exitCode: number;
-  stdout: string;
-  stderr: string;
+}
+
+interface CommandExecOutputDelta {
+  processId?: unknown;
+  stream?: unknown;
+  deltaBase64?: unknown;
 }
 
 interface CommandResult {
@@ -122,12 +126,14 @@ function toolResult(value: unknown): PaseoToolResult {
   return { content: [], structuredContent: ensureValidJson(value) };
 }
 
-function truncateBytes(text: string, maxBytes: number): { text: string; truncated: boolean } {
-  const bytes = Buffer.from(text, "utf8");
+/** UTF-8 text of at most `maxBytes` bytes, cut on a character start so the cut never decodes wider. */
+function truncateBytes(bytes: Buffer, maxBytes: number): { text: string; truncated: boolean } {
   if (bytes.length <= maxBytes) {
-    return { text, truncated: false };
+    return { text: bytes.toString("utf8"), truncated: false };
   }
-  return { text: bytes.subarray(0, maxBytes).toString("utf8"), truncated: true };
+  let end = maxBytes;
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return { text: bytes.subarray(0, end).toString("utf8"), truncated: true };
 }
 
 function displayPath(root: string, target: string): string {
@@ -142,15 +148,6 @@ function isLikelyBinary(bytes: Buffer): boolean {
 function entryKind(entry: { isDirectory: boolean; isFile: boolean }): string {
   if (entry.isDirectory) return "directory";
   return entry.isFile ? "file" : "other";
-}
-
-function patchPaths(patch: string): string[] {
-  const paths: string[] = [];
-  for (const line of patch.split(/\r?\n/)) {
-    const match = PATCH_PATH_HEADER.exec(line);
-    if (match?.[1]) paths.push(match[1].trim());
-  }
-  return paths;
 }
 
 export function registerLocalTools(options: RegisterLocalToolsOptions): void {
@@ -188,6 +185,33 @@ export function registerLocalTools(options: RegisterLocalToolsOptions): void {
     return resolved;
   }
 
+  /**
+   * A patch path as the executor resolves it (lexically against the workspace
+   * root, no trimming or `~`), judged like `scopedForWrite`. Returns the judged
+   * path relative to the root, with no `..` left for the executor to resolve.
+   */
+  async function scopedPatchPath(caller: LocalToolCaller, patchPath: string): Promise<string> {
+    const root = workspaceRoot(caller);
+    const absolute = path.resolve(root, patchPath);
+    if (absolute !== absolute.trim()) {
+      throw new Error(ACCESS_OUTSIDE_WORKSPACE_MESSAGE);
+    }
+    await scopedForWrite(caller, absolute);
+    return path.relative(root, absolute);
+  }
+
+  /** The patch rewritten with every path judged; one path outside the workspace refuses it whole. */
+  async function scopedPatch(caller: LocalToolCaller, patch: string): Promise<string> {
+    const hunks = parsePatch(patch);
+    for (const hunk of hunks) {
+      hunk.path = await scopedPatchPath(caller, hunk.path);
+      if (hunk.kind === "update" && hunk.movePath !== null) {
+        hunk.movePath = await scopedPatchPath(caller, hunk.movePath);
+      }
+    }
+    return renderPatch(hunks);
+  }
+
   async function runCommand(
     caller: LocalToolCaller,
     command: string[],
@@ -199,6 +223,17 @@ export function registerLocalTools(options: RegisterLocalToolsOptions): void {
     const onAbort = () => {
       void executor.request("command/exec/terminate", { processId }).catch(() => undefined);
     };
+    // Output is streamed as bytes and decoded here: the executor's own text
+    // decoding misreads a stream its cap cut inside a UTF-8 character.
+    const output = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
+    const stopListening = executor.onNotification((method, params) => {
+      const delta = params as CommandExecOutputDelta;
+      if (method !== "command/exec/outputDelta" || delta.processId !== processId) return;
+      if (typeof delta.deltaBase64 !== "string") return;
+      output[delta.stream === "stderr" ? "stderr" : "stdout"].push(
+        Buffer.from(delta.deltaBase64, "base64"),
+      );
+    });
     run.signal?.addEventListener("abort", onAbort, { once: true });
     try {
       const response = await executor.request<CommandExecResponse>(
@@ -208,6 +243,7 @@ export function registerLocalTools(options: RegisterLocalToolsOptions): void {
           processId,
           cwd: run.cwd,
           timeoutMs,
+          streamStdoutStderr: true,
           // One byte over the bound tells a cut-off stream from one that fit.
           outputBytesCap: maxOutputBytes + 1,
           env: run.env ?? {},
@@ -217,8 +253,9 @@ export function registerLocalTools(options: RegisterLocalToolsOptions): void {
         },
         timeoutMs + RPC_MARGIN_MS,
       );
-      const stdout = truncateBytes(response.stdout, maxOutputBytes);
-      const stderr = truncateBytes(response.stderr, maxOutputBytes);
+      // The response follows the run's last output notification.
+      const stdout = truncateBytes(Buffer.concat(output.stdout), maxOutputBytes);
+      const stderr = truncateBytes(Buffer.concat(output.stderr), maxOutputBytes);
       return {
         exitCode: response.exitCode,
         stdout: stdout.text,
@@ -227,6 +264,7 @@ export function registerLocalTools(options: RegisterLocalToolsOptions): void {
         stderrTruncated: stderr.truncated,
       };
     } finally {
+      stopListening();
       run.signal?.removeEventListener("abort", onAbort);
     }
   }
@@ -364,7 +402,7 @@ export function registerLocalTools(options: RegisterLocalToolsOptions): void {
           .slice(start, input.maxLines === undefined ? undefined : start + input.maxLines)
           .join("");
       }
-      const bounded = truncateBytes(selected, maxBytes);
+      const bounded = truncateBytes(Buffer.from(selected, "utf8"), maxBytes);
       return toolResult({
         path: shown,
         content: bounded.text,
@@ -458,12 +496,10 @@ export function registerLocalTools(options: RegisterLocalToolsOptions): void {
     },
     async (input, context) => {
       const caller = requireCaller();
-      for (const target of patchPaths(input.patch)) {
-        await scopedForWrite(caller, target);
-      }
+      const patch = await scopedPatch(caller, input.patch);
       const result = await runCommand(
         caller,
-        [host.codexPath, "--codex-run-as-apply-patch", input.patch],
+        [host.codexPath, "--codex-run-as-apply-patch", patch],
         { cwd: await scoped(caller), signal: context.signal },
       );
       const output = (result.stdout + result.stderr).trim();

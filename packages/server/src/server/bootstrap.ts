@@ -1003,7 +1003,7 @@ export async function createPaseoDaemon(
     mcpGatewayEnvPassthrough: config.mcpGatewayEnvPassthrough,
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
-    resolveToolTreeDir: localToolsRuntime.resolveToolTreeDir,
+    prepareToolTree: localToolsRuntime.prepareToolTree,
     logger,
   });
   agentManager.subscribe((event) => {

@@ -32,7 +32,11 @@ export interface LocalToolsRuntimeOptions {
 export interface LocalToolsRuntime {
   /** Present when the local tools are on. */
   host: LocalToolsHost | null;
-  resolveToolTreeDir: (agentId: string) => string | null;
+  /**
+   * Writes the agent's tree before its harness launches and returns where it
+   * is; null when trees are off or it could not be written.
+   */
+  prepareToolTree: (agentId: string) => Promise<string | null>;
   /** An agent appeared or changed: a new agent's tree is written; a closed agent's is removed. */
   onAgentState: (agent: { id: string; lifecycle: string }) => void;
   /** The agent listed its tools: its tree follows what it was shown. */
@@ -88,7 +92,10 @@ export function createLocalToolsRuntime(options: LocalToolsRuntimeOptions): Loca
       })
     : null;
   const processes = executor ? new LocalProcessRegistry(executor) : null;
+  /** Agents with a tree on disk. */
   const treeAgents = new Set<string>();
+  /** Agents whose tree has listed the gateway's backends since they registered. */
+  const listedAgents = new Set<string>();
 
   function resolveToolTreeDir(agentId: string): string | null {
     return toolTree ? toolTree.dirFor(agentId) : null;
@@ -119,10 +126,23 @@ export function createLocalToolsRuntime(options: LocalToolsRuntimeOptions): Loca
             resolveToolTreeDir,
           }
         : null,
-    resolveToolTreeDir,
+    async prepareToolTree(agentId) {
+      if (!toolTree) return null;
+      treeAgents.add(agentId);
+      try {
+        // Before its first launch the agent is unknown to the gateway; its
+        // backends join the tree once it registers (onAgentState).
+        await toolTree.refresh(agentId, "paseo");
+      } catch (error) {
+        logger.warn({ err: error, agentId }, "Failed to write the agent's tool tree before launch");
+        return null;
+      }
+      return toolTree.dirFor(agentId);
+    },
     onAgentState(agent) {
       if (agent.lifecycle === "closed") {
         void processes?.releaseAgent(agent.id);
+        listedAgents.delete(agent.id);
         if (toolTree && treeAgents.delete(agent.id)) {
           void toolTree.remove(agent.id).catch((error: unknown) => {
             logger.warn({ err: error, agentId: agent.id }, "Failed to remove a tool tree");
@@ -130,8 +150,9 @@ export function createLocalToolsRuntime(options: LocalToolsRuntimeOptions): Loca
         }
         return;
       }
-      if (toolTree && !treeAgents.has(agent.id)) {
+      if (toolTree && !listedAgents.has(agent.id)) {
         treeAgents.add(agent.id);
+        listedAgents.add(agent.id);
         toolTree.scheduleRefresh(agent.id);
       }
     },
