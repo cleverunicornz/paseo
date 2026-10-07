@@ -212,6 +212,7 @@ import {
 import { StopReadinessService, type ShutdownDrainResult } from "./stop-readiness.js";
 import { createWebBasePathMiddleware, stripUpgradeBasePath } from "./web-base-path.js";
 import { createPluginGatewayToolCaller } from "./mcp-gateway/plugin-tool-call.js";
+import { ShutdownGatewayCallers } from "./mcp-gateway/shutdown-callers.js";
 import {
   createRequireBearerMiddleware,
   authorizeAgentMcpRequest,
@@ -1038,11 +1039,16 @@ export async function createPaseoDaemon(
     },
     logger,
   });
+  // Agents the shutdown closes keep their gateway identity for plugin calls
+  // until the timeline drain ends; see stop().
+  const shutdownGatewayCallers = new ShutdownGatewayCallers();
   pluginRuntime.bindGatewayToolCaller(
     createPluginGatewayToolCaller({
       getGatewayBaseUrl: () => createLoopbackDaemonUrl(boundListenTarget, MCP_GATEWAY_ROUTE),
-      isLiveAgent: (agentId) => agentManager.getAgent(agentId) !== null,
-      issueAgentToken: (agentId) => agentManager.issueAgentToken(agentId),
+      issueCallerToken: (agentId) =>
+        agentManager.getAgent(agentId) !== null
+          ? agentManager.issueAgentToken(agentId)
+          : shutdownGatewayCallers.issue(agentId),
     }),
   );
   // Control endpoints for whatever stops this daemon's host, behind the same
@@ -1074,7 +1080,7 @@ export async function createPaseoDaemon(
       resolveAgent: (token) => {
         const agentId = agentTokens.resolve(token);
         if (!agentId) {
-          return null;
+          return shutdownGatewayCallers.resolve(token);
         }
         const agent = agentManager.getAgent(agentId);
         if (agent) {
@@ -1952,6 +1958,15 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
+    // Plugins draining timeline items still call the gateway for the agents
+    // closed below, with the identity each had, until the drain ends.
+    shutdownGatewayCallers.retain(
+      agentManager.listAgents().map((agent) => ({
+        agentId: agent.id,
+        sessionId: agent.persistence?.sessionId ?? null,
+        workspaceId: agent.workspaceId ?? null,
+      })),
+    );
     await closeAllAgents(logger, agentManager);
     await localToolsRuntime.close();
     await agentManager.flushForShutdown().catch(() => undefined);
@@ -1960,7 +1975,9 @@ export async function createPaseoDaemon(
     await agentProviderRuntime.shutdown();
     // Every agent is closed and its last timeline items emitted. Plugins stay up
     // until they acknowledged those items or the drain deadline passed.
-    const timelineDrain = await stopReadiness.drainForShutdown(sessionRuntime.timelineDrainMs);
+    const timelineDrain = await stopReadiness
+      .drainForShutdown(sessionRuntime.timelineDrainMs)
+      .finally(() => shutdownGatewayCallers.end());
     reportTimelineDrain(logger, timelineDrain);
     await pluginRuntime.stopAllPlugins();
     terminalManager.killAll();
