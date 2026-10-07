@@ -2,6 +2,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -53,7 +54,7 @@ function recordLaunchContexts(
 ): Record<string, AgentClient> {
   const claude = clients.claude!;
   const recording = Object.create(claude) as AgentClient;
-  recording.createSession = (config, launchContext, options) => {
+  const record = (launchContext: AgentLaunchContext | undefined): void => {
     const tree = launchContext?.env?.PASEO_TOOL_TREE;
     const treeFilesAtLaunch =
       tree && existsSync(tree)
@@ -62,35 +63,52 @@ function recordLaunchContexts(
           )
         : [];
     seen.push({ context: launchContext, treeFilesAtLaunch });
+  };
+  recording.createSession = (config, launchContext, options) => {
+    record(launchContext);
     return claude.createSession(config, launchContext, options);
+  };
+  recording.resumeSession = (handle, overrides, launchContext, options) => {
+    record(launchContext);
+    return claude.resumeSession(handle, overrides, launchContext, options);
   };
   return { ...clients, claude: recording };
 }
 
-/** A stateless MCP backend whose `whoami` answers with the agent identity the gateway attached. */
+const BETA_TOOLS = ["beta_one", "beta_two", "beta_three"];
+
+interface FixtureBackend {
+  name: string;
+  registerTools: (mcp: McpServer, agentId: string) => void;
+  /** Runs before a `tools/list` request is answered. */
+  beforeList?: () => Promise<void>;
+  /** Runs once a `tools/list` response has been sent. */
+  afterList?: () => void;
+}
+
+/** A stateless MCP backend. */
 async function serveFixtureBackend(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  withExtraTool: boolean,
+  backend: FixtureBackend,
 ): Promise<void> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
-  const agentId = String(req.headers["x-paseo-agent-id"]);
-  const mcp = new McpServer({ name: "fixture", version: "1.0.0" });
-  mcp.registerTool("whoami", { description: "Who is calling.", inputSchema: {} }, async () => ({
-    content: [{ type: "text", text: agentId }],
-  }));
-  if (withExtraTool) {
-    mcp.registerTool("added_later", { inputSchema: {} }, async () => ({ content: [] }));
+  const raw = Buffer.concat(chunks).toString("utf8");
+  const body = raw ? (JSON.parse(raw) as { method?: string }) : undefined;
+  if (body?.method === "tools/list") {
+    await backend.beforeList?.();
+    res.on("finish", () => backend.afterList?.());
   }
+  const mcp = new McpServer({ name: backend.name, version: "1.0.0" });
+  backend.registerTools(mcp, String(req.headers["x-paseo-agent-id"]));
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => {
     void transport.close();
     void mcp.close();
   });
   await mcp.connect(transport);
-  const body = Buffer.concat(chunks).toString("utf8");
-  await transport.handleRequest(req, res, body ? JSON.parse(body) : undefined);
+  await transport.handleRequest(req, res, body);
 }
 
 describe.skipIf(!codexPath)("tool tree (daemon)", () => {
@@ -101,7 +119,95 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
   let port: number;
   let backendHasExtraTool = false;
   let backendFails = false;
+  let betaFails = false;
+  let betaListings = 0;
+  /** While set, the next `fixture` listing waits for `release`. */
+  let fixtureListingHold: { reached: () => void; release: Promise<void> } | null = null;
   const launches: RecordedLaunch[] = [];
+
+  const fixture: FixtureBackend = {
+    name: "fixture",
+    registerTools: (mcp, agentId) => {
+      // `whoami` answers with the agent identity the gateway attached.
+      mcp.registerTool("whoami", { description: "Who is calling.", inputSchema: {} }, async () => ({
+        content: [{ type: "text", text: agentId }],
+      }));
+      if (backendHasExtraTool) {
+        mcp.registerTool("added_later", { inputSchema: {} }, async () => ({ content: [] }));
+      }
+    },
+    beforeList: async () => {
+      const hold = fixtureListingHold;
+      if (!hold) return;
+      fixtureListingHold = null;
+      hold.reached();
+      await hold.release;
+    },
+  };
+  const beta: FixtureBackend = {
+    name: "beta",
+    registerTools: (mcp) => {
+      for (const name of BETA_TOOLS) {
+        mcp.registerTool(name, { inputSchema: {} }, async () => ({ content: [] }));
+      }
+    },
+    afterList: () => {
+      betaListings += 1;
+    },
+  };
+
+  async function waitFor(check: () => boolean, what: string): Promise<void> {
+    const start = Date.now();
+    while (!check()) {
+      if (Date.now() - start > 15_000) throw new Error(`Timed out waiting for ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
+  /**
+   * Starts a launch and holds its tree discovery open after `beta` has answered; meanwhile the agent
+   * lists its own tools, which queues an ordinary refresh, and `beta` fails for that queued pass.
+   */
+  async function launchOverlappedByOrdinaryRefresh(
+    agentId: string,
+    launch: () => Promise<unknown>,
+  ): Promise<{ launched: Promise<unknown> }> {
+    let reached!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    fixtureListingHold = {
+      reached,
+      release: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    };
+    const betaListingsBefore = betaListings;
+    const launched = launch();
+    launched.catch(() => undefined);
+    const client = new Client({ name: "tree-overlap", version: "1.0.0" });
+    try {
+      await held;
+      await waitFor(() => betaListings > betaListingsBefore, "beta's launch listing");
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp/agents`), {
+          requestInit: {
+            headers: {
+              Authorization: `Bearer ${daemon.agentManager.issueAgentToken(agentId)}`,
+            },
+          },
+        }),
+      );
+      await client.listTools();
+      betaFails = true;
+    } finally {
+      fixtureListingHold = null;
+      release();
+      await client.close();
+    }
+    return { launched };
+  }
 
   beforeAll(async () => {
     root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paseo-tool-tree-e2e-")));
@@ -110,11 +216,12 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
     await mkdir(path.join(root, "static"));
 
     backend = http.createServer((req, res) => {
-      if (backendFails) {
+      const isBeta = req.url?.startsWith("/beta") === true;
+      if (backendFails || (isBeta && betaFails)) {
         res.writeHead(503).end();
         return;
       }
-      void serveFixtureBackend(req, res, backendHasExtraTool);
+      void serveFixtureBackend(req, res, isBeta ? beta : fixture);
     });
     await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
     const backendPort = (backend.address() as net.AddressInfo).port;
@@ -131,7 +238,10 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
         mcpDebug: false,
         agentClients: recordLaunchContexts(createTestAgentClients(), launches),
         agentStoragePath: path.join(paseoHome, "agents"),
-        mcpGatewayBackends: { fixture: { url: `http://127.0.0.1:${backendPort}/mcp` } },
+        mcpGatewayBackends: {
+          fixture: { url: `http://127.0.0.1:${backendPort}/mcp` },
+          beta: { url: `http://127.0.0.1:${backendPort}/beta` },
+        },
         localTools: { codexPath: codexPath! },
         toolTree: { enabled: true },
       },
@@ -166,6 +276,7 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
         "servers/paseo/exec.ts",
         "servers/paseo/read_file.ts",
         "servers/fixture/whoami.ts",
+        ...BETA_TOOLS.map((name) => `servers/beta/${name}.ts`),
       ]),
     );
 
@@ -227,5 +338,50 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
       backendFails = false;
     }
     expect(launches.length).toBe(launchesBefore);
+  });
+
+  test("a launch overlapped by an ordinary refresh fails when a backend drops out of the tree", async () => {
+    const cwd = path.join(root, "workspace-overlap");
+    await mkdir(cwd);
+    const agentId = randomUUID();
+    const launchesBefore = launches.length;
+    try {
+      const { launched } = await launchOverlappedByOrdinaryRefresh(agentId, () =>
+        daemon.agentManager.createAgent(
+          { provider: "claude", cwd, title: "Overlapped launch agent" },
+          agentId,
+          { workspaceId: undefined },
+        ),
+      );
+      await expect(launched).rejects.toThrow(/tool tree.*beta/s);
+    } finally {
+      betaFails = false;
+    }
+    expect(launches.length).toBe(launchesBefore);
+  });
+
+  test("a reload overlapped by an ordinary refresh fails when a backend drops out of the tree", async () => {
+    const cwd = path.join(root, "workspace-overlap-reload");
+    await mkdir(cwd);
+    const agent = await daemon.agentManager.createAgent(
+      { provider: "claude", cwd, title: "Overlapped reload agent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const tree = path.join(paseoHome, "tool-trees", agent.id);
+    const launchesBefore = launches.length;
+    try {
+      const { launched } = await launchOverlappedByOrdinaryRefresh(agent.id, () =>
+        daemon.agentManager.reloadAgentSession(agent.id),
+      );
+      await expect(launched).rejects.toThrow(/tool tree.*beta/s);
+    } finally {
+      betaFails = false;
+    }
+    expect(launches.length).toBe(launchesBefore);
+    // The tree the agent already had keeps every backend's tools.
+    for (const name of BETA_TOOLS) {
+      expect(existsSync(path.join(tree, "servers/beta", `${name}.ts`))).toBe(true);
+    }
   });
 });

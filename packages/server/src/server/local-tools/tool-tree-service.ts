@@ -39,7 +39,13 @@ export interface ToolTreeRefreshOptions {
 
 interface RefreshState {
   running: Promise<void>;
-  again: Required<ToolTreeRefreshOptions> | null;
+  /** Another pass was requested while one ran. */
+  again: boolean;
+  /**
+   * A strict caller awaits `running`, so every pass up to its end: once one
+   * joins, each later pass is strict, whatever else queued it.
+   */
+  strict: boolean;
 }
 
 /**
@@ -61,22 +67,24 @@ export class ToolTreeService {
 
   /**
    * Regenerates the agent's tree; overlapping requests coalesce into one more
-   * pass, strict when any of them is.
+   * pass and share the promise of the whole run. A run a strict caller has
+   * joined stays strict to its end, so a queued ordinary refresh cannot leave
+   * a backend out of the tree that caller launches with.
    */
   refresh(agentId: string, options: ToolTreeRefreshOptions = {}): Promise<void> {
     const strict = options.strict === true;
     const current = this.refreshes.get(agentId);
     if (current) {
-      current.again = { strict: strict || current.again?.strict === true };
+      current.again = true;
+      current.strict ||= strict;
       return current.running;
     }
-    const state: RefreshState = { running: Promise.resolve(), again: { strict } };
+    const state: RefreshState = { running: Promise.resolve(), again: true, strict };
     state.running = (async () => {
       try {
         while (state.again) {
-          const pass = state.again;
-          state.again = null;
-          await this.writeTree(agentId, pass);
+          state.again = false;
+          await this.writeTree(agentId, { strict: state.strict });
         }
       } finally {
         this.refreshes.delete(agentId);
