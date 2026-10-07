@@ -117,6 +117,43 @@ test("shutdown waits for a slow timeline recorder and stops the plugin only afte
   }
 }, 60_000);
 
+test("shutdown re-offers items whose recorder threw, and a recovered recorder drains clean", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "paseo-timeline-drain-"));
+  // Each item's first delivery throws; every later one succeeds.
+  await writeRecorderPlugin(
+    directory,
+    `    globalThis.tried ??= new Set();
+    if (!globalThis.tried.has(event.seq)) {
+      globalThis.tried.add(event.seq);
+      log("throw " + event.seq);
+      throw new Error("recorder down");
+    }`,
+  );
+  const daemon = await createTestPaseoDaemon({
+    daemonVersion: "0.8.0",
+    sessionRuntime: { timelineDrainMs: 30_000, singleAgent: false, webBasePath: "/" },
+  });
+  try {
+    const { seqs } = await runOneTurn(daemon, directory);
+    await expect
+      .poll(async () => (await readEvents(directory)).filter((line) => line.startsWith("throw")))
+      .toHaveLength(seqs.length);
+
+    const result = await daemon.daemon.stop();
+
+    const events = await readEvents(directory);
+    const acked = events
+      .slice(0, events.indexOf("cleanup"))
+      .filter((line) => line.startsWith("ack "))
+      .map((line) => Number(line.slice(4)));
+    expect(acked.sort((a, b) => a - b)).toEqual([...seqs].sort((a, b) => a - b));
+    expect(result.timelineDrain).toEqual({ status: "drained" });
+  } finally {
+    await removeDaemonFiles(daemon);
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 60_000);
+
 test("a recorder that never answers within the deadline fails the drain and reports what was never acknowledged", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-timeline-drain-"));
   await writeRecorderPlugin(directory, "    await new Promise(() => {});");

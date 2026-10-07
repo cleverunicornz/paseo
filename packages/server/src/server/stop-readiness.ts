@@ -1,7 +1,18 @@
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { PluginStopReadinessOperation } from "./plugins/plugin-process-protocol.js";
-import type { TimelineDrainFailure, TimelineDrainResult } from "./plugins/timeline-deliveries.js";
+import type {
+  TimelineDrainFailure,
+  TimelineDrainResult,
+  UnacknowledgedTimeline,
+} from "./plugins/timeline-deliveries.js";
+
+/**
+ * A readiness poll or begin-stopping offers a failed timeline item again only
+ * once it failed this long ago, so a controller polling every second does not
+ * hammer a recorder that is still down. The shutdown drain offers them all.
+ */
+export const TIMELINE_REOFFER_MIN_INTERVAL_MS = 2_000;
 
 export interface TimelineReadiness {
   ready: boolean;
@@ -42,7 +53,10 @@ export type ShutdownDrainResult =
 
 export interface StopReadinessPlugins {
   listStopReadinessProviders(operation: PluginStopReadinessOperation): string[];
-  hasPendingTimelineDeliveries(pluginId: string): boolean;
+  /** Pending and failed `agent.timeline_item` deliveries of every plugin. */
+  unacknowledgedTimeline(): UnacknowledgedTimeline | null;
+  /** Offers failed deliveries again, those that failed at least `minAgeMs` ago. */
+  reofferFailedTimelineItems(minAgeMs: number): void;
   requestStopReadiness(input: {
     pluginId: string;
     operation: PluginStopReadinessOperation;
@@ -151,15 +165,12 @@ export class StopReadinessService {
       );
       return notReady("invalid provider answer");
     }
-    // Items the daemon sent that the provider has not answered may not be in its count yet.
-    const timeline =
-      parsed.data.timeline.ready && this.deps.plugins.hasPendingTimelineDeliveries(pluginId)
-        ? {
-            ...parsed.data.timeline,
-            ready: false,
-            reason: "timeline items in flight to the provider",
-          }
-        : withReason(parsed.data.timeline);
+    const timeline = vetoUnacknowledged(
+      withReason(parsed.data.timeline),
+      this.deps.plugins.unacknowledgedTimeline(),
+    );
+    // A recorder that recovered gets its failed items again; the next poll sees the outcome.
+    this.deps.plugins.reofferFailedTimelineItems(TIMELINE_REOFFER_MIN_INTERVAL_MS);
     const wip = withReason(parsed.data.wip);
     return { ready: timeline.ready && wip.ready, timeline, wip };
   }
@@ -188,6 +199,7 @@ export class StopReadinessService {
       this.deps.logger.warn({ err: error }, "Failed to stop running turns");
     }
     if (signal.aborted) return;
+    this.deps.plugins.reofferFailedTimelineItems(TIMELINE_REOFFER_MIN_INTERVAL_MS);
     const calls = (["stop", "drain"] as const).flatMap((operation) =>
       this.deps.plugins.listStopReadinessProviders(operation).map((pluginId) =>
         this.deps.plugins
@@ -253,6 +265,26 @@ export class StopReadinessService {
       return [{ pluginId, reason: outcome.status === "deadline" ? "deadline" : "rejected" }];
     });
   }
+}
+
+/**
+ * The daemon knows what it sent and what was answered; the provider may not.
+ * Any item still pending or failed, to any plugin, keeps the timeline not
+ * ready, and the counters then come from the daemon's own record.
+ */
+function vetoUnacknowledged(
+  timeline: TimelineReadiness,
+  unacknowledged: UnacknowledgedTimeline | null,
+): TimelineReadiness {
+  if (!unacknowledged) return timeline;
+  const { count } = unacknowledged;
+  return {
+    ready: false,
+    epoch: unacknowledged.epoch,
+    emitted_through: unacknowledged.emittedThrough,
+    acknowledged_through: unacknowledged.deliveredThrough,
+    reason: `${count} timeline ${count === 1 ? "item" : "items"} not acknowledged`,
+  };
 }
 
 type Settled =

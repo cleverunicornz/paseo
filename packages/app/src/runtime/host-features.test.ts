@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DaemonServerInfo } from "@/stores/session-store";
-import { selectAgentCreationBlocked } from "./host-features";
+import { selectAgentCreationBlocked, selectEveryHostAgentCreationBlocked } from "./host-features";
 
 function state(input: {
   singleAgent?: boolean;
@@ -43,5 +43,29 @@ describe("selectAgentCreationBlocked", () => {
       false,
     );
     expect(selectAgentCreationBlocked(state({ agents: [] }), "unknown-host")).toBe(false);
+  });
+});
+
+describe("selectEveryHostAgentCreationBlocked", () => {
+  const occupied = {
+    serverInfo: { features: { singleAgent: true } } as DaemonServerInfo,
+    agents: new Map([["a", { archivedAt: null }]]),
+  };
+  const ordinary = {
+    serverInfo: { features: {} } as DaemonServerInfo,
+    agents: new Map([["b", { archivedAt: null }]]),
+  };
+
+  it("withdraws app-wide agent starts only when every host is an occupied single-agent host", () => {
+    expect(selectEveryHostAgentCreationBlocked({ sessions: { one: occupied } }, ["one"])).toBe(
+      true,
+    );
+    expect(
+      selectEveryHostAgentCreationBlocked({ sessions: { one: occupied, two: ordinary } }, [
+        "one",
+        "two",
+      ]),
+    ).toBe(false);
+    expect(selectEveryHostAgentCreationBlocked({ sessions: {} }, [])).toBe(false);
   });
 });

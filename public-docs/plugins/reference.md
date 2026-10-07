@@ -338,7 +338,9 @@ if (typeof server.registerStopReadiness === "function") server.registerStopReadi
 
 - `readiness` may return a promise and has 10 seconds to answer.
 - `stop` and `drain` are optional. They run until they settle or their signal aborts.
-- The daemon recomputes `ready`. It keeps `timeline` not ready while items are still in flight to your plugin.
+- The daemon recomputes `ready`. While any plugin has a timeline item pending or failed, `timeline`
+  is not ready with reason `N timeline items not acknowledged`. Its `epoch`, `emitted_through` and
+  `acknowledged_through` then come from the daemon's own record.
 - It refuses an answer of another shape, or a `ref` that is not a plain ref name or a `sha` that is not a full commit id.
 - It redacts URL user information in a `reason`.
 
@@ -555,12 +557,18 @@ but can overlap, so key records on `agent.id`, `epoch` and `seq` rather than arr
 utility agents emit nothing.
 
 The agent never waits for a callback. The daemon does track each item until your callbacks for it
-resolve: that is the acknowledgement. A callback that throws leaves the item unacknowledged, and the
-item is not retried, so retry inside the callback what you mean to keep. This event has no hook
-timeout. At shutdown the daemon waits for unacknowledged items up to its drain deadline before it
-stops plugins, and reports any left over ([Session containers](/docs/session-containers)). A
-consumer that misses rows, or starts late, reads the agent's timeline from its last `seq` with the
-SDK.
+resolve: that is the acknowledgement. This event has no hook timeout. A callback that throws leaves
+the item unacknowledged. The daemon then offers the same event again:
+
+- on each `GET /api/stop-readiness` and `POST /api/begin-stopping`, once the item failed at least
+  2 seconds before;
+- once more when shutdown starts its drain.
+
+During ordinary work a failed item is not retried. So make your handler idempotent on `agent.id`,
+`epoch` and `seq`, and retry inside it what you need to keep sooner. At shutdown the daemon waits
+for unacknowledged items up to its drain deadline before it stops plugins, and reports any left over
+([Session containers](/docs/session-containers)). A consumer that misses rows, or starts late,
+reads the agent's timeline from its last `seq` with the SDK.
 
 ### Answer a permission request
 

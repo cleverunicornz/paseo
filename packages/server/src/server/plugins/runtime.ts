@@ -29,7 +29,12 @@ import type {
 } from "./plugin-process-protocol.js";
 import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
 import { PluginSessionSocket } from "./session-socket.js";
-import { TimelineDeliveryLedger, type TimelineDrainResult } from "./timeline-deliveries.js";
+import {
+  TimelineDeliveryLedger,
+  type TimelineDelivery,
+  type TimelineDrainResult,
+  type UnacknowledgedTimeline,
+} from "./timeline-deliveries.js";
 
 const CLIENT_ENTRY_FILENAMES = ["index.client.ts", "index.client.tsx"] as const;
 const SERVER_ENTRY_FILENAMES = ["index.server.ts", "index.server.tsx"] as const;
@@ -514,7 +519,15 @@ export class PluginRuntime {
       epoch: event.epoch,
       seq: event.seq,
     };
-    this.timelineDeliveries.sent(delivery);
+    this.timelineDeliveries.sent(delivery, event);
+    this.dispatchTimelineItem(loaded, delivery, event);
+  }
+
+  private dispatchTimelineItem(
+    loaded: LoadedPlugin,
+    delivery: TimelineDelivery,
+    event: PluginLifecycleEvents["agent.timeline_item"],
+  ): void {
     let request: Promise<unknown>;
     try {
       request = this.request(
@@ -545,10 +558,27 @@ export class PluginRuntime {
   }
 
   /**
-   * Waits for every timeline item still in flight to any plugin, up to the
-   * deadline. Plugins keep running meanwhile; stop them only afterwards.
+   * Offers each failed timeline item again, unchanged, to its plugin if that
+   * plugin still subscribes, once it failed at least `minAgeMs` ago. A
+   * recorder that recovered acknowledges it; one that throws again leaves it
+   * failed for the next offer.
+   */
+  reofferFailedTimelineItems(minAgeMs: number): void {
+    for (const loaded of this.plugins.values()) {
+      if (!loaded.child || !loaded.hooks.events.includes("agent.timeline_item")) continue;
+      for (const { delivery, event } of this.timelineDeliveries.takeFailed(loaded.id, minAgeMs)) {
+        this.dispatchTimelineItem(loaded, delivery, event);
+      }
+    }
+  }
+
+  /**
+   * Offers every failed item once more, then waits for every timeline item
+   * still in flight to any plugin, up to the deadline. Plugins keep running
+   * meanwhile; stop them only afterwards.
    */
   drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult> {
+    this.reofferFailedTimelineItems(0);
     return this.timelineDeliveries.drain(deadlineMs);
   }
 
@@ -560,8 +590,9 @@ export class PluginRuntime {
       .sort((left, right) => left.localeCompare(right));
   }
 
-  hasPendingTimelineDeliveries(pluginId: string): boolean {
-    return this.timelineDeliveries.hasPending(pluginId);
+  /** Pending and failed timeline items of every plugin; null when all are acknowledged. */
+  unacknowledgedTimeline(): UnacknowledgedTimeline | null {
+    return this.timelineDeliveries.unacknowledged();
   }
 
   /**

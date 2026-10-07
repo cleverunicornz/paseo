@@ -11,7 +11,8 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 /**
  * A plugin whose `readiness` answers whatever `answers.json` in its directory
  * says, and which logs its `stop`/`drain` calls and its other hooks to
- * `events.log`. `extra` is spliced into its setup.
+ * `events.log`. `extra` is spliced into its setup, with `__DIRECTORY__` as the
+ * plugin directory.
  */
 async function writeProviderPlugin(input: {
   directory: string;
@@ -44,7 +45,7 @@ export default function contribute(server) {
     },
   });
   server.on("agent.turn_ended", (event) => log("turn_ended " + event.outcome.kind));
-${extra}
+${extra.replaceAll("__DIRECTORY__", JSON.stringify(directory))}
   return () => {};
 }
 `,
@@ -63,6 +64,10 @@ async function readEventsLog(directory: string): Promise<string[]> {
   }
 }
 
+async function eventsStartingWith(directory: string, prefix: string): Promise<string[]> {
+  return (await readEventsLog(directory)).filter((line) => line.startsWith(prefix));
+}
+
 async function stopWorkEvents(directory: string): Promise<string[]> {
   return (await readEventsLog(directory)).filter((line) => !line.startsWith("turn"));
 }
@@ -70,6 +75,28 @@ async function stopWorkEvents(directory: string): Promise<string[]> {
 async function getReadiness(daemon: TestPaseoDaemon, headers: Record<string, string> = {}) {
   const response = await fetch(`http://127.0.0.1:${daemon.port}/api/stop-readiness`, { headers });
   return { status: response.status, text: await response.text() };
+}
+
+function seqsIn(ranges: ReadonlyArray<{ startSeq: number; endSeq: number }>): number[] {
+  return ranges.flatMap((range) =>
+    Array.from({ length: range.endSeq - range.startSeq + 1 }, (_, index) => range.startSeq + index),
+  );
+}
+
+/** The agent's timeline epoch and every row's `seq`, as the daemon sent them to plugins. */
+async function timelineRows(client: DaemonClient, agentId: string) {
+  const timeline = await client.fetchAgentTimeline(agentId, {
+    projection: "canonical",
+    direction: "tail",
+    limit: 0,
+  });
+  const seqs = timeline.entries.flatMap((entry) => seqsIn(entry.sourceSeqRanges));
+  return {
+    epoch: timeline.epoch,
+    first: Math.min(...seqs),
+    last: Math.max(...seqs),
+    count: seqs.length,
+  };
 }
 
 const READY_TIMELINE = {
@@ -192,16 +219,72 @@ describe("stop readiness", () => {
     const agent = await client.createAgent({ provider: "codex", cwd: directory, title: "Busy" });
     await client.sendMessage(agent.id, "hello");
     await client.waitForFinish(agent.id, 10_000);
+    const rows = await timelineRows(client, agent.id);
 
     expect(JSON.parse((await getReadiness(daemon)).text)).toEqual({
       ready: false,
       timeline: {
-        ...READY_TIMELINE,
         ready: false,
-        reason: "timeline items in flight to the provider",
+        epoch: rows.epoch,
+        emitted_through: rows.last,
+        acknowledged_through: rows.first - 1,
+        reason: `${rows.count} timeline items not acknowledged`,
       },
       wip: READY_WIP,
     });
+  });
+
+  test("items whose recorder threw keep the timeline not ready until a re-offer is acknowledged", async () => {
+    // The validator's probe: a provider that claims everything is ready, and a
+    // recorder that throws until `recorder-ok` exists.
+    const directory = await installProvider(
+      "harness",
+      `  server.on("agent.timeline_item", (event) => {
+    try {
+      readFileSync(__DIRECTORY__ + "/recorder-ok");
+    } catch {
+      log("throw " + event.seq);
+      throw new Error("recorder down");
+    }
+    log("ack " + event.seq);
+  });`,
+    );
+    const claim = {
+      ready: true,
+      timeline: { ready: true, epoch: null, emitted_through: null, acknowledged_through: null },
+      wip: { ready: true },
+    };
+    await setAnswers(directory, claim);
+    const agent = await client.createAgent({ provider: "codex", cwd: directory, title: "Rec" });
+    await client.sendMessage(agent.id, "hello");
+    await client.waitForFinish(agent.id, 10_000);
+    const rows = await timelineRows(client, agent.id);
+    await expect.poll(() => eventsStartingWith(directory, "throw")).toHaveLength(rows.count);
+
+    expect(JSON.parse((await getReadiness(daemon)).text)).toEqual({
+      ready: false,
+      timeline: {
+        ready: false,
+        epoch: rows.epoch,
+        emitted_through: rows.last,
+        acknowledged_through: rows.first - 1,
+        reason: `${rows.count} timeline items not acknowledged`,
+      },
+      wip: { ready: true },
+    });
+
+    // The recorder recovers; polling re-offers the failed items until they are acknowledged.
+    await writeFile(path.join(directory, "recorder-ok"), "");
+    await expect
+      .poll(async () => JSON.parse((await getReadiness(daemon)).text), {
+        timeout: 20_000,
+        interval: 500,
+      })
+      .toEqual(claim);
+    const acked = (await readEventsLog(directory)).filter((line) => line.startsWith("ack"));
+    expect(acked.map((line) => Number(line.slice(4))).sort((a, b) => a - b)).toEqual(
+      Array.from({ length: rows.count }, (_, index) => rows.first + index),
+    );
   });
 
   test("two plugins registering a provider make nothing ready", async () => {

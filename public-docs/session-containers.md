@@ -23,7 +23,7 @@ With `daemon.singleAgent` set to `true` (or `PASEO_SINGLE_AGENT=true`), the daem
 - Creating, importing or resuming a second agent is refused with an error naming the live agent. The same holds for an agent's `create_agent` tool and a schedule that creates an agent.
 - Forking is refused, and the daemon stops advertising it.
 - Reloading or resuming the one agent works as usual. Archiving it makes room for the next.
-- The web UI drops the fork menu and the new-agent actions once the host has its live agent.
+- Once the host has its live agent, the web UI drops the fork menu, the workspace's "New agent" action, the tab launcher's agent entry, the command center's new-agent command and the new-agent shortcuts. When every host the UI knows is such a host, the sidebar's "Add project" and "Import session" go too.
 
 ## Ask whether stopping would lose anything
 
@@ -47,7 +47,7 @@ GET /api/stop-readiness
 - **Where the parts come from.** A plugin provides `timeline` and `wip` through a [stop-readiness provider](/docs/plugins/reference#stop-readiness).
 - **`ready`** is `timeline.ready && wip.ready`. The daemon computes it; a provider cannot claim it.
 - **No provider.** Both parts are `ready: false` with reason `no provider`. With a provider in more than one plugin the reason is `multiple providers`; when the provider fails, `provider failed`.
-- **In-flight items.** While the daemon has timeline items in flight to the provider's plugin, `timeline` is not ready.
+- **Unacknowledged items.** While any plugin has a timeline item it has not acknowledged, `timeline` is not ready, with reason `N timeline items not acknowledged`. This counts items still in flight and items whose handler threw. Its `epoch`, `emitted_through` and `acknowledged_through` then come from the daemon's own record of the most recently active agent and epoch. Each poll offers items that failed at least 2 seconds before to their plugin again, so a recorder that recovered catches up, and the timeline turns ready once those offers are acknowledged.
 - **No credential.** An answer whose `ref` is not a plain ref name or whose `sha` is not a full commit id is refused as `invalid provider answer`. User information in a URL inside a `reason` is replaced with `[redacted]`.
 
 ## Begin stopping
@@ -70,7 +70,7 @@ Both endpoints sit behind the same Host allowlist and daemon password as the res
 
 Shutdown first closes every agent. Plugins keep running until both of these finish, or until `daemon.shutdown.timelineDrainMs` (default 300000 ms) passes:
 
-- every `agent.timeline_item` delivery still in flight;
+- every `agent.timeline_item` delivery not yet acknowledged; items whose handler threw are offered once more first;
 - the provider's `drain`.
 
 Only then does the daemon stop plugins.

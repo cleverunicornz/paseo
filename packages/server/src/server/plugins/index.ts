@@ -24,7 +24,7 @@ import { readPluginManifest } from "./manifest.js";
 import { runPluginBuild } from "./preparation.js";
 import { PluginRuntime, type PluginGatewayToolCaller } from "./runtime.js";
 import type { PluginStopReadinessOperation } from "./plugin-process-protocol.js";
-import type { TimelineDrainResult } from "./timeline-deliveries.js";
+import type { TimelineDrainResult, UnacknowledgedTimeline } from "./timeline-deliveries.js";
 import type { PluginProviderMetadata } from "./plugin-process-protocol.js";
 import { readPluginProviderIcon } from "./provider-icon.js";
 
@@ -46,7 +46,8 @@ interface PluginRuntimePort {
   stopAll(): Promise<void>;
   drainTimelineDeliveries?(deadlineMs: number): Promise<TimelineDrainResult>;
   listStopReadinessProviders?(operation: PluginStopReadinessOperation): string[];
-  hasPendingTimelineDeliveries?(pluginId: string): boolean;
+  unacknowledgedTimeline?(): UnacknowledgedTimeline | null;
+  reofferFailedTimelineItems?(minAgeMs: number): void;
   requestStopReadiness?(input: {
     pluginId: string;
     operation: PluginStopReadinessOperation;
@@ -441,8 +442,12 @@ export class PluginService {
     this.runtime.bindGatewayToolCaller?.(caller);
   }
 
-  hasPendingTimelineDeliveries(pluginId: string): boolean {
-    return this.runtime.hasPendingTimelineDeliveries?.(pluginId) ?? false;
+  unacknowledgedTimeline(): UnacknowledgedTimeline | null {
+    return this.runtime.unacknowledgedTimeline?.() ?? null;
+  }
+
+  reofferFailedTimelineItems(minAgeMs: number): void {
+    this.runtime.reofferFailedTimelineItems?.(minAgeMs);
   }
 
   requestStopReadiness(input: {

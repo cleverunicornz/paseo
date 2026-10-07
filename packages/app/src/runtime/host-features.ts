@@ -57,6 +57,25 @@ export function selectAgentCreationBlocked(
   return false;
 }
 
+/**
+ * True when there is at least one host and every one refuses another agent,
+ * so app-wide ways of starting one (add a project, import a session) lead
+ * nowhere.
+ */
+export function selectEveryHostAgentCreationBlocked(
+  state: AgentCreationSessionState,
+  serverIds: readonly string[],
+): boolean {
+  return (
+    serverIds.length > 0 &&
+    serverIds.every((serverId) => selectAgentCreationBlocked(state, serverId))
+  );
+}
+
+export function useEveryHostAgentCreationBlocked(serverIds: readonly string[]): boolean {
+  return useSessionStore((state) => selectEveryHostAgentCreationBlocked(state, serverIds));
+}
+
 export function useAgentCreationBlocked(serverId: string | null | undefined): boolean {
   const normalizedServerId = serverId?.trim() ?? "";
   return useSessionStore((state) => selectAgentCreationBlocked(state, normalizedServerId));
