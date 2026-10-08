@@ -5,6 +5,7 @@ import { Writable } from "node:stream";
 import pino from "pino";
 import { expect, test } from "vitest";
 import { DaemonClient } from "../test-utils/daemon-client.js";
+import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 
 interface LogLine {
@@ -185,6 +186,7 @@ test("a recorder that never answers within the deadline fails the drain and repo
         },
       ],
       providerFailures: [],
+      unclosedAgents: [],
     });
     const report = lines.find((line) => line.msg.startsWith("Timeline drain failed"));
     expect(report).toMatchObject({
@@ -201,6 +203,64 @@ test("a recorder that never answers within the deadline fails the drain and repo
     await rm(directory, { recursive: true, force: true });
   }
 }, 60_000);
+
+const UNFINISHED_CLOSES = [
+  {
+    label: "rejects",
+    closeSession: async () => {
+      throw new Error("provider close rejected");
+    },
+    reason: "rejected",
+  },
+  {
+    label: "never finishes",
+    closeSession: () => new Promise<void>(() => {}),
+    reason: "deadline",
+  },
+] as const;
+
+for (const close of UNFINISHED_CLOSES) {
+  test(`an agent whose close ${close.label} fails the drain, and what it emitted is still delivered`, async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "paseo-timeline-drain-"));
+    await writeRecorderPlugin(directory, "");
+    const lines: LogLine[] = [];
+    const daemon = await createTestPaseoDaemon({
+      daemonVersion: "0.8.0",
+      logger: captureLogger(lines),
+      agentClients: createTestAgentClients({ closeSession: close.closeSession }),
+      sessionRuntime: { timelineDrainMs: 30_000, singleAgent: false, webBasePath: "/" },
+    });
+    try {
+      const { agentId, seqs } = await runOneTurn(daemon, directory);
+
+      const result = await daemon.daemon.stop();
+
+      // The agent was never closed, so it could still add items: no clean drain.
+      expect(daemon.daemon.agentManager.getAgent(agentId)).not.toBeNull();
+      expect(result.timelineDrain).toEqual({
+        status: "failed",
+        deadlineMs: 30_000,
+        failures: [],
+        providerFailures: [],
+        unclosedAgents: [{ agentId, reason: close.reason }],
+      });
+      const report = lines.find(
+        (line) => line.msg.startsWith("Timeline drain failed") && line.agentId === agentId,
+      );
+      expect(report).toMatchObject({ level: 50, agentId, reason: close.reason });
+      // Everything it emitted before the stop still reached the recorder before plugins stopped.
+      const events = await readEvents(directory);
+      const acked = events
+        .slice(0, events.indexOf("cleanup"))
+        .filter((line) => line.startsWith("ack "))
+        .map((line) => Number(line.slice(4)));
+      expect(acked.sort((a, b) => a - b)).toEqual([...seqs].sort((a, b) => a - b));
+    } finally {
+      await removeDaemonFiles(daemon);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
+}
 
 /** A plugin whose stop-readiness provider drains with `drainBody`; it logs to `events.log`. */
 async function writeDrainProviderPlugin(directory: string, drainBody: string): Promise<void> {
@@ -281,6 +341,7 @@ test("a provider drain unfinished at the deadline is aborted and fails the drain
       deadlineMs: 1_000,
       failures: [],
       providerFailures: [{ pluginId: "harness", reason: "deadline" }],
+      unclosedAgents: [],
     });
     expect(await readEvents(directory)).toEqual(["aborted", "cleanup"]);
   } finally {
