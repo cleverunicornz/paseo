@@ -32,7 +32,7 @@ import { PluginSessionSocket } from "./session-socket.js";
 import {
   TimelineDeliveryLedger,
   type TimelineDelivery,
-  type TimelineDrainResult,
+  type TimelineDrainFailure,
   type UnacknowledgedTimeline,
 } from "./timeline-deliveries.js";
 
@@ -573,13 +573,13 @@ export class PluginRuntime {
   }
 
   /**
-   * Offers every failed item once more, then waits for every timeline item
-   * still in flight to any plugin, up to the deadline. Plugins keep running
-   * meanwhile; stop them only afterwards.
+   * Waits for every timeline item in flight to any plugin, including items
+   * sent while it waits, until none is pending or `deadline` aborts, and
+   * returns what is still unacknowledged. Plugins keep running meanwhile;
+   * stop them only afterwards.
    */
-  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult> {
-    this.reofferFailedTimelineItems(0);
-    return this.timelineDeliveries.drain(deadlineMs);
+  drainTimelineDeliveries(deadline: AbortSignal): Promise<TimelineDrainFailure[]> {
+    return this.timelineDeliveries.drain(deadline);
   }
 
   /** Running plugins that registered a stop-readiness provider with this operation, by id. */

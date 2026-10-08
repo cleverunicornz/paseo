@@ -3,7 +3,6 @@ import { z } from "zod";
 import type { PluginStopReadinessOperation } from "./plugins/plugin-process-protocol.js";
 import type {
   TimelineDrainFailure,
-  TimelineDrainResult,
   UnacknowledgedTimeline,
 } from "./plugins/timeline-deliveries.js";
 
@@ -72,7 +71,12 @@ export interface StopReadinessPlugins {
     operation: PluginStopReadinessOperation;
     signal?: AbortSignal;
   }): Promise<unknown>;
-  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult>;
+  /**
+   * Waits until no timeline delivery to any plugin is pending, counting those
+   * sent while it waits, or until `deadline` aborts; returns what is still
+   * unacknowledged.
+   */
+  drainTimelineDeliveries(deadline: AbortSignal): Promise<TimelineDrainFailure[]>;
 }
 
 const MAX_REASON_LENGTH = 300;
@@ -226,14 +230,16 @@ export class StopReadinessService {
   }
 
   /**
-   * Waits up to the deadline for the daemon's own timeline deliveries and for
-   * every provider's `drain`. Whatever is still outstanding then is a failure.
-   */
-  /**
-   * Waits for plugins to acknowledge every timeline item and for the
-   * provider's drain. The drain is never clean while `unclosedAgents` is not
-   * empty: those agents may add items after it ends. Their items are still
-   * delivered and waited for like any other.
+   * Offers every failed timeline item once more, waits for every provider's
+   * `drain`, then waits for every timeline item delivered to any plugin until
+   * none is pending, all within one deadline. Whatever is still outstanding at
+   * the deadline is a failure, listed item by item.
+   *
+   * The deliveries are waited for after the providers' drains, not alongside
+   * them: an agent in `unclosedAgents` is still live and can emit items while
+   * a provider drains, and those are awaited like any other. The drain is
+   * never clean while `unclosedAgents` is not empty, because those agents may
+   * add items after it ends.
    */
   async drainForShutdown(
     deadlineMs: number,
@@ -243,21 +249,16 @@ export class StopReadinessService {
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), deadlineMs);
     try {
-      const [deliveries, providerFailures] = await Promise.all([
-        this.deps.plugins.drainTimelineDeliveries(deadlineMs),
-        this.drainProviders(deadline.signal),
-      ]);
-      if (
-        deliveries.status === "drained" &&
-        providerFailures.length === 0 &&
-        unclosedAgents.length === 0
-      ) {
+      this.deps.plugins.reofferFailedTimelineItems(0);
+      const providerFailures = await this.drainProviders(deadline.signal);
+      const failures = await this.deps.plugins.drainTimelineDeliveries(deadline.signal);
+      if (failures.length === 0 && providerFailures.length === 0 && unclosedAgents.length === 0) {
         return { status: "drained" };
       }
       return {
         status: "failed",
         deadlineMs,
-        failures: deliveries.status === "failed" ? deliveries.failures : [],
+        failures,
         providerFailures,
         unclosedAgents: [...unclosedAgents],
       };

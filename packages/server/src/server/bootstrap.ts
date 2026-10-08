@@ -2039,7 +2039,7 @@ function reportTimelineDrain(logger: Logger, result: ShutdownDrainResult): void 
   for (const failure of result.failures) {
     logger.error(
       { ...failure, deadlineMs: result.deadlineMs },
-      `Timeline drain failed: plugin ${failure.pluginId} did not acknowledge agent ${failure.agentId} epoch ${failure.epoch} through seq ${failure.highestUnacknowledgedSeq}`,
+      `Timeline drain failed: plugin ${failure.pluginId} did not acknowledge agent ${failure.agentId} epoch ${failure.epoch} seq ${failure.unacknowledgedSeqs.join(", ")}`,
     );
   }
   for (const failure of result.providerFailures) {

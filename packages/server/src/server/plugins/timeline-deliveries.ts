@@ -37,12 +37,10 @@ export interface TimelineDrainFailure {
   epoch: string;
   highestUnacknowledgedSeq: number;
   unacknowledged: number;
+  /** Every `seq` still pending or failed, ascending. */
+  unacknowledgedSeqs: number[];
   deliveredThrough: number;
 }
-
-export type TimelineDrainResult =
-  | { status: "drained" }
-  | { status: "failed"; deadlineMs: number; failures: TimelineDrainFailure[] };
 
 /**
  * Tracks every `agent.timeline_item` delivery to every plugin until the
@@ -131,45 +129,42 @@ export class TimelineDeliveryLedger {
   }
 
   /**
-   * Waits until no delivery is pending or the deadline passes, whichever is
-   * first. Every delivery still pending then, and every failed one, is
-   * reported; none is counted as delivered.
+   * Waits until no delivery to any plugin is pending, or until `deadline`
+   * aborts. Items sent while it waits are waited for too: every settled
+   * delivery checks the whole ledger again, so it returns only when nothing,
+   * old or new, is in flight. Every delivery still pending then, and every
+   * failed one, is reported; none is counted as delivered. An empty list
+   * means everything sent so far was acknowledged.
    */
-  async drain(deadlineMs: number): Promise<TimelineDrainResult> {
-    await this.waitForSettled(deadlineMs);
-    const failures = [...this.streams.values()]
+  async drain(deadline: AbortSignal): Promise<TimelineDrainFailure[]> {
+    await this.waitForSettled(deadline);
+    return [...this.streams.values()]
       .filter((stream) => stream.pending.size > 0 || stream.failed.size > 0)
-      .map((stream) => {
-        return {
-          pluginId: stream.pluginId,
-          agentId: stream.agentId,
-          epoch: stream.epoch,
-          highestUnacknowledgedSeq: unacknowledgedBound(stream, "highest"),
-          unacknowledged: stream.pending.size + stream.failed.size,
-          deliveredThrough: deliveredThrough(stream),
-        };
-      });
-    return failures.length === 0
-      ? { status: "drained" }
-      : { status: "failed", deadlineMs, failures };
+      .map((stream) => ({
+        pluginId: stream.pluginId,
+        agentId: stream.agentId,
+        epoch: stream.epoch,
+        highestUnacknowledgedSeq: unacknowledgedBound(stream, "highest"),
+        unacknowledged: stream.pending.size + stream.failed.size,
+        unacknowledgedSeqs: [...stream.pending, ...stream.failed.keys()].sort((a, b) => a - b),
+        deliveredThrough: deliveredThrough(stream),
+      }));
   }
 
-  private async waitForSettled(deadlineMs: number): Promise<void> {
-    if (!this.hasPending()) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+  private async waitForSettled(deadline: AbortSignal): Promise<void> {
+    if (!this.hasPending() || deadline.aborted) return;
     let listener: (() => void) | undefined;
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, deadlineMs);
-    });
-    const settled = new Promise<void>((resolve) => {
+    let onAbort: (() => void) | undefined;
+    await new Promise<void>((resolve) => {
       listener = () => {
         if (!this.hasPending()) resolve();
       };
+      onAbort = resolve;
       this.settledListeners.add(listener);
+      deadline.addEventListener("abort", onAbort, { once: true });
     });
-    await Promise.race([deadline, settled]);
-    clearTimeout(timer);
     if (listener) this.settledListeners.delete(listener);
+    if (onAbort) deadline.removeEventListener("abort", onAbort);
   }
 
   private notifySettled(): void {
