@@ -209,7 +209,11 @@ import {
   DEFAULT_SESSION_RUNTIME_CONFIG,
   type SessionRuntimeConfig,
 } from "./session-runtime-config.js";
-import { StopReadinessService, type ShutdownDrainResult } from "./stop-readiness.js";
+import {
+  StopReadinessService,
+  type ShutdownDrainResult,
+  type UnclosedAgent,
+} from "./stop-readiness.js";
 import { createWebBasePathMiddleware, stripUpgradeBasePath } from "./web-base-path.js";
 import { createPluginGatewayToolCaller } from "./mcp-gateway/plugin-tool-call.js";
 import { ShutdownGatewayCallers } from "./mcp-gateway/shutdown-callers.js";
@@ -1967,16 +1971,18 @@ export async function createPaseoDaemon(
         workspaceId: agent.workspaceId ?? null,
       })),
     );
-    await closeAllAgents(logger, agentManager);
+    const unclosedAgents = await closeAllAgents(logger, agentManager);
     await localToolsRuntime.close();
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();
     await agentStorage.flush().catch(() => undefined);
     await agentProviderRuntime.shutdown();
-    // Every agent is closed and its last timeline items emitted. Plugins stay up
-    // until they acknowledged those items or the drain deadline passed.
+    // Every closed agent has emitted its last timeline items. Plugins stay up
+    // until they acknowledged every item or the drain deadline passed. An agent
+    // whose close failed is still live and can add items, so the drain then
+    // still delivers what it emits but cannot end clean.
     const timelineDrain = await stopReadiness
-      .drainForShutdown(sessionRuntime.timelineDrainMs)
+      .drainForShutdown(sessionRuntime.timelineDrainMs, unclosedAgents)
       .finally(() => shutdownGatewayCallers.end());
     reportTimelineDrain(logger, timelineDrain);
     await pluginRuntime.stopAllPlugins();
@@ -2042,6 +2048,12 @@ function reportTimelineDrain(logger: Logger, result: ShutdownDrainResult): void 
       `Timeline drain failed: plugin ${failure.pluginId} did not finish its drain (${failure.reason})`,
     );
   }
+  for (const agent of result.unclosedAgents) {
+    logger.error(
+      { ...agent, deadlineMs: result.deadlineMs },
+      `Timeline drain failed: agent ${agent.agentId} was not closed (${agent.reason}) and could still add timeline items`,
+    );
+  }
 }
 
 /**
@@ -2052,19 +2064,36 @@ function reportTimelineDrain(logger: Logger, result: ShutdownDrainResult): void 
  */
 const AGENT_CLOSE_TIMEOUT_MS = 5_000;
 
-async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promise<void> {
+/**
+ * Closes every agent and returns those still live afterwards. A failed close
+ * leaves the agent registered and subscribed: the daemon has no
+ * provider-independent way to force its harness down, and a session whose
+ * close failed may still own its native writer, so it is not treated as closed.
+ */
+async function closeAllAgents(
+  logger: Logger,
+  agentManager: AgentManager,
+): Promise<UnclosedAgent[]> {
   const agents = agentManager.listAgents();
-  await Promise.all(
-    agents.map(async (agent) => {
+  const outcomes = await Promise.all(
+    agents.map(async (agent): Promise<UnclosedAgent | null> => {
+      let settled = false;
+      const close = agentManager.closeAgent(agent.id).finally(() => {
+        settled = true;
+      });
+      let reason: UnclosedAgent["reason"] = "rejected";
       try {
         await withTimeout({
-          promise: agentManager.closeAgent(agent.id),
+          promise: close,
           timeoutMs: AGENT_CLOSE_TIMEOUT_MS,
           label: `close agent ${agent.id}`,
         });
       } catch (err) {
+        reason = settled ? "rejected" : "deadline";
         logger.error({ err, agentId: agent.id }, "Failed to close agent");
       }
+      return agentManager.getAgent(agent.id) === null ? null : { agentId: agent.id, reason };
     }),
   );
+  return outcomes.filter((outcome): outcome is UnclosedAgent => outcome !== null);
 }

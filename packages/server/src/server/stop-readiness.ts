@@ -42,6 +42,15 @@ export interface ProviderDrainFailure {
   reason: "deadline" | "rejected";
 }
 
+/**
+ * An agent shutdown meant to close but that is still live: its provider's
+ * close rejected, or did not finish in time. It can still add timeline items.
+ */
+export interface UnclosedAgent {
+  agentId: string;
+  reason: "deadline" | "rejected";
+}
+
 export type ShutdownDrainResult =
   | { status: "drained" }
   | {
@@ -49,6 +58,7 @@ export type ShutdownDrainResult =
       deadlineMs: number;
       failures: TimelineDrainFailure[];
       providerFailures: ProviderDrainFailure[];
+      unclosedAgents: UnclosedAgent[];
     };
 
 export interface StopReadinessPlugins {
@@ -219,7 +229,16 @@ export class StopReadinessService {
    * Waits up to the deadline for the daemon's own timeline deliveries and for
    * every provider's `drain`. Whatever is still outstanding then is a failure.
    */
-  async drainForShutdown(deadlineMs: number): Promise<ShutdownDrainResult> {
+  /**
+   * Waits for plugins to acknowledge every timeline item and for the
+   * provider's drain. The drain is never clean while `unclosedAgents` is not
+   * empty: those agents may add items after it ends. Their items are still
+   * delivered and waited for like any other.
+   */
+  async drainForShutdown(
+    deadlineMs: number,
+    unclosedAgents: readonly UnclosedAgent[] = [],
+  ): Promise<ShutdownDrainResult> {
     this.stopWork?.abort();
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), deadlineMs);
@@ -228,7 +247,11 @@ export class StopReadinessService {
         this.deps.plugins.drainTimelineDeliveries(deadlineMs),
         this.drainProviders(deadline.signal),
       ]);
-      if (deliveries.status === "drained" && providerFailures.length === 0) {
+      if (
+        deliveries.status === "drained" &&
+        providerFailures.length === 0 &&
+        unclosedAgents.length === 0
+      ) {
         return { status: "drained" };
       }
       return {
@@ -236,6 +259,7 @@ export class StopReadinessService {
         deadlineMs,
         failures: deliveries.status === "failed" ? deliveries.failures : [],
         providerFailures,
+        unclosedAgents: [...unclosedAgents],
       };
     } finally {
       clearTimeout(timer);

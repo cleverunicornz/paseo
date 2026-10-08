@@ -9,8 +9,9 @@ function digest(token: string): string {
  * The gateway identities of the agents a shutdown closes, kept so plugins can
  * still call the gateway on their behalf while the timeline drain runs.
  *
- * Shutdown closes agents before it drains, so nothing new reaches the
- * timeline, and closing revokes each agent's own token. This table holds the
+ * Shutdown closes agents before it drains, so no closed agent adds timeline
+ * items, and closing revokes each agent's own token. An agent whose close
+ * failed stays live and calls with its own token as before. This table holds the
  * identity each agent had, captured before it closed, and mints a separate
  * token per agent that only the daemon ever holds: the agent's own token,
  * which its harness and the processes it ran received, is not revived. The
