@@ -68,18 +68,18 @@ Both endpoints sit behind the same Host allowlist and daemon password as the res
 
 ## Stop without losing timeline items
 
-Shutdown first closes every agent. Plugins keep running until both of these finish, or until `daemon.shutdown.timelineDrainMs` (default 300000 ms) passes:
+Shutdown first asks every agent's provider to close its session, so closed agents add no more timeline items. A close that fails, or does not finish within 5 seconds, leaves that agent running: it can still add items. Plugins keep running until both of these finish, or until `daemon.shutdown.timelineDrainMs` (default 300000 ms) passes:
 
 - every `agent.timeline_item` delivery not yet acknowledged; items whose handler threw are offered once more first;
 - the provider's `drain`.
 
-Only then does the daemon stop plugins. Until then a plugin can still send what it holds through
+Items from an agent left running are delivered and waited for like any other. Only then does the daemon stop plugins. Until then a plugin can still send what it holds through
 [`server.mcp.callTool()`](/docs/plugins/reference#gateway-calls) on behalf of the agents this
 shutdown closed, with their identity, for example when its backend came back during the drain.
 
 When something is left unfinished:
 
-- The daemon logs `Timeline drain failed` with the plugin, agent, epoch and the highest unacknowledged `seq`, or with the plugin whose `drain` did not finish.
+- The daemon logs `Timeline drain failed` with the plugin, agent, epoch and the highest unacknowledged `seq`, with the plugin whose `drain` did not finish, or with the agent left running and why its close did not finish (`rejected` or `deadline`). An agent left running fails the drain even when every item was acknowledged, because it could add items after the drain.
 - The worker exits with status **75** instead of 0. The supervisor, and the Docker image's entrypoint, pass that status through.
 
 The supervisor waits for the drain plus the rest of the teardown before it forces the worker down. Give the container's stop timeout the same room, for example `docker stop -t 330` or `stop_grace_period: 330s`. Otherwise the container runtime kills the daemon first.
