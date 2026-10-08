@@ -24,7 +24,7 @@ import { readPluginManifest } from "./manifest.js";
 import { runPluginBuild } from "./preparation.js";
 import { PluginRuntime, type PluginGatewayToolCaller } from "./runtime.js";
 import type { PluginStopReadinessOperation } from "./plugin-process-protocol.js";
-import type { TimelineDrainResult, UnacknowledgedTimeline } from "./timeline-deliveries.js";
+import type { TimelineDrainFailure, UnacknowledgedTimeline } from "./timeline-deliveries.js";
 import type { PluginProviderMetadata } from "./plugin-process-protocol.js";
 import { readPluginProviderIcon } from "./provider-icon.js";
 
@@ -44,7 +44,7 @@ interface PluginRuntimePort {
   startPlugin(pluginId: string, path: string, canPublish: () => boolean): Promise<void>;
   stopPluginById(pluginId: string): Promise<boolean>;
   stopAll(): Promise<void>;
-  drainTimelineDeliveries?(deadlineMs: number): Promise<TimelineDrainResult>;
+  drainTimelineDeliveries?(deadline: AbortSignal): Promise<TimelineDrainFailure[]>;
   listStopReadinessProviders?(operation: PluginStopReadinessOperation): string[];
   unacknowledgedTimeline?(): UnacknowledgedTimeline | null;
   reofferFailedTimelineItems?(minAgeMs: number): void;
@@ -428,10 +428,8 @@ export class PluginService {
     return this.runtime.invoke(pluginId, method, input);
   }
 
-  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult> {
-    return (
-      this.runtime.drainTimelineDeliveries?.(deadlineMs) ?? Promise.resolve({ status: "drained" })
-    );
+  drainTimelineDeliveries(deadline: AbortSignal): Promise<TimelineDrainFailure[]> {
+    return this.runtime.drainTimelineDeliveries?.(deadline) ?? Promise.resolve([]);
   }
 
   listStopReadinessProviders(operation: PluginStopReadinessOperation): string[] {

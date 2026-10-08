@@ -3,7 +3,6 @@ import { z } from "zod";
 import type { PluginStopReadinessOperation } from "./plugins/plugin-process-protocol.js";
 import type {
   TimelineDrainFailure,
-  TimelineDrainResult,
   UnacknowledgedTimeline,
 } from "./plugins/timeline-deliveries.js";
 
@@ -42,6 +41,15 @@ export interface ProviderDrainFailure {
   reason: "deadline" | "rejected";
 }
 
+/**
+ * An agent shutdown meant to close but that is still live: its provider's
+ * close rejected, or did not finish in time. It can still add timeline items.
+ */
+export interface UnclosedAgent {
+  agentId: string;
+  reason: "deadline" | "rejected";
+}
+
 export type ShutdownDrainResult =
   | { status: "drained" }
   | {
@@ -49,6 +57,7 @@ export type ShutdownDrainResult =
       deadlineMs: number;
       failures: TimelineDrainFailure[];
       providerFailures: ProviderDrainFailure[];
+      unclosedAgents: UnclosedAgent[];
     };
 
 export interface StopReadinessPlugins {
@@ -62,7 +71,12 @@ export interface StopReadinessPlugins {
     operation: PluginStopReadinessOperation;
     signal?: AbortSignal;
   }): Promise<unknown>;
-  drainTimelineDeliveries(deadlineMs: number): Promise<TimelineDrainResult>;
+  /**
+   * Waits until no timeline delivery to any plugin is pending, counting those
+   * sent while it waits, or until `deadline` aborts; returns what is still
+   * unacknowledged.
+   */
+  drainTimelineDeliveries(deadline: AbortSignal): Promise<TimelineDrainFailure[]>;
 }
 
 const MAX_REASON_LENGTH = 300;
@@ -216,26 +230,37 @@ export class StopReadinessService {
   }
 
   /**
-   * Waits up to the deadline for the daemon's own timeline deliveries and for
-   * every provider's `drain`. Whatever is still outstanding then is a failure.
+   * Offers every failed timeline item once more, waits for every provider's
+   * `drain`, then waits for every timeline item delivered to any plugin until
+   * none is pending, all within one deadline. Whatever is still outstanding at
+   * the deadline is a failure, listed item by item.
+   *
+   * The deliveries are waited for after the providers' drains, not alongside
+   * them: an agent in `unclosedAgents` is still live and can emit items while
+   * a provider drains, and those are awaited like any other. The drain is
+   * never clean while `unclosedAgents` is not empty, because those agents may
+   * add items after it ends.
    */
-  async drainForShutdown(deadlineMs: number): Promise<ShutdownDrainResult> {
+  async drainForShutdown(
+    deadlineMs: number,
+    unclosedAgents: readonly UnclosedAgent[] = [],
+  ): Promise<ShutdownDrainResult> {
     this.stopWork?.abort();
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), deadlineMs);
     try {
-      const [deliveries, providerFailures] = await Promise.all([
-        this.deps.plugins.drainTimelineDeliveries(deadlineMs),
-        this.drainProviders(deadline.signal),
-      ]);
-      if (deliveries.status === "drained" && providerFailures.length === 0) {
+      this.deps.plugins.reofferFailedTimelineItems(0);
+      const providerFailures = await this.drainProviders(deadline.signal);
+      const failures = await this.deps.plugins.drainTimelineDeliveries(deadline.signal);
+      if (failures.length === 0 && providerFailures.length === 0 && unclosedAgents.length === 0) {
         return { status: "drained" };
       }
       return {
         status: "failed",
         deadlineMs,
-        failures: deliveries.status === "failed" ? deliveries.failures : [],
+        failures,
         providerFailures,
+        unclosedAgents: [...unclosedAgents],
       };
     } finally {
       clearTimeout(timer);

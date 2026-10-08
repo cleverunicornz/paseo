@@ -7,9 +7,12 @@ import { MCP_GATEWAY_BACKEND_NAME_PATTERN } from "./backends.js";
 export interface PluginGatewayToolCallerDeps {
   /** The daemon's own loopback `/mcp/backends` URL, or null without a TCP listener. */
   getGatewayBaseUrl: () => string | null;
-  /** Only an agent the daemon holds now may be named. */
-  isLiveAgent: (agentId: string) => boolean;
-  issueAgentToken: (agentId: string) => string;
+  /**
+   * The token to call with on behalf of `agentId`: a live agent's own token,
+   * or, while the shutdown drain runs, the daemon-only token of an agent that
+   * shutdown closed. Null for any other agent.
+   */
+  issueCallerToken: (agentId: string) => string | null;
 }
 
 /**
@@ -23,12 +26,14 @@ export function createPluginGatewayToolCaller(deps: PluginGatewayToolCallerDeps)
     if (!MCP_GATEWAY_BACKEND_NAME_PATTERN.test(call.backend)) {
       throw new Error(`Invalid gateway backend name: ${call.backend}`);
     }
-    if (!deps.isLiveAgent(call.onBehalfOf)) {
-      throw new Error(`No live agent ${call.onBehalfOf}; a plugin can call only for a live agent`);
-    }
     const baseUrl = deps.getGatewayBaseUrl();
     if (!baseUrl) throw new Error("Gateway tool calls need the daemon to listen on TCP");
-    const token = deps.issueAgentToken(call.onBehalfOf);
+    const token = deps.issueCallerToken(call.onBehalfOf);
+    if (!token) {
+      throw new Error(
+        `No live agent ${call.onBehalfOf}; a plugin can call only for a live agent, or during the shutdown drain for an agent the shutdown closed`,
+      );
+    }
     const transport = new StreamableHTTPClientTransport(
       new URL(`${baseUrl.replace(/\/$/, "")}/${call.backend}`),
       { requestInit: { headers: { Authorization: `Bearer ${token}` } } },

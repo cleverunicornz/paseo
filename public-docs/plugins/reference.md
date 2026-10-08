@@ -362,8 +362,18 @@ const result = await server.mcp.callTool({
 
 The daemon makes the call as that agent's own request to `/mcp/backends/memory`. It goes through
 the same `mcp_gateway.upstream` hooks, including your own, and the backend sees the agent's
-`X-Paseo-*` identity headers. The agent must be live; any other id is refused. Your plugin sees the
-result or an error message, never the agent's token.
+`X-Paseo-*` identity headers. Your plugin sees the result or an error message, never the agent's
+token.
+
+You can call for:
+
+- a live agent;
+- during the shutdown drain, an agent that this shutdown closed. The call carries the identity the
+  agent had when shutdown began, so a recorder can send the timeline items it still holds from its
+  `drain` or from a re-offered `agent.timeline_item`.
+
+Any other id is refused, including an agent closed before shutdown began and every agent once the
+drain has ended.
 
 ## Entry point and cleanup
 
