@@ -322,6 +322,8 @@ export interface CreateAgentOptions {
 /** What a launch knows of its agent before the agent is registered. */
 export interface LaunchingAgent {
   workspaceId: string | null;
+  provider: AgentProvider;
+  model: string | null;
 }
 
 export interface AgentManagerOptions {
@@ -1383,7 +1385,12 @@ export class AgentManager {
       storedConfig.cwd,
       paseoToolPolicy,
       options?.env,
-      { reason: "create", purpose: "interactive", workspaceId: options.workspaceId ?? null },
+      {
+        reason: "create",
+        purpose: "interactive",
+        workspaceId: options.workspaceId ?? null,
+        model: storedConfig.model,
+      },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
       agentId: resolvedAgentId,
@@ -1533,6 +1540,7 @@ export class AgentManager {
         reason: "resume",
         purpose,
         workspaceId: options?.workspaceId ?? null,
+        model: storedConfig.model,
       },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
@@ -1698,7 +1706,12 @@ export class AgentManager {
       storedConfig.cwd,
       paseoToolPolicy,
       undefined,
-      { reason: "refresh", purpose: "interactive", workspaceId: existing.workspaceId },
+      {
+        reason: "refresh",
+        purpose: "interactive",
+        workspaceId: existing.workspaceId,
+        model: storedConfig.model,
+      },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
       agentId: agentId,
@@ -5405,6 +5418,7 @@ export class AgentManager {
       reason: PluginSessionOpenRequest["reason"];
       purpose: PluginSessionOpenRequest["purpose"];
       workspaceId?: string | null;
+      model?: string | null;
     },
   ): Promise<AgentLaunchContext> {
     if (this.pluginLifecycle) {
@@ -5420,7 +5434,11 @@ export class AgentManager {
       const transformed = await this.pluginLifecycle.before("agent.session_open", request);
       env = transformed.env;
     }
-    const launching: LaunchingAgent = { workspaceId: opening?.workspaceId ?? null };
+    const launching: LaunchingAgent = {
+      workspaceId: opening?.workspaceId ?? null,
+      provider: client.provider,
+      model: opening?.model ?? null,
+    };
     this.launchingAgents.set(agentId, launching);
     let toolTreeDir: string | null;
     try {

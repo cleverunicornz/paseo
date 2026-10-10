@@ -14,6 +14,9 @@ export interface McpGatewayAgent {
   agentId: string;
   sessionId: string | null;
   workspaceId: string | null;
+  /** The provider and model the agent runs as, from which the gateway forms its member. */
+  provider: string;
+  model: string | null;
 }
 
 export interface McpGatewayOptions {
@@ -46,6 +49,21 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 const IDENTITY_HEADER_PREFIX = "x-paseo-";
+
+const MEMBER_PATTERN = /^([a-z0-9-]+\/)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
+const MEMBER_MAX_LENGTH = 128;
+
+/**
+ * The agent's member, `<provider>/<model>` in ASCII lowercase, that backends
+ * record in their lineage. Null when either part is missing or the result
+ * does not match the member pattern within 128 characters: the gateway then
+ * sends no member rather than a malformed one.
+ */
+export function formatMcpGatewayMember(provider: string, model: string | null): string | null {
+  if (!provider || !model) return null;
+  const member = `${provider}/${model}`.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  return member.length <= MEMBER_MAX_LENGTH && MEMBER_PATTERN.test(member) ? member : null;
+}
 
 type ParsedTarget =
   | { kind: "backend"; backend: string; suffix: string; search: string }
@@ -222,6 +240,8 @@ function buildUpstreamHeaders(input: {
   if (input.agent.sessionId) headers["x-paseo-session-id"] = input.agent.sessionId;
   if (input.agent.workspaceId) headers["x-paseo-workspace-id"] = input.agent.workspaceId;
   headers["x-paseo-server-id"] = input.serverId;
+  const member = formatMcpGatewayMember(input.agent.provider, input.agent.model);
+  if (member) headers["x-paseo-member"] = member;
   return headers;
 }
 

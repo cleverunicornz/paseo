@@ -316,6 +316,7 @@ describe("MCP gateway", () => {
     ["", "glm-5.3"],
     ["codex", "gpt-6\nx-injected: 1"],
     ["codex", "x".repeat(123)],
+    ["codex", "\u212Aimi"],
   ])("member of %s and %j is not representable", (provider, model) => {
     expect(formatMcpGatewayMember(provider, model)).toBeNull();
   });
