@@ -30,6 +30,7 @@ export async function importSessionFromPersistence(input: {
     provider: input.provider,
     cwd: input.request.cwd,
   } as AgentSessionConfig;
+  input.context.admit?.(config);
   const persistence =
     input.persistence ?? buildImportPersistenceHandle(input.provider, input.request, storedConfig);
   const session = await input.resumeSession(persistence, config, input.context.launchContext);

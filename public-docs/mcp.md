@@ -136,6 +136,12 @@ agent's `Authorization` and every `X-Paseo-*` header, then sets:
 | `X-Paseo-Session-ID`   | The agent's provider session ID, once it has one |
 | `X-Paseo-Workspace-ID` | The agent's workspace, when it has one           |
 | `X-Paseo-Server-ID`    | This daemon's server ID                          |
+| `X-Paseo-Member`       | In session mode, the session's member            |
+| `X-Paseo-Role`         | In session mode, the session's role              |
+
+Session mode is described in [one member per session](/docs/session-containers#one-member-per-session).
+Outside it the gateway sends neither `X-Paseo-Member` nor `X-Paseo-Role`. In session mode an agent
+stopped for running another member gets `403` with the refusal.
 
 Paseo holds no backend credential. A plugin supplies one per request through the
 [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks); without one the request goes

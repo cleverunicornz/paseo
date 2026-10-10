@@ -7,6 +7,7 @@ import type { PluginMcpGatewayUpstreamRequest } from "@getpaseo/plugin/server";
 
 import { extractHttpBearerToken } from "../auth.js";
 import { MCP_GATEWAY_BACKEND_NAME_PATTERN, type McpGatewayBackend } from "./backends.js";
+import type { SessionIdentity } from "../session-runtime-config.js";
 
 export type McpGatewayUpstreamRequest = PluginMcpGatewayUpstreamRequest;
 
@@ -21,6 +22,10 @@ export interface McpGatewayOptions {
   /** Resolves the caller from its daemon-issued bearer token; nothing else names a caller. */
   resolveAgent: (token: string | null) => McpGatewayAgent | null;
   serverId: string;
+  /** In session mode, the member and role every forwarded request carries, whichever agent calls. */
+  sessionIdentity: SessionIdentity | null;
+  /** Why the session refused this agent, or null; a refused agent's requests are not forwarded. */
+  agentRefusal?: (agentId: string) => string | null;
   /** Runs the `mcp_gateway.upstream` plugin hooks. */
   resolveUpstream: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   /**
@@ -194,6 +199,7 @@ function buildUpstreamHeaders(input: {
   pluginHeaders: Record<string, string>;
   agent: McpGatewayAgent;
   serverId: string;
+  sessionIdentity: SessionIdentity | null;
 }): OutgoingHttpHeaders {
   const connectionListed = connectionListedHeaders(input.incoming);
   const headers: OutgoingHttpHeaders = {};
@@ -222,6 +228,10 @@ function buildUpstreamHeaders(input: {
   if (input.agent.sessionId) headers["x-paseo-session-id"] = input.agent.sessionId;
   if (input.agent.workspaceId) headers["x-paseo-workspace-id"] = input.agent.workspaceId;
   headers["x-paseo-server-id"] = input.serverId;
+  if (input.sessionIdentity) {
+    headers["x-paseo-member"] = input.sessionIdentity.member;
+    headers["x-paseo-role"] = input.sessionIdentity.role;
+  }
   return headers;
 }
 
@@ -258,6 +268,11 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
     const agent = options.resolveAgent(extractHttpBearerToken(req.headers.authorization));
     if (!agent) {
       sendError(res, 401, "Unauthorized");
+      return;
+    }
+    const refusal = options.agentRefusal?.(agent.agentId);
+    if (refusal) {
+      sendError(res, 403, refusal);
       return;
     }
     const target = parseTarget(req.url);
@@ -305,6 +320,12 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       sendError(res, 400, "Invalid MCP backend path");
       return;
     }
+    // The agent may have been refused while the upstream hook ran.
+    const lateRefusal = options.agentRefusal?.(agent.agentId);
+    if (lateRefusal) {
+      sendError(res, 403, lateRefusal);
+      return;
+    }
     const transport = base.protocol === "https:" ? https : http;
     let upstreamRequest: http.ClientRequest;
     try {
@@ -319,6 +340,7 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
           pluginHeaders: upstream.headers,
           agent,
           serverId: options.serverId,
+          sessionIdentity: options.sessionIdentity,
         }),
       });
     } catch (error) {

@@ -94,6 +94,8 @@ import {
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { extractAttention } from "../persistence-hooks.js";
 import { AgentAdmission } from "./agent-admission.js";
+import type { SessionIdentity } from "../session-runtime-config.js";
+import { SessionMemberError, SessionMemberGate } from "./session-member-gate.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -360,6 +362,12 @@ export interface AgentManagerOptions {
   rescueTimeouts?: AgentManagerRescueTimeouts;
   /** At most one live public agent; a second create, import or resume is refused. */
   singleAgent?: boolean;
+  /**
+   * Session mode's identity. Every client is put behind its member gate, so no
+   * provider session or runtime starts for another member, and an agent whose
+   * runtime reports another model is stopped.
+   */
+  sessionIdentity?: SessionIdentity | null;
   beforeSteerUnavailableFallback?: (input: {
     agentId: string;
     expectedTurnId: string;
@@ -800,9 +808,13 @@ export class AgentManager {
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
   private readonly admission: AgentAdmission;
+  private readonly sessionMemberGate: SessionMemberGate | null;
+  /** Agents stopped for running another member, with the refusal; the gateway forwards nothing for them. */
+  private readonly sessionMemberRefusals = new Map<string, SessionMemberError>();
 
   constructor(options: AgentManagerOptions) {
     this.pluginLifecycle = options.pluginLifecycle;
+    this.sessionMemberGate = SessionMemberGate.of(options.sessionIdentity);
     this.idFactory = options?.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
@@ -849,7 +861,31 @@ export class AgentManager {
   }
 
   registerClient(provider: AgentProvider, client: AgentClient): void {
-    this.clients.set(provider, client);
+    this.clients.set(provider, this.guardClient(provider, client));
+  }
+
+  private guardClient(provider: AgentProvider, client: AgentClient): AgentClient {
+    return this.sessionMemberGate ? this.sessionMemberGate.guard(provider, client) : client;
+  }
+
+  /**
+   * Validates, before an operation changes anything, that what it would start
+   * runs the session's member. The clients' gate enforces the same rule when
+   * the provider is asked to start; this only keeps a refused operation from
+   * cancelling, deleting or closing first.
+   */
+  private assertRunsSessionMember(provider: AgentProvider, model: string | null | undefined): void {
+    this.sessionMemberGate?.assert(provider, model);
+  }
+
+  /** Clears an agent's error, except the refusal of an agent the session stopped. */
+  private clearLastError(agent: ManagedAgent): void {
+    agent.lastError = this.sessionMemberRefusals.get(agent.id)?.message;
+  }
+
+  /** Why the session stopped this agent for running another member, or null. */
+  getSessionMemberRefusal(agentId: string): string | null {
+    return this.sessionMemberRefusals.get(agentId)?.message ?? null;
   }
 
   updateProviderRegistry(input: {
@@ -869,7 +905,7 @@ export class AgentManager {
     this.clients.clear();
     for (const [provider, client] of Object.entries(input.clients)) {
       if (client) {
-        this.clients.set(provider, client);
+        this.clients.set(provider, this.guardClient(provider, client));
       }
     }
 
@@ -1188,7 +1224,7 @@ export class AgentManager {
   async listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
     const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
     const client = this.requireClient(normalizedConfig.provider);
-    if (!normalizedConfig.model) {
+    if (!normalizedConfig.model || this.refusesDraft(normalizedConfig)) {
       return [];
     }
     const available = await client.isAvailable();
@@ -1222,10 +1258,15 @@ export class AgentManager {
     }
   }
 
+  /** Discovery for another member finds nothing rather than starting that member's session. */
+  private refusesDraft(config: AgentSessionConfig): boolean {
+    return this.sessionMemberGate?.refusal(config.provider, config.model) != null;
+  }
+
   async listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
     const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
     const client = this.requireClient(normalizedConfig.provider);
-    if (!normalizedConfig.model && !client.listFeatures) {
+    if ((!normalizedConfig.model && !client.listFeatures) || this.refusesDraft(normalizedConfig)) {
       return [];
     }
     const available = await client.isAvailable();
@@ -1367,11 +1408,12 @@ export class AgentManager {
       config = { ...request.config, internal: config.internal };
       options = { ...options, env: request.env };
     }
-    await this.deleteAgentState(resolvedAgentId);
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       { env: options?.env },
     );
+    this.assertRunsSessionMember(storedConfig.provider, storedConfig.model);
+    await this.deleteAgentState(resolvedAgentId);
     this.requireEnabledProvider(storedConfig.provider);
     const client = await this.requireAvailableClient({
       provider: storedConfig.provider,
@@ -1515,6 +1557,7 @@ export class AgentManager {
       mergedConfig,
       { purpose },
     );
+    this.assertRunsSessionMember(storedConfig.provider, storedConfig.model);
     const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
     if (!available) {
@@ -1585,6 +1628,8 @@ export class AgentManager {
     resolvedAgentId: string,
   ): Promise<ManagedAgent> {
     this.requireEnabledProvider(input.provider);
+    // The imported model is known only once the provider reads the native session.
+    this.sessionMemberGate?.assertProvider(input.provider);
 
     const client = await this.requireAvailableClient({ provider: input.provider });
     if (!client.importSession) {
@@ -1664,6 +1709,26 @@ export class AgentManager {
     );
   }
 
+  /**
+   * A reload refused for another member must not cancel the turn it would
+   * replace. The model is resolved once and the reload launches exactly the
+   * checked model, so a default that changes between reads cannot slip in.
+   */
+  private async checkReloadSessionMember(
+    agent: ManagedAgent,
+    overrides: Partial<AgentSessionConfig> | undefined,
+  ): Promise<Partial<AgentSessionConfig> | undefined> {
+    if (!this.sessionMemberGate) return overrides;
+    const provider = agent.persistence?.provider ?? agent.provider;
+    const config = await this.normalizeConfig({
+      ...agent.config,
+      ...overrides,
+      provider,
+    } as AgentSessionConfig);
+    this.sessionMemberGate.assert(config.provider, config.model);
+    return { ...overrides, model: config.model };
+  }
+
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
@@ -1671,6 +1736,7 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
+    const checkedOverrides = await this.checkReloadSessionMember(existing, overrides);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
@@ -1685,7 +1751,7 @@ export class AgentManager {
     const client = this.requireClient(provider);
     const refreshConfig = {
       ...existing.config,
-      ...overrides,
+      ...checkedOverrides,
       provider,
     } as AgentSessionConfig;
     const { storedConfig, launchConfig, paseoToolPolicy } =
@@ -1830,7 +1896,7 @@ export class AgentManager {
     }
   }
 
-  closeAgent(agentId: string): Promise<void> {
+  closeAgent(agentId: string, options?: { reason?: string }): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
       return existing;
@@ -1838,7 +1904,7 @@ export class AgentManager {
 
     const close = this.runLifecycleMutation(agentId, async () => {
       // A preceding reload or archive may already have closed the durable agent.
-      if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
+      if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId, options?.reason);
     });
     this.inFlightAgentCloses.set(agentId, close);
     const clearClose = () => {
@@ -1850,7 +1916,7 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string): Promise<void> {
+  private async closeAgentRuntime(agentId: string, reason = "agent closed"): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1869,7 +1935,7 @@ export class AgentManager {
     // native writer, so publishing a resumable closed snapshot would orphan it.
     await agent.session.close();
     this.cancelRunningProviderSubagents(agentId);
-    const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
+    const closedAgent = this.prepareAgentForClosure(agent, reason);
     this.agentTokens.revoke(agentId);
 
     let persistError: unknown;
@@ -2094,6 +2160,7 @@ export class AgentManager {
     const agent = this.requireSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
+    this.assertRunsSessionMember(agent.provider, normalizedModelId);
 
     if (agent.session.setModel) {
       await agent.session.setModel(normalizedModelId);
@@ -2491,6 +2558,9 @@ export class AgentManager {
 
     finalText = this.getLastAssistantMessageFromTimeline(timeline) ?? "";
 
+    // The session stopped this agent mid-run for running another member.
+    const refusal = this.sessionMemberRefusals.get(agentId);
+    if (refusal) throw refusal;
     const agent = this.requireAgent(agentId);
     const sessionId = agent.persistence?.sessionId;
     if (!sessionId) {
@@ -2665,7 +2735,7 @@ export class AgentManager {
 
     const agent = existingAgent;
     const isReplacement = agent.pendingReplacement;
-    agent.lastError = undefined;
+    this.clearLastError(agent);
 
     const pendingRun = this.runs.createPendingRun(agentId);
 
@@ -3703,6 +3773,9 @@ export class AgentManager {
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
       this.subscribeToSession(managed);
+      // A new session for this agent is judged on what its runtime reports now.
+      this.sessionMemberRefusals.delete(managed.id);
+      this.enforceRuntimeSessionMember(managed);
       return { ...managed };
     } catch (error) {
       if (!registered) {
@@ -4103,6 +4176,27 @@ export class AgentManager {
     await this.refreshRuntimeInfo(agent, options);
   }
 
+  /**
+   * Stops an agent whose runtime reports a model other than the session's
+   * member, however it came to run it: the gateway refuses the agent at once,
+   * and closing it ends its turn. The member header itself never changes.
+   */
+  private enforceRuntimeSessionMember(agent: ActiveManagedAgent): void {
+    const model = agent.runtimeInfo?.model;
+    if (!this.sessionMemberGate || !model || this.sessionMemberRefusals.has(agent.id)) return;
+    const refusal = this.sessionMemberGate.refusal(agent.provider, model);
+    if (!refusal) return;
+    this.sessionMemberRefusals.set(agent.id, refusal);
+    agent.lastError = refusal.message;
+    this.logger.warn(
+      { agentId: agent.id, member: refusal.member, reported: refusal.attempted },
+      "Agent runtime reported a model other than the session's member; stopping it",
+    );
+    void this.closeAgent(agent.id, { reason: refusal.message }).catch((error: unknown) => {
+      this.logger.warn({ err: error, agentId: agent.id }, "Failed to stop agent after refusal");
+    });
+  }
+
   private async refreshRuntimeInfo(
     agent: ActiveManagedAgent,
     options?: { emit?: boolean },
@@ -4115,6 +4209,8 @@ export class AgentManager {
         newInfo.sessionId !== agent.runtimeInfo?.sessionId ||
         newInfo.modeId !== agent.runtimeInfo?.modeId;
       agent.runtimeInfo = newInfo;
+      // Registration checks once it has subscribed; see registerSession.
+      if (agent.unsubscribeSession) this.enforceRuntimeSessionMember(agent);
       if (!agent.persistence && newInfo.sessionId) {
         agent.persistence = attachPersistenceCwd(
           { provider: agent.provider, sessionId: newInfo.sessionId },
@@ -4492,6 +4588,7 @@ export class AgentManager {
         return undefined;
       case "model_changed":
         agent.runtimeInfo = event.runtimeInfo;
+        this.enforceRuntimeSessionMember(agent);
         if (!agent.persistence && event.runtimeInfo.sessionId) {
           agent.persistence = attachPersistenceCwd(
             { provider: agent.provider, sessionId: event.runtimeInfo.sessionId },
@@ -4643,7 +4740,7 @@ export class AgentManager {
     // If no usage on turn_completed, keep lastUsage as-is so context window
     // data accumulated during streaming isn't lost when the provider omits
     // it from the completion event.
-    agent.lastError = undefined;
+    this.clearLastError(agent);
     if (
       !isForegroundEvent &&
       !agent.activeForegroundTurnId &&
@@ -4726,7 +4823,7 @@ export class AgentManager {
     if (!isForegroundEvent && !agent.activeForegroundTurnId && !agent.pendingReplacement) {
       agent.lifecycle = "idle";
     }
-    agent.lastError = undefined;
+    this.clearLastError(agent);
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Interrupted");
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);

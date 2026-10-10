@@ -47,6 +47,7 @@ describe("server config", () => {
       timelineDrainMs: 300_000,
       singleAgent: false,
       webBasePath: "/",
+      identity: null,
     });
 
     await writeFile(
@@ -65,6 +66,7 @@ describe("server config", () => {
       timelineDrainMs: 60_000,
       singleAgent: true,
       webBasePath: "/s/abc/",
+      identity: null,
     });
 
     const fromEnv = loadConfig(paseoHome, {
@@ -79,9 +81,60 @@ describe("server config", () => {
       timelineDrainMs: 1_500,
       singleAgent: false,
       webBasePath: "/s/xyz/",
+      identity: null,
     });
     // The allowlist from the environment adds to the file's.
     expect(fromEnv.hostnames).toEqual(["file.example", "dash.example", ".proxy.example"]);
+  });
+
+  test("runs in session mode with the member and role the session pod gives it", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-session-identity-"));
+    roots.push(paseoHome);
+
+    for (const role of ["orchestrator", "scout", "implementer", "validator", "advisor"]) {
+      const config = loadConfig(paseoHome, {
+        env: { CVU_MEMBER: "codex/gpt-6-astra", CVU_ROLE: role },
+      });
+      expect(config.sessionRuntime?.identity).toEqual({ member: "codex/gpt-6-astra", role });
+    }
+    expect(
+      loadConfig(paseoHome, { env: { CVU_MEMBER: "claude-gateway/glm-5.3", CVU_ROLE: "scout" } })
+        .sessionRuntime?.identity,
+    ).toEqual({ member: "claude-gateway/glm-5.3", role: "scout" });
+  });
+
+  test("outside session mode has no identity, whatever CVU_ROLE says", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-no-session-"));
+    roots.push(paseoHome);
+
+    expect(loadConfig(paseoHome, { env: {} }).sessionRuntime?.identity).toBeNull();
+    expect(
+      loadConfig(paseoHome, { env: { CVU_ROLE: "validator" } }).sessionRuntime?.identity,
+    ).toBeNull();
+  });
+
+  test("refuses session mode with a member or role it cannot use", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-session-identity-bad-"));
+    roots.push(paseoHome);
+
+    for (const member of [
+      "",
+      "codex/GPT-6-Astra",
+      "claude/claude-opus-5-5[1m]",
+      "opencode/anthropic/claude-sonnet-5-5",
+      "codex/gpt-6-astra ",
+      "codex/-gpt",
+      `codex/${"x".repeat(123)}`,
+    ]) {
+      expect(() =>
+        loadConfig(paseoHome, { env: { CVU_MEMBER: member, CVU_ROLE: "validator" } }),
+      ).toThrow("CVU_MEMBER must be a member such as codex/gpt-6-astra");
+    }
+    for (const role of [undefined, "", "infra", "Validator", "security-validator"]) {
+      expect(() =>
+        loadConfig(paseoHome, { env: { CVU_MEMBER: "codex/gpt-6-astra", CVU_ROLE: role } }),
+      ).toThrow("CVU_ROLE must be one of orchestrator, scout, implementer, validator, advisor");
+    }
   });
 
   test("refuses a base path or drain deadline it cannot use", async () => {

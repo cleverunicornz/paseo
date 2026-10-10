@@ -582,6 +582,12 @@ export interface ImportProviderSessionContext {
   config: AgentSessionConfig;
   storedConfig: AgentSessionConfig;
   launchContext?: AgentLaunchContext;
+  /**
+   * Refuses a configuration the daemon will not run. An import calls it with
+   * the configuration it read from the native session, before it opens that
+   * session.
+   */
+  admit?: (config: AgentSessionConfig) => void;
 }
 
 export interface ImportedTimelineEntry {

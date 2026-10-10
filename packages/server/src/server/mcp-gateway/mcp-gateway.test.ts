@@ -11,6 +11,7 @@ import {
   type McpGatewayUpstreamRequest,
 } from "./mcp-gateway.js";
 import type { McpGatewayBackend } from "./backends.js";
+import type { SessionIdentity } from "../session-runtime-config.js";
 
 interface RecordedRequest {
   method: string;
@@ -85,10 +86,14 @@ const AGENTS: Record<string, McpGatewayAgent> = {
   "token-b": { agentId: "agent-b", sessionId: null, workspaceId: null },
 };
 
+const SESSION_IDENTITY: SessionIdentity = { member: "codex/gpt-6-astra", role: "validator" };
+
 interface GatewayOptions {
   backends: Record<string, string | McpGatewayBackend>;
   resolveUpstream?: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   responseTimeoutMs?: number;
+  sessionIdentity?: SessionIdentity | null;
+  agentRefusal?: (agentId: string) => string | null;
 }
 
 async function startGateway(options: GatewayOptions): Promise<string> {
@@ -105,6 +110,8 @@ async function startGateway(options: GatewayOptions): Promise<string> {
         ),
       resolveAgent: (token) => (token ? (AGENTS[token] ?? null) : null),
       serverId: "server-1",
+      sessionIdentity: options.sessionIdentity ?? null,
+      agentRefusal: options.agentRefusal,
       resolveUpstream: options.resolveUpstream ?? (async (request) => request),
       responseTimeoutMs: options.responseTimeoutMs,
       logger: pino({ level: "silent" }),
@@ -212,6 +219,145 @@ describe("MCP gateway", () => {
     expect(headers).not.toHaveProperty("x-paseo-anything");
     expect(headers).not.toHaveProperty("authorization");
     expect(headers).not.toHaveProperty("proxy-authorization");
+  });
+
+  test("in session mode sends the session's member and role for every agent", async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+    });
+
+    for (const token of ["token-a", "token-b"]) {
+      await fetch(`${gateway}/cluster`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: MCP_INIT,
+      });
+    }
+
+    expect(upstream.requests.map((request) => request.headers["x-paseo-agent-id"])).toEqual([
+      "agent-a",
+      "agent-b",
+    ]);
+    for (const request of upstream.requests) {
+      expect(request.headers["x-paseo-member"]).toBe("codex/gpt-6-astra");
+      expect(request.headers["x-paseo-role"]).toBe("validator");
+    }
+  });
+
+  test("in session mode replaces a member or role from the caller or a plugin", async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      resolveUpstream: async (request) => ({
+        ...request,
+        headers: { "X-Paseo-Member": "plugin/supplied", "X-Paseo-Role": "infra" },
+      }),
+    });
+
+    await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer token-a",
+        "X-Paseo-Member": "claude/claude-opus-5-5",
+        "X-Paseo-Role": "infra",
+      },
+      body: MCP_INIT,
+    });
+
+    const headers = upstream.requests[0]!.headers;
+    expect(headers["x-paseo-member"]).toBe("codex/gpt-6-astra");
+    expect(headers["x-paseo-role"]).toBe("validator");
+  });
+
+  test("forwards nothing for an agent the session refused", async () => {
+    const upstream = await startUpstream();
+    const refusal =
+      "This session's member is codex/gpt-6-astra. This agent would run codex/gpt-5.4. A different model needs a new session.";
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: (agentId) => (agentId === "agent-b" ? refusal : null),
+    });
+
+    const refused = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-b" },
+      body: MCP_INIT,
+    });
+    const admitted = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: MCP_INIT,
+    });
+
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toEqual({ error: refusal });
+    expect(admitted.status).toBe(200);
+    expect(upstream.requests.map((request) => request.headers["x-paseo-agent-id"])).toEqual([
+      "agent-a",
+    ]);
+  });
+
+  test("forwards nothing for an agent refused while its request waits on the upstream hook", async () => {
+    const upstream = await startUpstream();
+    const refusal =
+      "This session's member is codex/gpt-6-astra. This agent would run codex/gpt-5.4. A different model needs a new session.";
+    let refused: string | null = null;
+    let reachedHook!: () => void;
+    let releaseHook!: () => void;
+    const hookReached = new Promise<void>((resolve) => {
+      reachedHook = resolve;
+    });
+    const hookReleased = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: () => refused,
+      resolveUpstream: async (request) => {
+        reachedHook();
+        await hookReleased;
+        return request;
+      },
+    });
+
+    const response = fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: MCP_INIT,
+    });
+    await hookReached;
+    refused = refusal;
+    releaseHook();
+
+    const answered = await response;
+    expect(answered.status).toBe(403);
+    expect(await answered.json()).toEqual({ error: refusal });
+    expect(upstream.requests).toEqual([]);
+  });
+
+  test("outside session mode sends no member or role, and drops the caller's", async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({ backends: { cluster: upstream.url } });
+
+    await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer token-a",
+        "X-Paseo-Member": "claude/claude-opus-5-5",
+        "X-Paseo-Role": "validator",
+      },
+      body: MCP_INIT,
+    });
+
+    const headers = upstream.requests[0]!.headers;
+    expect(headers["x-paseo-agent-id"]).toBe("agent-a");
+    expect(headers).not.toHaveProperty("x-paseo-member");
+    expect(headers).not.toHaveProperty("x-paseo-role");
   });
 
   test("another agent's token acts only as that other agent", async () => {

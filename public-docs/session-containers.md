@@ -11,6 +11,7 @@ category: Getting started
 A session container runs one daemon for one agent. A controller outside it, such as a dashboard, starts the container, opens its web UI, and stops it when the session ends. This page covers what the daemon offers that controller:
 
 - single-agent mode;
+- one member per session;
 - a stop-readiness answer and a begin-stopping call;
 - a shutdown that waits for timeline recorders.
 
@@ -24,6 +25,19 @@ With `daemon.singleAgent` set to `true` (or `PASEO_SINGLE_AGENT=true`), the daem
 - Forking is refused, and the daemon stops advertising it.
 - Reloading or resuming the one agent works as usual. Archiving it makes room for the next.
 - Once the host has its live agent, the web UI drops the fork menu, the workspace's "New agent" action, the tab launcher's agent entry, the command center's new-agent command and the new-agent shortcuts. When every host the UI knows is such a host, the sidebar's "Add project" and "Import session" go too.
+
+## One member per session
+
+A session runs as one member, the provider and model written `<provider>/<model>` such as `codex/gpt-6-astra`, and under one role. The controller that creates the container chooses both and passes them in `CVU_MEMBER` and `CVU_ROLE`. Setting `CVU_MEMBER`, even to an empty value, starts session mode:
+
+- **Checked at startup.** `CVU_MEMBER` must match `^([a-z0-9-]+/)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$` within 128 characters, and `CVU_ROLE` must be `orchestrator`, `scout`, `implementer`, `validator` or `advisor`. Otherwise the daemon refuses to start. An empty `CVU_MEMBER` is a container whose creator did not set one.
+- **Nothing starts for another member.** Every provider client sits behind one check, so no provider session or runtime starts unless it runs the member: creating, importing, resuming or reloading an agent, internal agents such as the branch-name generator, and switching a running agent's model are refused otherwise. An import is checked against the model the native session recorded. The agent's value is lowercased first (`GPT-6-Astra` matches `gpt-6-astra`) and otherwise compared as given: `claude-opus-5-5[1m]` is not `claude-opus-5-5`. An agent created without a model gets the provider's default model, which must be the member too. The refusal names the member and says a different model needs a new session.
+- **Refused before anything changes.** A refused reload, model switch, create or resume leaves the agent, its running turn and its timeline as they were.
+- **Discovery stays with the member.** Other providers show as unavailable and their catalogues, commands, features and importable sessions come back empty, without starting them.
+- **A runtime that reports another model is stopped.** If a running agent's harness reports a model other than the member, for example after a `/model` command typed into it, the daemon ends its turn, closes it with the refusal as its error, and the MCP gateway answers its requests with `403`.
+- **The MCP gateway sends both** as `X-Paseo-Member` and `X-Paseo-Role` on every request, whichever agent calls. See [the MCP gateway](/docs/mcp).
+
+Without `CVU_MEMBER` the daemon sends neither header and launches any model. `CVU_ROLE` alone changes nothing.
 
 ## Ask whether stopping would lose anything
 

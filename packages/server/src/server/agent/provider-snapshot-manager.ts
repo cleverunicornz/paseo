@@ -51,6 +51,8 @@ import {
 } from "./agent-configuration-validator.js";
 import type { ProviderRegistration } from "@getpaseo/plugin/server/provider";
 import { PluginAgentClientRegistry } from "./plugin-provider.js";
+import { SessionMemberGate } from "./session-member-gate.js";
+import type { SessionIdentity } from "../session-runtime-config.js";
 
 const DEFAULT_REFRESH_TIMEOUT_MS = 120_000;
 const MAX_REFRESH_TIMEOUT_MS = 2_147_483_647;
@@ -126,6 +128,11 @@ export interface ProviderSnapshotManagerOptions {
   mcpGatewayModelBackends?: Readonly<Record<string, string>>;
   /** Names and `NAME_*` prefixes a gateway provider's harness may inherit beyond the base variables. */
   mcpGatewayEnvPassthrough?: readonly string[];
+  /**
+   * Session mode's identity. Every client this manager creates or is given is
+   * put behind its member gate, which the agent manager then shares.
+   */
+  sessionIdentity?: SessionIdentity | null;
 }
 
 interface ProviderSnapshotRefreshOptions {
@@ -262,6 +269,7 @@ export class ProviderSnapshotManager {
   private providerClients: Record<AgentProvider, AgentClient>;
   private readonly ownedClients = new Set<AgentClient>();
   private readonly pluginProviders: PluginAgentClientRegistry;
+  private readonly sessionMemberGate: SessionMemberGate | null;
 
   constructor(options: ProviderSnapshotManagerOptions) {
     this.logger = options.logger;
@@ -274,7 +282,8 @@ export class ProviderSnapshotManager {
     this.mcpGatewayModelBackends = options.mcpGatewayModelBackends;
     this.mcpGatewayEnvPassthrough = options.mcpGatewayEnvPassthrough;
     this.isDev = options.isDev === true;
-    this.extraClients = options.extraClients ?? {};
+    this.sessionMemberGate = SessionMemberGate.of(options.sessionIdentity);
+    this.extraClients = this.guardClients(options.extraClients ?? {});
     this.runtimeSettings = options.runtimeSettings;
     this.providerOverrides = options.providerOverrides;
     this.baseProviderOverrides = options.providerOverrides;
@@ -289,9 +298,27 @@ export class ProviderSnapshotManager {
     );
     this.providerClients = {
       ...this.extraClients,
-      ...this.pluginProviders.clients(),
+      ...this.pluginClients(),
     } as Record<AgentProvider, AgentClient>;
     for (const client of Object.values(this.providerClients)) this.ownedClients.add(client);
+  }
+
+  private guardClient(provider: AgentProvider, client: AgentClient): AgentClient {
+    return this.sessionMemberGate ? this.sessionMemberGate.guard(provider, client) : client;
+  }
+
+  private guardClients(
+    clients: Partial<Record<AgentProvider, AgentClient>>,
+  ): Partial<Record<AgentProvider, AgentClient>> {
+    const guarded: Partial<Record<AgentProvider, AgentClient>> = {};
+    for (const [provider, client] of Object.entries(clients)) {
+      if (client) guarded[provider] = this.guardClient(provider, client);
+    }
+    return guarded;
+  }
+
+  private pluginClients(): Partial<Record<AgentProvider, AgentClient>> {
+    return this.guardClients(this.pluginProviders.clients());
   }
 
   getSnapshot(cwd?: string): ProviderSnapshot {
@@ -423,7 +450,7 @@ export class ProviderSnapshotManager {
       delete clients[provider];
     }
     Object.assign(definitions, plugins);
-    Object.assign(clients, this.pluginProviders.clients());
+    Object.assign(clients, this.pluginClients());
     for (const client of Object.values(clients)) this.ownedClients.add(client);
     const generation = this.createGeneration(definitions, this.providerOverrides);
     const state = this.createAgentManagerState(definitions, clients);
@@ -440,7 +467,7 @@ export class ProviderSnapshotManager {
     if (existing) {
       return existing;
     }
-    const client = definition.createClient(this.logger);
+    const client = this.guardClient(provider, definition.createClient(this.logger));
     clients[provider] = client;
     this.ownedClients.add(client);
     return client;
@@ -615,7 +642,7 @@ export class ProviderSnapshotManager {
         definitions[provider] = before;
       }
     }
-    Object.assign(clients, this.extraClients, this.pluginProviders.clients());
+    Object.assign(clients, this.extraClients, this.pluginClients());
     const generation = this.createGeneration(definitions, providerOverrides);
     const agentManagerState = this.createAgentManagerState(definitions, clients);
     return {
