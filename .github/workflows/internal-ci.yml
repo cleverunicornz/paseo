@@ -2,7 +2,8 @@ name: Internal daemon qualification
 
 on:
   pull_request:
-    branches: [internal/main]
+    # Candidate lanes (infra-v2 D-000385) are qualified like the trunk.
+    branches: [internal/main, "candidate/**"]
   push:
     branches: [internal/main]
   workflow_dispatch:
