@@ -93,6 +93,7 @@ interface GatewayOptions {
   resolveUpstream?: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   responseTimeoutMs?: number;
   sessionIdentity?: SessionIdentity | null;
+  agentRefusal?: (agentId: string) => string | null;
 }
 
 async function startGateway(options: GatewayOptions): Promise<string> {
@@ -110,6 +111,7 @@ async function startGateway(options: GatewayOptions): Promise<string> {
       resolveAgent: (token) => (token ? (AGENTS[token] ?? null) : null),
       serverId: "server-1",
       sessionIdentity: options.sessionIdentity ?? null,
+      agentRefusal: options.agentRefusal,
       resolveUpstream: options.resolveUpstream ?? (async (request) => request),
       responseTimeoutMs: options.responseTimeoutMs,
       logger: pino({ level: "silent" }),
@@ -268,6 +270,35 @@ describe("MCP gateway", () => {
     const headers = upstream.requests[0]!.headers;
     expect(headers["x-paseo-member"]).toBe("codex/gpt-6-astra");
     expect(headers["x-paseo-role"]).toBe("validator");
+  });
+
+  test("forwards nothing for an agent the session refused", async () => {
+    const upstream = await startUpstream();
+    const refusal =
+      "This session's member is codex/gpt-6-astra. This agent would run codex/gpt-5.4. A different model needs a new session.";
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: (agentId) => (agentId === "agent-b" ? refusal : null),
+    });
+
+    const refused = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-b" },
+      body: MCP_INIT,
+    });
+    const admitted = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: MCP_INIT,
+    });
+
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toEqual({ error: refusal });
+    expect(admitted.status).toBe(200);
+    expect(upstream.requests.map((request) => request.headers["x-paseo-agent-id"])).toEqual([
+      "agent-a",
+    ]);
   });
 
   test("outside session mode sends no member or role, and drops the caller's", async () => {

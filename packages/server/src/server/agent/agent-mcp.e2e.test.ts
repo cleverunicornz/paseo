@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { experimental_createMCPClient } from "ai";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
@@ -14,6 +14,7 @@ import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { DEFAULT_SESSION_RUNTIME_CONFIG } from "../session-runtime-config.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { ClaudeAgentClient } from "./providers/claude/agent.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -236,6 +237,54 @@ async function assertAgentNotRunning(options: {
   if (status === "running" || status === "initializing") {
     throw new Error(`Agent still running after blocking create_agent (status=${status})`);
   }
+}
+
+/**
+ * A scripted Claude Code query that reports `reportedModel` in its init message,
+ * whatever model it was launched with, then holds the turn open until closed.
+ */
+function claudeQueryReportingModel(reportedModel: string, launches: string[]) {
+  return ({ options }: { options: { model?: string } }) => {
+    launches.push(String(options.model));
+    const queued: Array<Record<string, unknown>> = [
+      {
+        type: "system",
+        subtype: "init",
+        session_id: "fixture-claude",
+        permissionMode: "default",
+        model: reportedModel,
+      },
+    ];
+    let closed = false;
+    const waiters: Array<() => void> = [];
+    const end = () => {
+      closed = true;
+      for (const wake of waiters.splice(0)) wake();
+    };
+    return {
+      next: async () => {
+        while (queued.length === 0 && !closed) {
+          await new Promise<void>((resolve) => waiters.push(resolve));
+        }
+        const value = queued.shift();
+        return value ? { done: false, value } : { done: true, value: undefined };
+      },
+      return: async () => {
+        end();
+        return { done: true, value: undefined };
+      },
+      interrupt: async () => end(),
+      close: () => end(),
+      applyFlagSettings: async () => undefined,
+      setPermissionMode: async () => undefined,
+      setModel: async () => undefined,
+      supportedModels: async () => [],
+      supportedCommands: async () => [],
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  };
 }
 
 function recordHeadersAndAnswer(seen: http.IncomingHttpHeaders[]): http.RequestListener {
@@ -1157,6 +1206,83 @@ describe("agent MCP end-to-end (offline)", () => {
         "implementer",
         "implementer",
       ]);
+    } finally {
+      await daemon.stop();
+      backend.closeAllConnections();
+      await new Promise<void>((resolve) => backend.close(() => resolve()));
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+      await rm(agentCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+  test("in session mode an agent whose harness switches to another model is stopped and the gateway refuses it", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+
+    const seen: http.IncomingHttpHeaders[] = [];
+    const backend = http.createServer(recordHeadersAndAnswer(seen));
+    await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+    const backendPort = (backend.address() as net.AddressInfo).port;
+
+    // The real Claude adapter, launched as Opus, whose harness reports Sonnet mid-turn.
+    const launches: string[] = [];
+    const claude = new ClaudeAgentClient({
+      logger: pino({ level: "silent" }),
+      resolveBinary: async () => "/fixture/claude",
+      queryFactory: claudeQueryReportingModel("claude-sonnet-5-5", launches) as never,
+    });
+    const clients = createTestAgentClients();
+    clients.claude!.createSession = claude.createSession.bind(claude);
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: clients,
+        agentStoragePath: path.join(paseoHome, "agents"),
+        mcpGatewayBackends: { cluster: { url: `http://127.0.0.1:${backendPort}/mcp` } },
+        sessionRuntime: {
+          ...DEFAULT_SESSION_RUNTIME_CONFIG,
+          identity: { member: "claude/claude-opus-5-5", role: "implementer" },
+        },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+
+    try {
+      const manager = daemon.agentManager;
+      const agent = await manager.createAgent(
+        { provider: "claude", cwd: agentCwd, model: "claude-opus-5-5" },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const token = manager.issueAgentToken(agent.id);
+      const callGateway = () =>
+        fetch(`http://127.0.0.1:${port}/mcp/backends/cluster`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+        });
+      expect((await callGateway()).status).toBe(200);
+
+      const run = await manager.runAgent(agent.id, "/model claude-sonnet-5-5");
+
+      expect(launches).toEqual(["claude-opus-5-5"]);
+      expect(run.canceled).toBe(true);
+      await vi.waitFor(() => expect(manager.getAgent(agent.id)).toBeNull());
+      expect(manager.getSessionMemberRefusal(agent.id)).toBe(
+        "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.",
+      );
+      expect((await callGateway()).status).not.toBe(200);
+      expect(seen.map((headers) => headers["x-paseo-member"])).toEqual(["claude/claude-opus-5-5"]);
     } finally {
       await daemon.stop();
       backend.closeAllConnections();

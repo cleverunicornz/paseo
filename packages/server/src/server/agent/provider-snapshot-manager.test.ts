@@ -166,6 +166,49 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("in session mode discovers only the member's provider and starts nothing for another", async () => {
+    const member = { provider: "codex", id: "gpt-5.4", label: "GPT-5.4", isDefault: true };
+    const claudeAvailable = vi.fn(async () => true);
+    const claudeCatalog = vi.fn(async () => ({ models: [] as AgentModelDefinition[], modes: [] }));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      sessionIdentity: { member: "codex/gpt-5.4", role: "implementer" },
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog: async () => ({ models: [member], modes: [] }),
+        }),
+        claude: createExtraClient("claude", {
+          isAvailable: claudeAvailable,
+          fetchCatalog: claudeCatalog,
+        }),
+      },
+    });
+    try {
+      const entries = await manager.listProviders({
+        cwd: "/tmp/project",
+        providers: ["codex", "claude"],
+        wait: true,
+      });
+      expect(entries.find((entry) => entry.provider === "codex")).toMatchObject({
+        status: "ready",
+        models: [member],
+      });
+      expect(entries.find((entry) => entry.provider === "claude")).toMatchObject({
+        status: "unavailable",
+      });
+      expect(claudeAvailable).not.toHaveBeenCalled();
+      expect(claudeCatalog).not.toHaveBeenCalled();
+      // The agent manager is handed the same guarded clients.
+      const { clients } = manager.getAgentManagerProviderState();
+      await expect(
+        clients.claude!.createSession({ provider: "claude", cwd: "/tmp/project", model: "x" }),
+      ).rejects.toThrow("This session's member is codex/gpt-5.4.");
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("normalizes plugin model catalogs at the same publication boundary", async () => {
     const manager = new ProviderSnapshotManager({ logger: createTestLogger() });
     manager.replacePluginProviders([

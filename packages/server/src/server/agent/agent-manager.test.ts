@@ -21,6 +21,7 @@ import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt, startAgentRun } from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
+import { importSessionFromPersistence } from "./provider-session-import.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
@@ -11947,6 +11948,321 @@ test("outside session mode an agent launches and switches to any model", async (
     expect(manager.getAgent(agent.id)?.config.model).toBe("gpt-5.2-codex");
     const reloaded = await manager.reloadAgentSession(agent.id, { model: "gpt-5.4" });
     expect(reloaded.config.model).toBe("gpt-5.4");
+  } finally {
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+const SESSION_MEMBER_REFUSAL =
+  /^This session's member is codex\/gpt-5\.4\. This agent would run .+\. A different model needs a new session\.$/;
+
+/** One start of provider work: a session, a resumed or imported session, a catalogue, or a metadata probe. */
+interface ProviderStart {
+  via: string;
+  provider: string;
+  model: string | null;
+}
+
+/** A provider that records every start it is asked for, and imports native sessions with a recorded model. */
+class StartRecordingClient extends TestAgentClient {
+  constructor(
+    provider: AgentProvider,
+    private readonly starts: ProviderStart[],
+    private readonly nativeModels: Record<string, string> = {},
+  ) {
+    super(provider);
+  }
+
+  private record(via: string, model: string | null | undefined): void {
+    this.starts.push({ via, provider: this.provider, model: model ?? null });
+  }
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    this.record("createSession", config.model);
+    return super.createSession(config);
+  }
+
+  override async resumeSession(
+    handle: AgentPersistenceHandle,
+    overrides?: Partial<AgentSessionConfig>,
+    launchContext?: AgentLaunchContext,
+  ): Promise<AgentSession> {
+    this.record("resumeSession", overrides?.model);
+    return super.resumeSession(handle, overrides, launchContext);
+  }
+
+  override async fetchCatalog() {
+    this.record("fetchCatalog", null);
+    return super.fetchCatalog();
+  }
+
+  async listCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
+    this.record("listCommands", config.model);
+    return [];
+  }
+
+  async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
+    this.record("listFeatures", config.model);
+    return [];
+  }
+
+  async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+    return importSessionFromPersistence({
+      provider: this.provider,
+      request: input,
+      context,
+      config: { model: this.nativeModels[input.providerHandleId] },
+      resumeSession: (handle, overrides, launchContext) =>
+        this.resumeSession(handle, overrides, launchContext),
+    });
+  }
+}
+
+/** A session whose turn stays open until it is interrupted, counting interrupts and closes. */
+class HeldTurnSession extends TestAgentSession {
+  interrupts = 0;
+  closes = 0;
+
+  override async startTurn(): Promise<{ turnId: string }> {
+    setTimeout(() => {
+      this.pushEvent({ type: "turn_started", provider: this.provider, turnId: "held-turn" });
+    }, 0);
+    return { turnId: "held-turn" };
+  }
+
+  override async interrupt(): Promise<void> {
+    this.interrupts += 1;
+  }
+
+  override async close(): Promise<void> {
+    this.closes += 1;
+  }
+}
+
+test("in session mode every provider start passes the member check, and a refused path starts nothing", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-member-starts-"));
+  const starts: ProviderStart[] = [];
+  const nativeModels = { "native-member": "gpt-5.4", "native-other": "gpt-5.4-mini" };
+  const manager = new AgentManager({
+    clients: {
+      codex: new StartRecordingClient("codex", starts, nativeModels),
+      claude: new StartRecordingClient("claude", starts, nativeModels),
+    },
+    sessionIdentity: { member: "codex/gpt-5.4", role: "implementer" },
+    logger,
+  });
+  const create = (config: Omit<AgentSessionConfig, "cwd">, agentId?: string) =>
+    manager.createAgent({ ...config, cwd: workdir }, agentId, { workspaceId: undefined });
+  const resume = (provider: AgentProvider, model: string) =>
+    manager.resumeAgentFromPersistence({
+      provider,
+      sessionId: `stored-${provider}-${model}`,
+      metadata: { cwd: workdir, model },
+    });
+  const importNative = (provider: AgentProvider, providerHandleId: string) =>
+    manager.importProviderSession({ provider, providerHandleId, cwd: workdir, workspaceId: "ws" });
+  const draft = (provider: AgentProvider, model: string) => ({ provider, model, cwd: workdir });
+  // Admitted: the member's provider, and either its catalogue or exactly the member's model.
+  const admitted = (start: ProviderStart) =>
+    start.provider === "codex" &&
+    (start.via === "fetchCatalog" || start.model?.toLowerCase() === "gpt-5.4");
+  try {
+    const live = await create({ provider: "codex", model: "gpt-5.4" });
+    const admittedPaths: Array<[string, () => Promise<unknown>]> = [
+      ["create with the member", () => create({ provider: "codex", model: "GPT-5.4" })],
+      ["create with the provider default", () => create({ provider: "codex" })],
+      ["internal create", () => create({ provider: "codex", model: "gpt-5.4", internal: true })],
+      ["resume", () => resume("codex", "gpt-5.4")],
+      ["import", () => importNative("codex", "native-member")],
+      ["reload", () => manager.reloadAgentSession(live.id)],
+      ["model switch", () => manager.setAgentModel(live.id, "gpt-5.4")],
+      ["draft commands", () => manager.listDraftCommands(draft("codex", "gpt-5.4"))],
+      ["draft features", () => manager.listDraftFeatures(draft("codex", "gpt-5.4"))],
+    ];
+    for (const [, run] of admittedPaths) await run();
+    expect(new Set(starts.map((start) => start.via))).toEqual(
+      new Set(["createSession", "resumeSession", "fetchCatalog", "listCommands", "listFeatures"]),
+    );
+    expect(starts.filter((start) => !admitted(start))).toEqual([]);
+
+    const refusedPaths: Array<[string, () => Promise<unknown>]> = [
+      ["create with another model", () => create({ provider: "codex", model: "gpt-5.4-mini" })],
+      ["create with a [1m] variant", () => create({ provider: "codex", model: "gpt-5.4[1m]" })],
+      ["create with another provider", () => create({ provider: "claude", model: "gpt-5.4" })],
+      ["create with another provider's default", () => create({ provider: "claude" })],
+      [
+        "internal create with another model",
+        () => create({ provider: "codex", model: "gpt-5.4-mini", internal: true }),
+      ],
+      ["resume another model", () => resume("codex", "gpt-5.4-mini")],
+      ["resume another provider", () => resume("claude", "gpt-5.4")],
+      ["import a session recorded with another model", () => importNative("codex", "native-other")],
+      ["import from another provider", () => importNative("claude", "native-member")],
+      [
+        "reload onto another model",
+        () => manager.reloadAgentSession(live.id, { model: "gpt-5.4-mini" }),
+      ],
+      ["model switch to another model", () => manager.setAgentModel(live.id, "gpt-5.4-mini")],
+    ];
+    for (const [name, run] of refusedPaths) {
+      const before = starts.length;
+      await expect(run(), name).rejects.toThrow(SESSION_MEMBER_REFUSAL);
+      expect(starts.slice(before), name).toEqual([]);
+    }
+
+    // Discovery for another member returns nothing and starts nothing.
+    const before = starts.length;
+    for (const config of [draft("claude", "claude-opus-5-5"), draft("codex", "gpt-5.4-mini")]) {
+      await expect(manager.listDraftCommands(config)).resolves.toEqual([]);
+      await expect(manager.listDraftFeatures(config)).resolves.toEqual([]);
+    }
+    expect(starts.slice(before)).toEqual([]);
+  } finally {
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("in session mode a refused operation leaves the agent, its turn and its timeline exactly as they were", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-member-side-effects-"));
+  const store = new RecordingTimelineStore();
+  const sessions: HeldTurnSession[] = [];
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new HeldTurnSession(config);
+      sessions.push(session);
+      return session;
+    }
+  })("codex");
+  const manager = new AgentManager({
+    clients: { codex: client },
+    durableTimelineStore: store,
+    sessionIdentity: { member: "codex/gpt-5.4", role: "implementer" },
+    logger,
+  });
+  const storedId = "00000000-0000-4000-8000-000000000001";
+  await store.appendCommitted(storedId, { type: "assistant_message", text: "retained" });
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    void drainAsyncGenerator(manager.streamAgent(agent.id, "keep this turn open")).catch(
+      () => undefined,
+    );
+    await manager.waitForAgentRunStart(agent.id);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const state = async () => {
+      const live = manager.getAgent(agent.id)!;
+      return JSON.stringify({
+        lifecycle: live.lifecycle,
+        activeForegroundTurnId: live.activeForegroundTurnId,
+        activeTurnId: live.activeTurnId,
+        config: live.config,
+        runtimeInfo: live.runtimeInfo,
+        lastError: live.lastError,
+        timeline: manager.getTimeline(agent.id),
+        committed: await store.getCommittedRows(agent.id),
+        stored: await store.getCommittedRows(storedId),
+        interrupts: sessions[0]!.interrupts,
+        closes: sessions[0]!.closes,
+      });
+    };
+    const before = await state();
+    expect(JSON.parse(before)).toMatchObject({ lifecycle: "running", interrupts: 0 });
+
+    const refused: Array<[string, () => Promise<unknown>]> = [
+      ["reload onto another model", () => manager.reloadAgentSession(agent.id, { model: "x-1" })],
+      ["model switch", () => manager.setAgentModel(agent.id, "gpt-5.4-mini")],
+      [
+        "create over a stored agent",
+        () =>
+          manager.createAgent(
+            { provider: "codex", cwd: workdir, model: "gpt-5.4-mini" },
+            storedId,
+            {
+              workspaceId: undefined,
+            },
+          ),
+      ],
+      [
+        "resume a stored agent onto another model",
+        () =>
+          manager.resumeAgentFromPersistence(
+            { provider: "codex", sessionId: "stored", metadata: { cwd: workdir, model: "x-1" } },
+            undefined,
+            storedId,
+          ),
+      ],
+    ];
+    for (const [name, run] of refused) {
+      await expect(run(), name).rejects.toThrow(SESSION_MEMBER_REFUSAL);
+      expect(await state(), name).toBe(before);
+    }
+    expect(sessions).toHaveLength(1);
+  } finally {
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("in session mode an agent whose runtime reports another model is stopped and marked refused", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-member-runtime-"));
+  const sessions: HeldTurnSession[] = [];
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new (class extends HeldTurnSession {
+        override async startTurn(): Promise<{ turnId: string }> {
+          const started = await super.startTurn();
+          setTimeout(() => {
+            // The harness switched models by itself in the middle of the turn.
+            this.pushEvent({
+              type: "model_changed",
+              provider: "codex",
+              runtimeInfo: { provider: "codex", sessionId: this.id, model: "gpt-5.4-mini" },
+            });
+          }, 5);
+          return started;
+        }
+      })(config);
+      sessions.push(session);
+      return session;
+    }
+  })("codex");
+  const agentTokens = new AgentTokenRegistry();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    agentTokens,
+    sessionIdentity: { member: "codex/gpt-5.4", role: "implementer" },
+    logger,
+  });
+  const states: Array<{ lifecycle: string; lastError?: string }> = [];
+  manager.subscribe((event) => {
+    if (event.type === "agent_state") {
+      states.push({ lifecycle: event.agent.lifecycle, lastError: event.agent.lastError });
+    }
+  });
+  const refusal =
+    "This session's member is codex/gpt-5.4. This agent would run codex/gpt-5.4-mini. A different model needs a new session.";
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const token = manager.issueAgentToken(agent.id);
+    expect(manager.getSessionMemberRefusal(agent.id)).toBeNull();
+
+    const run = await manager.runAgent(agent.id, "switch models");
+
+    expect(run.canceled).toBe(true);
+    await vi.waitFor(() => expect(manager.getAgent(agent.id)).toBeNull());
+    expect(manager.getSessionMemberRefusal(agent.id)).toBe(refusal);
+    expect(states.at(-1)).toEqual({ lifecycle: "closed", lastError: refusal });
+    expect(sessions[0]!.closes).toBe(1);
+    expect(agentTokens.resolve(token)).toBeNull();
   } finally {
     for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
     rmSync(workdir, { recursive: true, force: true });
