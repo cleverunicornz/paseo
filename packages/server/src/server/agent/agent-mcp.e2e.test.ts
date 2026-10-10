@@ -981,15 +981,30 @@ describe("agent MCP end-to-end (offline)", () => {
           },
         },
       };
-      const first = await daemon.agentManager.createAgent(gatewayConfig, undefined, {
-        workspaceId: undefined,
-      });
+      const first = await daemon.agentManager.createAgent(
+        { ...gatewayConfig, model: "claude-opus-5-5" },
+        undefined,
+        { workspaceId: undefined },
+      );
       const firstLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
-      const second = await daemon.agentManager.createAgent(gatewayConfig, undefined, {
-        workspaceId: undefined,
-      });
+      const second = await daemon.agentManager.createAgent(
+        { ...gatewayConfig, model: "Claude-Sonnet-5-5" },
+        undefined,
+        { workspaceId: undefined },
+      );
       const secondLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
-      if (firstLaunch?.type !== "http" || secondLaunch?.type !== "http") {
+      // A model that cannot be written as a member sends no member at all.
+      const third = await daemon.agentManager.createAgent(
+        { ...gatewayConfig, model: "claude-opus-5-5[1m]" },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const thirdLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
+      if (
+        firstLaunch?.type !== "http" ||
+        secondLaunch?.type !== "http" ||
+        thirdLaunch?.type !== "http"
+      ) {
         throw new Error("Gateway MCP entry was not launched as HTTP");
       }
       expect(firstLaunch.url).toBe(`http://127.0.0.1:${port}/mcp/backends/cluster`);
@@ -1004,21 +1019,37 @@ describe("agent MCP end-to-end (offline)", () => {
             "content-type": "application/json",
             "X-Paseo-Agent-ID": "caller-supplied-agent",
             "X-Paseo-Server-ID": "caller-supplied-server",
+            "X-Paseo-Member": "codex/caller-supplied",
           },
           body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
         });
       const firstResponse = await callAs(firstLaunch);
       const secondResponse = await callAs(secondLaunch);
+      const thirdResponse = await callAs(thirdLaunch);
       expect(firstResponse.status).toBe(200);
       expect(firstResponse.headers.get("mcp-session-id")).toBe("s1");
       expect(secondResponse.status).toBe(200);
+      expect(thirdResponse.status).toBe(200);
 
       const status = await fetch(`http://127.0.0.1:${port}/api/status`, {
         headers: { Authorization: "Bearer daemon-secret" },
       });
       const { serverId } = (await status.json()) as { serverId: string };
-      expect(seen.map((headers) => headers["x-paseo-agent-id"])).toEqual([first.id, second.id]);
-      expect(seen.map((headers) => headers["x-paseo-server-id"])).toEqual([serverId, serverId]);
+      expect(seen.map((headers) => headers["x-paseo-agent-id"])).toEqual([
+        first.id,
+        second.id,
+        third.id,
+      ]);
+      expect(seen.map((headers) => headers["x-paseo-server-id"])).toEqual([
+        serverId,
+        serverId,
+        serverId,
+      ]);
+      expect(seen.map((headers) => headers["x-paseo-member"])).toEqual([
+        "claude/claude-opus-5-5",
+        "claude/claude-sonnet-5-5",
+        undefined,
+      ]);
       expect(seen.every((headers) => headers.authorization === undefined)).toBe(true);
 
       // Neither the daemon password nor a missing token reaches a backend.
@@ -1039,7 +1070,7 @@ describe("agent MCP end-to-end (offline)", () => {
       await daemon.agentManager.closeAgent(first.id);
       const afterClose = await callAs(firstLaunch);
       expect(afterClose.status).toBe(401);
-      expect(seen).toHaveLength(2);
+      expect(seen).toHaveLength(3);
     } finally {
       await daemon.stop();
       backend.closeAllConnections();

@@ -1,7 +1,13 @@
 import { describe, expect, test } from "vitest";
 import { ShutdownGatewayCallers } from "./shutdown-callers.js";
 
-const closing = { agentId: "agent-1", sessionId: "session-1", workspaceId: "workspace-1" };
+const closing = {
+  agentId: "agent-1",
+  sessionId: "session-1",
+  workspaceId: "workspace-1",
+  provider: "claude",
+  model: "claude-opus-5-5",
+};
 
 describe("ShutdownGatewayCallers", () => {
   test("a retained agent's token resolves to the identity it had when the shutdown began", () => {
