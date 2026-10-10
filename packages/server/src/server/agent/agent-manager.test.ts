@@ -12108,7 +12108,11 @@ test("in session mode every provider start passes the member check, and a refuse
     for (const [name, run] of refusedPaths) {
       const before = starts.length;
       await expect(run(), name).rejects.toThrow(SESSION_MEMBER_REFUSAL);
-      expect(starts.slice(before), name).toEqual([]);
+      // No session starts; the member provider's catalogue may still be read for its default.
+      expect(
+        starts.slice(before).filter((start) => !admitted(start) || start.via !== "fetchCatalog"),
+        name,
+      ).toEqual([]);
     }
 
     // Discovery for another member returns nothing and starts nothing.
@@ -12255,9 +12259,8 @@ test("in session mode an agent whose runtime reports another model is stopped an
     const token = manager.issueAgentToken(agent.id);
     expect(manager.getSessionMemberRefusal(agent.id)).toBeNull();
 
-    const run = await manager.runAgent(agent.id, "switch models");
+    await expect(manager.runAgent(agent.id, "switch models")).rejects.toThrow(refusal);
 
-    expect(run.canceled).toBe(true);
     await vi.waitFor(() => expect(manager.getAgent(agent.id)).toBeNull());
     expect(manager.getSessionMemberRefusal(agent.id)).toBe(refusal);
     expect(states.at(-1)).toEqual({ lifecycle: "closed", lastError: refusal });

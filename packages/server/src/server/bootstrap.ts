@@ -982,6 +982,7 @@ export async function createPaseoDaemon(
       extraClients: config.agentClients,
       mcpGatewayModelBackends: config.mcpGatewayModelBackends,
       mcpGatewayEnvPassthrough: config.mcpGatewayEnvPassthrough,
+      sessionIdentity: sessionRuntime.identity,
     },
   });
   const providerSnapshotManager = agentProviderRuntime.snapshotManager;
@@ -1101,6 +1102,7 @@ export async function createPaseoDaemon(
       },
       serverId,
       sessionIdentity: sessionRuntime.identity,
+      agentRefusal: (agentId) => agentManager.getSessionMemberRefusal(agentId),
       resolveUpstream: (request) => pluginRuntime.before("mcp_gateway.upstream", request),
       logger,
     }),

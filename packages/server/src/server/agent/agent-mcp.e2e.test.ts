@@ -255,15 +255,15 @@ function claudeQueryReportingModel(reportedModel: string, launches: string[]) {
         model: reportedModel,
       },
     ];
-    let closed = false;
+    const closedRef = { value: false };
     const waiters: Array<() => void> = [];
     const end = () => {
-      closed = true;
+      closedRef.value = true;
       for (const wake of waiters.splice(0)) wake();
     };
     return {
       next: async () => {
-        while (queued.length === 0 && !closed) {
+        while (queued.length === 0 && !closedRef.value) {
           await new Promise<void>((resolve) => waiters.push(resolve));
         }
         const value = queued.shift();
@@ -1273,14 +1273,13 @@ describe("agent MCP end-to-end (offline)", () => {
         });
       expect((await callGateway()).status).toBe(200);
 
-      const run = await manager.runAgent(agent.id, "/model claude-sonnet-5-5");
+      const refusal =
+        "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.";
+      await expect(manager.runAgent(agent.id, "/model claude-sonnet-5-5")).rejects.toThrow(refusal);
 
       expect(launches).toEqual(["claude-opus-5-5"]);
-      expect(run.canceled).toBe(true);
       await vi.waitFor(() => expect(manager.getAgent(agent.id)).toBeNull());
-      expect(manager.getSessionMemberRefusal(agent.id)).toBe(
-        "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.",
-      );
+      expect(manager.getSessionMemberRefusal(agent.id)).toBe(refusal);
       expect((await callGateway()).status).not.toBe(200);
       expect(seen.map((headers) => headers["x-paseo-member"])).toEqual(["claude/claude-opus-5-5"]);
     } finally {

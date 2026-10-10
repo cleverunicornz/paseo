@@ -24,6 +24,8 @@ export interface McpGatewayOptions {
   serverId: string;
   /** In session mode, the member and role every forwarded request carries, whichever agent calls. */
   sessionIdentity: SessionIdentity | null;
+  /** Why the session refused this agent, or null; a refused agent's requests are not forwarded. */
+  agentRefusal?: (agentId: string) => string | null;
   /** Runs the `mcp_gateway.upstream` plugin hooks. */
   resolveUpstream: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   /**
@@ -266,6 +268,11 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
     const agent = options.resolveAgent(extractHttpBearerToken(req.headers.authorization));
     if (!agent) {
       sendError(res, 401, "Unauthorized");
+      return;
+    }
+    const refusal = options.agentRefusal?.(agent.agentId);
+    if (refusal) {
+      sendError(res, 403, refusal);
       return;
     }
     const target = parseTarget(req.url);
