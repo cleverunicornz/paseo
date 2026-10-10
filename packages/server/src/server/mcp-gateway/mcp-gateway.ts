@@ -320,6 +320,12 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       sendError(res, 400, "Invalid MCP backend path");
       return;
     }
+    // The agent may have been refused while the upstream hook ran.
+    const lateRefusal = options.agentRefusal?.(agent.agentId);
+    if (lateRefusal) {
+      sendError(res, 403, lateRefusal);
+      return;
+    }
     const transport = base.protocol === "https:" ? https : http;
     let upstreamRequest: http.ClientRequest;
     try {

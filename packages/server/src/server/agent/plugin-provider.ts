@@ -944,6 +944,8 @@ class PluginAgentClient implements AgentClient {
     input: ImportProviderSessionInput,
     context: ImportProviderSessionContext,
   ): Promise<ImportedProviderSession> {
+    // The session opens with the launch configuration, so that is what is admitted.
+    context.admit?.({ ...context.config, provider: this.provider, cwd: input.cwd });
     const session = await this.openSession({
       config: { ...context.config, provider: this.provider, cwd: input.cwd },
       launchContext: context.launchContext,

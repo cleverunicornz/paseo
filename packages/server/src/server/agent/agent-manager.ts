@@ -878,6 +878,11 @@ export class AgentManager {
     this.sessionMemberGate?.assert(provider, model);
   }
 
+  /** Clears an agent's error, except the refusal of an agent the session stopped. */
+  private clearLastError(agent: ManagedAgent): void {
+    agent.lastError = this.sessionMemberRefusals.get(agent.id)?.message;
+  }
+
   /** Why the session stopped this agent for running another member, or null. */
   getSessionMemberRefusal(agentId: string): string | null {
     return this.sessionMemberRefusals.get(agentId)?.message ?? null;
@@ -1704,12 +1709,16 @@ export class AgentManager {
     );
   }
 
-  /** A reload refused for another member must not cancel the turn it would replace. */
-  private async assertReloadRunsSessionMember(
+  /**
+   * A reload refused for another member must not cancel the turn it would
+   * replace. The model is resolved once and the reload launches exactly the
+   * checked model, so a default that changes between reads cannot slip in.
+   */
+  private async checkReloadSessionMember(
     agent: ManagedAgent,
     overrides: Partial<AgentSessionConfig> | undefined,
-  ): Promise<void> {
-    if (!this.sessionMemberGate) return;
+  ): Promise<Partial<AgentSessionConfig> | undefined> {
+    if (!this.sessionMemberGate) return overrides;
     const provider = agent.persistence?.provider ?? agent.provider;
     const config = await this.normalizeConfig({
       ...agent.config,
@@ -1717,6 +1726,7 @@ export class AgentManager {
       provider,
     } as AgentSessionConfig);
     this.sessionMemberGate.assert(config.provider, config.model);
+    return { ...overrides, model: config.model };
   }
 
   private async reloadAgentSessionInternal(
@@ -1726,7 +1736,7 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
-    await this.assertReloadRunsSessionMember(existing, overrides);
+    const checkedOverrides = await this.checkReloadSessionMember(existing, overrides);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
@@ -1741,7 +1751,7 @@ export class AgentManager {
     const client = this.requireClient(provider);
     const refreshConfig = {
       ...existing.config,
-      ...overrides,
+      ...checkedOverrides,
       provider,
     } as AgentSessionConfig;
     const { storedConfig, launchConfig, paseoToolPolicy } =
@@ -2725,7 +2735,7 @@ export class AgentManager {
 
     const agent = existingAgent;
     const isReplacement = agent.pendingReplacement;
-    agent.lastError = undefined;
+    this.clearLastError(agent);
 
     const pendingRun = this.runs.createPendingRun(agentId);
 
@@ -4730,7 +4740,7 @@ export class AgentManager {
     // If no usage on turn_completed, keep lastUsage as-is so context window
     // data accumulated during streaming isn't lost when the provider omits
     // it from the completion event.
-    agent.lastError = undefined;
+    this.clearLastError(agent);
     if (
       !isForegroundEvent &&
       !agent.activeForegroundTurnId &&
@@ -4813,7 +4823,7 @@ export class AgentManager {
     if (!isForegroundEvent && !agent.activeForegroundTurnId && !agent.pendingReplacement) {
       agent.lifecycle = "idle";
     }
-    agent.lastError = undefined;
+    this.clearLastError(agent);
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Interrupted");
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
