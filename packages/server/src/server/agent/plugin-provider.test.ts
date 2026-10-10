@@ -9,6 +9,7 @@ import { describe, expect, test } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import type { AgentClient, AgentStreamEvent } from "./agent-sdk-types.js";
 import { PluginAgentClientRegistry } from "./plugin-provider.js";
+import { AgentManager } from "./agent-manager.js";
 import {
   isStaleProviderSessionError,
   StaleProviderSessionError,
@@ -394,6 +395,44 @@ describe("PluginAgentClientRegistry", () => {
     await expect(client.unarchiveNativeSession?.(persistence)).resolves.toBeUndefined();
     expect(harness.inputs).toEqual([]);
     await registry.shutdown();
+  });
+
+  test("in session mode refuses importing a native session of another member before opening it", async () => {
+    const native = 'plugin:{"version":1,"data":{"token":"native"}}';
+    const importAs = async (member: string) => {
+      const harness = createProviderHarness();
+      const registry = new PluginAgentClientRegistry(createTestLogger());
+      registry.replace([harness.registration]);
+      const manager = new AgentManager({
+        clients: registry.clients(),
+        sessionIdentity: { member, role: "validator" },
+        logger: createTestLogger(),
+      });
+      const imported = manager.importProviderSession({
+        provider: harness.registration.id,
+        providerHandleId: native,
+        cwd: process.cwd(),
+        workspaceId: "ws",
+      });
+      return { harness, registry, manager, imported };
+    };
+
+    // The import would open the provider's default model, plugin-model.
+    const refused = await importAs("plugin-direct/allowed-model");
+    await expect(refused.imported).rejects.toThrow(
+      "This session's member is plugin-direct/allowed-model. This agent would run plugin-direct/plugin-model.",
+    );
+    expect(refused.harness.inputs.map((input) => input.type)).not.toContain("session.open");
+    expect(refused.harness.inputs.map((input) => input.type)).not.toContain("session.close");
+    await refused.registry.shutdown();
+
+    const admitted = await importAs("plugin-direct/plugin-model");
+    const agent = await admitted.imported;
+    expect(admitted.harness.inputs.filter((input) => input.type === "session.open")).toHaveLength(
+      1,
+    );
+    await admitted.manager.closeAgent(agent.id);
+    await admitted.registry.shutdown();
   });
 
   test("terminalizes an active turn exactly once when its plugin provider is removed", async () => {

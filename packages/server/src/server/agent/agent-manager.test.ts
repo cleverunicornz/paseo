@@ -12271,3 +12271,65 @@ test("in session mode an agent whose runtime reports another model is stopped an
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test("in session mode a reload resolves the default model once, checks it, and launches exactly it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-member-reload-default-"));
+  // Each catalogue read can name a different default, as when settings change between reads.
+  const defaults: string[] = [];
+  const launched: Array<string | null> = [];
+  const sessions: HeldTurnSession[] = [];
+  const client = new (class extends TestAgentClient {
+    override async fetchCatalog() {
+      const id = defaults.shift() ?? "unexpected-extra-read";
+      return { models: [{ provider: "codex", id, label: id, isDefault: true }], modes: [] };
+    }
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      launched.push(config.model ?? null);
+      const session = new HeldTurnSession(config);
+      sessions.push(session);
+      return session;
+    }
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      overrides?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      launched.push(overrides?.model ?? null);
+      const session = new HeldTurnSession({ provider: "codex", cwd: workdir, ...overrides });
+      sessions.push(session);
+      return session;
+    }
+  })("codex");
+  const manager = new AgentManager({
+    clients: { codex: client },
+    sessionIdentity: { member: "codex/gpt-5.4-mini", role: "implementer" },
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4-mini" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    // The default read once is the member; a second read would name another model.
+    defaults.push("gpt-5.4-mini", "gpt-6-astra");
+    await manager.reloadAgentSession(agent.id, { model: "default" });
+    expect(defaults).toEqual(["gpt-6-astra"]);
+    expect(launched).toEqual(["gpt-5.4-mini", "gpt-5.4-mini"]);
+    expect(manager.getAgent(agent.id)?.config.model).toBe("gpt-5.4-mini");
+
+    // A default that is not the member is refused, and the running agent is not closed.
+    defaults.splice(0, defaults.length, "gpt-6-astra", "gpt-5.4-mini");
+    const live = sessions.at(-1)!;
+    await expect(manager.reloadAgentSession(agent.id, { model: "default" })).rejects.toThrow(
+      "This session's member is codex/gpt-5.4-mini. This agent would run codex/gpt-6-astra.",
+    );
+    expect(defaults).toEqual(["gpt-5.4-mini"]);
+    expect(live.closes).toBe(0);
+    expect(launched).toHaveLength(2);
+    expect(manager.getAgent(agent.id)).toMatchObject({ config: { model: "gpt-5.4-mini" } });
+  } finally {
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

@@ -301,6 +301,45 @@ describe("MCP gateway", () => {
     ]);
   });
 
+  test("forwards nothing for an agent refused while its request waits on the upstream hook", async () => {
+    const upstream = await startUpstream();
+    const refusal =
+      "This session's member is codex/gpt-6-astra. This agent would run codex/gpt-5.4. A different model needs a new session.";
+    let refused: string | null = null;
+    let reachedHook!: () => void;
+    let releaseHook!: () => void;
+    const hookReached = new Promise<void>((resolve) => {
+      reachedHook = resolve;
+    });
+    const hookReleased = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: () => refused,
+      resolveUpstream: async (request) => {
+        reachedHook();
+        await hookReleased;
+        return request;
+      },
+    });
+
+    const response = fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: MCP_INIT,
+    });
+    await hookReached;
+    refused = refusal;
+    releaseHook();
+
+    const answered = await response;
+    expect(answered.status).toBe(403);
+    expect(await answered.json()).toEqual({ error: refusal });
+    expect(upstream.requests).toEqual([]);
+  });
+
   test("outside session mode sends no member or role, and drops the caller's", async () => {
     const upstream = await startUpstream();
     const gateway = await startGateway({ backends: { cluster: upstream.url } });
