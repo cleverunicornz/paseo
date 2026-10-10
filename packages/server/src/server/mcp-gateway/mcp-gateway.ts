@@ -7,6 +7,7 @@ import type { PluginMcpGatewayUpstreamRequest } from "@getpaseo/plugin/server";
 
 import { extractHttpBearerToken } from "../auth.js";
 import { MCP_GATEWAY_BACKEND_NAME_PATTERN, type McpGatewayBackend } from "./backends.js";
+import type { SessionIdentity } from "../session-runtime-config.js";
 
 export type McpGatewayUpstreamRequest = PluginMcpGatewayUpstreamRequest;
 
@@ -14,9 +15,6 @@ export interface McpGatewayAgent {
   agentId: string;
   sessionId: string | null;
   workspaceId: string | null;
-  /** The provider and model the agent runs as, from which the gateway forms its member. */
-  provider: string;
-  model: string | null;
 }
 
 export interface McpGatewayOptions {
@@ -24,6 +22,8 @@ export interface McpGatewayOptions {
   /** Resolves the caller from its daemon-issued bearer token; nothing else names a caller. */
   resolveAgent: (token: string | null) => McpGatewayAgent | null;
   serverId: string;
+  /** In session mode, the member and role every forwarded request carries, whichever agent calls. */
+  sessionIdentity: SessionIdentity | null;
   /** Runs the `mcp_gateway.upstream` plugin hooks. */
   resolveUpstream: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   /**
@@ -49,21 +49,6 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 const IDENTITY_HEADER_PREFIX = "x-paseo-";
-
-const MEMBER_PATTERN = /^([a-z0-9-]+\/)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
-const MEMBER_MAX_LENGTH = 128;
-
-/**
- * The agent's member, `<provider>/<model>` in ASCII lowercase, that backends
- * record in their lineage. Null when either part is missing or the result
- * does not match the member pattern within 128 characters: the gateway then
- * sends no member rather than a malformed one.
- */
-export function formatMcpGatewayMember(provider: string, model: string | null): string | null {
-  if (!provider || !model) return null;
-  const member = `${provider}/${model}`.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
-  return member.length <= MEMBER_MAX_LENGTH && MEMBER_PATTERN.test(member) ? member : null;
-}
 
 type ParsedTarget =
   | { kind: "backend"; backend: string; suffix: string; search: string }
@@ -212,6 +197,7 @@ function buildUpstreamHeaders(input: {
   pluginHeaders: Record<string, string>;
   agent: McpGatewayAgent;
   serverId: string;
+  sessionIdentity: SessionIdentity | null;
 }): OutgoingHttpHeaders {
   const connectionListed = connectionListedHeaders(input.incoming);
   const headers: OutgoingHttpHeaders = {};
@@ -240,8 +226,10 @@ function buildUpstreamHeaders(input: {
   if (input.agent.sessionId) headers["x-paseo-session-id"] = input.agent.sessionId;
   if (input.agent.workspaceId) headers["x-paseo-workspace-id"] = input.agent.workspaceId;
   headers["x-paseo-server-id"] = input.serverId;
-  const member = formatMcpGatewayMember(input.agent.provider, input.agent.model);
-  if (member) headers["x-paseo-member"] = member;
+  if (input.sessionIdentity) {
+    headers["x-paseo-member"] = input.sessionIdentity.member;
+    headers["x-paseo-role"] = input.sessionIdentity.role;
+  }
   return headers;
 }
 
@@ -339,6 +327,7 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
           pluginHeaders: upstream.headers,
           agent,
           serverId: options.serverId,
+          sessionIdentity: options.sessionIdentity,
         }),
       });
     } catch (error) {

@@ -136,12 +136,11 @@ agent's `Authorization` and every `X-Paseo-*` header, then sets:
 | `X-Paseo-Session-ID`   | The agent's provider session ID, once it has one |
 | `X-Paseo-Workspace-ID` | The agent's workspace, when it has one           |
 | `X-Paseo-Server-ID`    | This daemon's server ID                          |
-| `X-Paseo-Member`       | The agent's `<provider>/<model>`, lowercased     |
+| `X-Paseo-Member`       | In session mode, the session's member            |
+| `X-Paseo-Role`         | In session mode, the session's role              |
 
-`X-Paseo-Member` uses the model the agent reports running, or its configured model before it
-reports one. The gateway omits it when the value would not match
-`^([a-z0-9-]+/)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$` within 128 characters, for example a model with
-brackets or a slash in its ID.
+Session mode is described in [one member per session](/docs/session-containers#one-member-per-session).
+Outside it the gateway sends neither `X-Paseo-Member` nor `X-Paseo-Role`.
 
 Paseo holds no backend credential. A plugin supplies one per request through the
 [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks); without one the request goes

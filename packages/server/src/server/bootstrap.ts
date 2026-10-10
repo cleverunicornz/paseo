@@ -128,12 +128,12 @@ import type { OpenAiSpeechProviderConfig } from "./speech/providers/openai/confi
 import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
-import { AgentManager, type ManagedAgent } from "./agent/agent-manager.js";
+import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import { AgentTokenRegistry } from "./agent/agent-tokens.js";
-import { createMcpGatewayHandler, type McpGatewayAgent } from "./mcp-gateway/mcp-gateway.js";
+import { createMcpGatewayHandler } from "./mcp-gateway/mcp-gateway.js";
 import { MCP_GATEWAY_ROUTE, type McpGatewayBackend } from "./mcp-gateway/backends.js";
 import {
   createPaseoToolCatalog,
@@ -277,17 +277,6 @@ function createAgentMcpBaseUrl(listenTarget: ListenTarget | null): string | null
     "/mcp/agents",
     `http://${formatHostForHttpUrl(host)}:${listenTarget.port}`,
   ).toString();
-}
-
-/** The identity the MCP gateway attaches for an agent; its model is the one it reports running. */
-function toMcpGatewayAgent(agent: ManagedAgent): McpGatewayAgent {
-  return {
-    agentId: agent.id,
-    sessionId: agent.persistence?.sessionId ?? null,
-    workspaceId: agent.workspaceId ?? null,
-    provider: agent.provider,
-    model: agent.runtimeInfo?.model ?? agent.config.model ?? null,
-  };
 }
 
 function isToolsListRequest(body: unknown): boolean {
@@ -1044,6 +1033,7 @@ export async function createPaseoDaemon(
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     prepareToolTree: localToolsRuntime.prepareToolTree,
     singleAgent: sessionRuntime.singleAgent,
+    sessionIdentity: sessionRuntime.identity,
     logger,
   });
   const stopReadiness = new StopReadinessService({
@@ -1099,21 +1089,18 @@ export async function createPaseoDaemon(
         }
         const agent = agentManager.getAgent(agentId);
         if (agent) {
-          return toMcpGatewayAgent(agent);
+          return {
+            agentId: agent.id,
+            sessionId: agent.persistence?.sessionId ?? null,
+            workspaceId: agent.workspaceId ?? null,
+          };
         }
         // Before registration a launch lists the backends for the agent's tool tree.
         const launching = agentManager.getLaunchingAgent(agentId);
-        return launching
-          ? {
-              agentId,
-              sessionId: null,
-              workspaceId: launching.workspaceId,
-              provider: launching.provider,
-              model: launching.model,
-            }
-          : null;
+        return launching ? { agentId, sessionId: null, workspaceId: launching.workspaceId } : null;
       },
       serverId,
+      sessionIdentity: sessionRuntime.identity,
       resolveUpstream: (request) => pluginRuntime.before("mcp_gateway.upstream", request),
       logger,
     }),
@@ -1979,7 +1966,13 @@ export async function createPaseoDaemon(
     agentManager.prepareForShutdown();
     // Plugins draining timeline items still call the gateway for the agents
     // closed below, with the identity each had, until the drain ends.
-    shutdownGatewayCallers.retain(agentManager.listAgents().map(toMcpGatewayAgent));
+    shutdownGatewayCallers.retain(
+      agentManager.listAgents().map((agent) => ({
+        agentId: agent.id,
+        sessionId: agent.persistence?.sessionId ?? null,
+        workspaceId: agent.workspaceId ?? null,
+      })),
+    );
     const unclosedAgents = await closeAllAgents(logger, agentManager);
     await localToolsRuntime.close();
     await agentManager.flushForShutdown().catch(() => undefined);

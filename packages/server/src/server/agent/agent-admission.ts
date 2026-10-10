@@ -1,3 +1,5 @@
+import type { SessionIdentity } from "../session-runtime-config.js";
+
 export class AgentManagerStoppingError extends Error {
   constructor(work: "agents" | "turns") {
     super(`Paseo is stopping and accepts no new ${work}`);
@@ -16,8 +18,27 @@ export class SingleAgentModeError extends Error {
   }
 }
 
+export class SessionMemberError extends Error {
+  constructor(
+    readonly member: string,
+    readonly attempted: string,
+  ) {
+    super(
+      `This session's member is ${member}. This agent would run ${attempted}. A different model needs a new session.`,
+    );
+    this.name = "SessionMemberError";
+  }
+}
+
+/** ASCII-only lowercasing, so Unicode case folding never turns another value into a member. */
+function asciiLowercase(value: string): string {
+  return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
 export interface AgentAdmissionOptions {
   singleAgent: boolean;
+  /** In session mode, the identity whose member every agent runs as. */
+  sessionIdentity?: SessionIdentity | null;
   /** Ids of the public (non-internal) agents the manager currently holds. */
   listPublicAgentIds: () => string[];
   /** An archived agent loaded only to read its history does not count as live. */
@@ -26,8 +47,8 @@ export interface AgentAdmissionOptions {
 
 /**
  * Decides whether the agent manager takes new agents and new turns: not once a
- * controller asked the daemon to begin stopping, and in single-agent mode not
- * a second live agent.
+ * controller asked the daemon to begin stopping, in single-agent mode not
+ * a second live agent, and in session mode no agent that runs another member.
  */
 export class AgentAdmission {
   private stopping = false;
@@ -49,6 +70,20 @@ export class AgentAdmission {
 
   assertAcceptingTurns(): void {
     if (this.stopping) throw new AgentManagerStoppingError("turns");
+  }
+
+  /**
+   * In session mode, refuses any provider and model but the session's member.
+   * The agent's value is compared lowercased and otherwise as given: a suffixed
+   * variant such as `[1m]` is a different model.
+   */
+  assertRunsSessionMember(provider: string, model: string | null | undefined): void {
+    const member = this.options.sessionIdentity?.member;
+    if (member === undefined) return;
+    const attempted = model
+      ? asciiLowercase(`${provider}/${model}`)
+      : `${asciiLowercase(provider)} without a model`;
+    if (attempted !== member) throw new SessionMemberError(member, attempted);
   }
 
   /**

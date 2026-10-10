@@ -47,6 +47,7 @@ describe("server config", () => {
       timelineDrainMs: 300_000,
       singleAgent: false,
       webBasePath: "/",
+      identity: null,
     });
 
     await writeFile(

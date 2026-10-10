@@ -11872,7 +11872,7 @@ test("in session mode an agent launches, switches and reloads only as the sessio
   const codex = new TestAgentClient("codex");
   const manager = new AgentManager({
     clients: { codex, claude: new TestAgentClient("claude") },
-    sessionMember: "codex/gpt-5.4",
+    sessionIdentity: { member: "codex/gpt-5.4", role: "implementer" },
     logger,
   });
   const refusal =

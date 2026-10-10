@@ -94,6 +94,7 @@ import {
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { extractAttention } from "../persistence-hooks.js";
 import { AgentAdmission } from "./agent-admission.js";
+import type { SessionIdentity } from "../session-runtime-config.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -322,8 +323,6 @@ export interface CreateAgentOptions {
 /** What a launch knows of its agent before the agent is registered. */
 export interface LaunchingAgent {
   workspaceId: string | null;
-  provider: AgentProvider;
-  model: string | null;
 }
 
 export interface AgentManagerOptions {
@@ -362,6 +361,11 @@ export interface AgentManagerOptions {
   rescueTimeouts?: AgentManagerRescueTimeouts;
   /** At most one live public agent; a second create, import or resume is refused. */
   singleAgent?: boolean;
+  /**
+   * Session mode's identity: every agent launches, resumes, reloads and switches
+   * models only as its member.
+   */
+  sessionIdentity?: SessionIdentity | null;
   beforeSteerUnavailableFallback?: (input: {
     agentId: string;
     expectedTurnId: string;
@@ -827,6 +831,7 @@ export class AgentManager {
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
     this.admission = new AgentAdmission({
       singleAgent: options.singleAgent === true,
+      sessionIdentity: options.sessionIdentity,
       listPublicAgentIds: () =>
         [...this.agents.values()].filter((agent) => !agent.internal).map((agent) => agent.id),
       isArchived: async (agentId) => Boolean((await this.registry?.get(agentId))?.archivedAt),
@@ -1385,12 +1390,7 @@ export class AgentManager {
       storedConfig.cwd,
       paseoToolPolicy,
       options?.env,
-      {
-        reason: "create",
-        purpose: "interactive",
-        workspaceId: options.workspaceId ?? null,
-        model: storedConfig.model,
-      },
+      { reason: "create", purpose: "interactive", workspaceId: options.workspaceId ?? null },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
       agentId: resolvedAgentId,
@@ -1540,7 +1540,6 @@ export class AgentManager {
         reason: "resume",
         purpose,
         workspaceId: options?.workspaceId ?? null,
-        model: storedConfig.model,
       },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
@@ -1706,12 +1705,7 @@ export class AgentManager {
       storedConfig.cwd,
       paseoToolPolicy,
       undefined,
-      {
-        reason: "refresh",
-        purpose: "interactive",
-        workspaceId: existing.workspaceId,
-        model: storedConfig.model,
-      },
+      { reason: "refresh", purpose: "interactive", workspaceId: existing.workspaceId },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
       agentId: agentId,
@@ -2107,6 +2101,7 @@ export class AgentManager {
     const agent = this.requireSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
+    this.admission.assertRunsSessionMember(agent.provider, normalizedModelId);
 
     if (agent.session.setModel) {
       await agent.session.setModel(normalizedModelId);
@@ -5388,6 +5383,7 @@ export class AgentManager {
       env: options.env,
       purpose: options.purpose,
     });
+    this.admission.assertRunsSessionMember(storedConfig.provider, storedConfig.model);
     const paseoToolPolicy = this.paseoToolsEnabled
       ? this.resolvePaseoToolPolicy(storedConfig.provider)
       : { enabled: false };
@@ -5418,7 +5414,6 @@ export class AgentManager {
       reason: PluginSessionOpenRequest["reason"];
       purpose: PluginSessionOpenRequest["purpose"];
       workspaceId?: string | null;
-      model?: string | null;
     },
   ): Promise<AgentLaunchContext> {
     if (this.pluginLifecycle) {
@@ -5434,11 +5429,7 @@ export class AgentManager {
       const transformed = await this.pluginLifecycle.before("agent.session_open", request);
       env = transformed.env;
     }
-    const launching: LaunchingAgent = {
-      workspaceId: opening?.workspaceId ?? null,
-      provider: client.provider,
-      model: opening?.model ?? null,
-    };
+    const launching: LaunchingAgent = { workspaceId: opening?.workspaceId ?? null };
     this.launchingAgents.set(agentId, launching);
     let toolTreeDir: string | null;
     try {

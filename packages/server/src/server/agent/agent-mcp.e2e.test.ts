@@ -1120,9 +1120,9 @@ describe("agent MCP end-to-end (offline)", () => {
       await expect(create("claude-sonnet-5-5")).rejects.toThrow(
         "This session's member is claude/claude-opus-5-5.",
       );
-      await expect(daemon.agentManager.setAgentModel(first.id, "claude-sonnet-5-5")).rejects.toThrow(
-        "A different model needs a new session.",
-      );
+      await expect(
+        daemon.agentManager.setAgentModel(first.id, "claude-sonnet-5-5"),
+      ).rejects.toThrow("A different model needs a new session.");
       expect(recorder.recordedLaunches).toHaveLength(2);
 
       const callAs = (launch: { url: string; headers?: Record<string, string> }) =>

@@ -145,7 +145,7 @@ To serve it under a path such as `/s/abc/` behind a reverse proxy, set `daemon.w
 | `daemon.shutdown.timelineDrainMs` | `300000` | How long shutdown waits for plugins to acknowledge timeline items before it stops them.           |
 | `daemon.web.basePath`             | `/`      | The path a reverse proxy serves the daemon under. [Path prefix](/docs/web-ui#under-a-path-prefix) |
 
-These settings are read at startup. See [Session containers](/docs/session-containers) for the stop-readiness endpoints and what shutdown reports.
+These settings are read at startup. See [Session containers](/docs/session-containers) for the stop-readiness endpoints and what shutdown reports. `CVU_MEMBER` and `CVU_ROLE` start [session mode](/docs/session-containers#one-member-per-session).
 
 ## Logging
 
@@ -261,6 +261,7 @@ Set the persisted value in `config.json`:
 - `PASEO_WEB_BASE_PATH`, override `daemon.web.basePath`
 - `PASEO_SINGLE_AGENT`, override `daemon.singleAgent` (`true` or `false`)
 - `PASEO_TIMELINE_DRAIN_MS`, override `daemon.shutdown.timelineDrainMs`
+- `CVU_MEMBER`, `CVU_ROLE`, run in [session mode](/docs/session-containers#one-member-per-session) as this member and role
 - `PASEO_TRUSTED_PROXIES`, configure trusted reverse proxy ranges for `X-Forwarded-*` headers
 - `PASEO_LOG_CONSOLE_LEVEL`, override `log.console.level`
 - `PASEO_LOG_FILE_LEVEL`, override `log.file.level`
