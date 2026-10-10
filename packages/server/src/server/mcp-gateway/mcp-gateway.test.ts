@@ -6,12 +6,12 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   createMcpGatewayHandler,
-  formatMcpGatewayMember,
   resolveUpstreamUrl,
   type McpGatewayAgent,
   type McpGatewayUpstreamRequest,
 } from "./mcp-gateway.js";
 import type { McpGatewayBackend } from "./backends.js";
+import type { SessionIdentity } from "../session-runtime-config.js";
 
 interface RecordedRequest {
   method: string;
@@ -82,40 +82,17 @@ async function startUpstream(handler?: UpstreamHandler): Promise<Upstream> {
 }
 
 const AGENTS: Record<string, McpGatewayAgent> = {
-  "token-a": {
-    agentId: "agent-a",
-    sessionId: "session-a",
-    workspaceId: "workspace-a",
-    provider: "codex",
-    model: "gpt-6-astra",
-  },
-  "token-b": {
-    agentId: "agent-b",
-    sessionId: null,
-    workspaceId: null,
-    provider: "claude",
-    model: "claude-opus-5-5",
-  },
-  "token-unrepresentable": {
-    agentId: "agent-c",
-    sessionId: null,
-    workspaceId: null,
-    provider: "claude",
-    model: "claude-opus-5-5[1m]",
-  },
-  "token-no-model": {
-    agentId: "agent-d",
-    sessionId: null,
-    workspaceId: null,
-    provider: "codex",
-    model: null,
-  },
+  "token-a": { agentId: "agent-a", sessionId: "session-a", workspaceId: "workspace-a" },
+  "token-b": { agentId: "agent-b", sessionId: null, workspaceId: null },
 };
+
+const SESSION_IDENTITY: SessionIdentity = { member: "codex/gpt-6-astra", role: "validator" };
 
 interface GatewayOptions {
   backends: Record<string, string | McpGatewayBackend>;
   resolveUpstream?: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   responseTimeoutMs?: number;
+  sessionIdentity?: SessionIdentity | null;
 }
 
 async function startGateway(options: GatewayOptions): Promise<string> {
@@ -132,6 +109,7 @@ async function startGateway(options: GatewayOptions): Promise<string> {
         ),
       resolveAgent: (token) => (token ? (AGENTS[token] ?? null) : null),
       serverId: "server-1",
+      sessionIdentity: options.sessionIdentity ?? null,
       resolveUpstream: options.resolveUpstream ?? (async (request) => request),
       responseTimeoutMs: options.responseTimeoutMs,
       logger: pino({ level: "silent" }),
@@ -241,9 +219,12 @@ describe("MCP gateway", () => {
     expect(headers).not.toHaveProperty("proxy-authorization");
   });
 
-  test("sends each agent's own member, lowercased provider/model", async () => {
+  test("in session mode sends the session's member and role for every agent", async () => {
     const upstream = await startUpstream();
-    const gateway = await startGateway({ backends: { cluster: upstream.url } });
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+    });
 
     for (const token of ["token-a", "token-b"]) {
       await fetch(`${gateway}/cluster`, {
@@ -253,77 +234,60 @@ describe("MCP gateway", () => {
       });
     }
 
-    expect(upstream.requests.map((request) => request.headers["x-paseo-member"])).toEqual([
-      "codex/gpt-6-astra",
-      "claude/claude-opus-5-5",
+    expect(upstream.requests.map((request) => request.headers["x-paseo-agent-id"])).toEqual([
+      "agent-a",
+      "agent-b",
     ]);
+    for (const request of upstream.requests) {
+      expect(request.headers["x-paseo-member"]).toBe("codex/gpt-6-astra");
+      expect(request.headers["x-paseo-role"]).toBe("validator");
+    }
   });
 
-  test("overwrites a caller-supplied X-Paseo-Member", async () => {
+  test("in session mode replaces a member or role from the caller or a plugin", async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      resolveUpstream: async (request) => ({
+        ...request,
+        headers: { "X-Paseo-Member": "plugin/supplied", "X-Paseo-Role": "infra" },
+      }),
+    });
+
+    await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer token-a",
+        "X-Paseo-Member": "claude/claude-opus-5-5",
+        "X-Paseo-Role": "infra",
+      },
+      body: MCP_INIT,
+    });
+
+    const headers = upstream.requests[0]!.headers;
+    expect(headers["x-paseo-member"]).toBe("codex/gpt-6-astra");
+    expect(headers["x-paseo-role"]).toBe("validator");
+  });
+
+  test("outside session mode sends no member or role, and drops the caller's", async () => {
     const upstream = await startUpstream();
     const gateway = await startGateway({ backends: { cluster: upstream.url } });
 
     await fetch(`${gateway}/cluster`, {
       method: "POST",
-      headers: { Authorization: "Bearer token-b", "X-Paseo-Member": "codex/gpt-6-astra" },
+      headers: {
+        Authorization: "Bearer token-a",
+        "X-Paseo-Member": "claude/claude-opus-5-5",
+        "X-Paseo-Role": "validator",
+      },
       body: MCP_INIT,
     });
 
-    expect(upstream.requests[0]!.headers["x-paseo-member"]).toBe("claude/claude-opus-5-5");
-  });
-
-  test("sends no member, and drops the caller's, when the agent's member is unrepresentable", async () => {
-    const upstream = await startUpstream();
-    const gateway = await startGateway({ backends: { cluster: upstream.url } });
-
-    for (const token of ["token-unrepresentable", "token-no-model"]) {
-      await fetch(`${gateway}/cluster`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "X-Paseo-Member": "claude/claude-opus-5-5" },
-        body: MCP_INIT,
-      });
-    }
-
-    expect(upstream.requests).toHaveLength(2);
-    for (const request of upstream.requests) {
-      expect(request.headers).not.toHaveProperty("x-paseo-member");
-    }
-  });
-
-  test.each([
-    ["codex", "gpt-6-astra", "codex/gpt-6-astra"],
-    ["claude", "claude-opus-5-5", "claude/claude-opus-5-5"],
-    ["claude-gateway", "glm-5.3", "claude-gateway/glm-5.3"],
-    ["Claude", "Claude-Opus-5-5", "claude/claude-opus-5-5"],
-    ["codex", "gpt-5.1-codex", "codex/gpt-5.1-codex"],
-    ["codex", "a", "codex/a"],
-  ])("member of %s and %s is %s", (provider, model, member) => {
-    expect(formatMcpGatewayMember(provider, model)).toBe(member);
-  });
-
-  test.each([
-    ["claude", null],
-    ["claude", ""],
-    ["claude", "claude-opus-5-5[1m]"],
-    ["opencode", "anthropic/claude-sonnet-5-5"],
-    ["claude", "-opus"],
-    ["claude", "opus-"],
-    ["claude", "opus."],
-    ["claude", ".opus"],
-    ["claude", "opus 5"],
-    ["claude", "opus_5"],
-    ["claude_gateway", "glm-5.3"],
-    ["", "glm-5.3"],
-    ["codex", "gpt-6\nx-injected: 1"],
-    ["codex", "x".repeat(123)],
-    ["codex", "\u212Aimi"],
-  ])("member of %s and %j is not representable", (provider, model) => {
-    expect(formatMcpGatewayMember(provider, model)).toBeNull();
-  });
-
-  test("a member is at most 128 characters", () => {
-    expect(formatMcpGatewayMember("codex", "x".repeat(123))).toBeNull();
-    expect(formatMcpGatewayMember("codex", "x".repeat(122))).toBe(`codex/${"x".repeat(122)}`);
+    const headers = upstream.requests[0]!.headers;
+    expect(headers["x-paseo-agent-id"]).toBe("agent-a");
+    expect(headers).not.toHaveProperty("x-paseo-member");
+    expect(headers).not.toHaveProperty("x-paseo-role");
   });
 
   test("another agent's token acts only as that other agent", async () => {

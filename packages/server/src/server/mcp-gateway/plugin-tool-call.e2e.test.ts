@@ -118,7 +118,6 @@ const IDENTITY_HEADERS = [
   "x-paseo-session-id",
   "x-paseo-workspace-id",
   "x-paseo-server-id",
-  "x-paseo-member",
   "x-recorder-hook",
 ] as const;
 
@@ -301,7 +300,6 @@ async function runTurnWhileBackendDown(running: TestPaseoDaemon) {
     backend.down = true;
     const agent = await client.createAgent({
       provider: "codex",
-      model: "gpt-6-astra",
       cwd: directory,
       title: "Recorded",
     });
@@ -344,7 +342,6 @@ async function expectDrainSentEverythingAsTheAgent(input: {
   expect(identityOf(liveCall as RecordedRequest)).toMatchObject({
     "x-paseo-agent-id": agentId,
     "x-paseo-server-id": expect.any(String),
-    "x-paseo-member": "codex/gpt-6-astra",
     "x-recorder-hook": agentId,
   });
   expect(drainCalls.length).toBeGreaterThanOrEqual(seqs.length);

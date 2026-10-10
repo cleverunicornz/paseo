@@ -12,6 +12,7 @@ import pino from "pino";
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
+import { DEFAULT_SESSION_RUNTIME_CONFIG } from "../session-runtime-config.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type {
   AgentClient,
@@ -981,30 +982,15 @@ describe("agent MCP end-to-end (offline)", () => {
           },
         },
       };
-      const first = await daemon.agentManager.createAgent(
-        { ...gatewayConfig, model: "claude-opus-5-5" },
-        undefined,
-        { workspaceId: undefined },
-      );
+      const first = await daemon.agentManager.createAgent(gatewayConfig, undefined, {
+        workspaceId: undefined,
+      });
       const firstLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
-      const second = await daemon.agentManager.createAgent(
-        { ...gatewayConfig, model: "Claude-Sonnet-5-5" },
-        undefined,
-        { workspaceId: undefined },
-      );
+      const second = await daemon.agentManager.createAgent(gatewayConfig, undefined, {
+        workspaceId: undefined,
+      });
       const secondLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
-      // A model that cannot be written as a member sends no member at all.
-      const third = await daemon.agentManager.createAgent(
-        { ...gatewayConfig, model: "claude-opus-5-5[1m]" },
-        undefined,
-        { workspaceId: undefined },
-      );
-      const thirdLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
-      if (
-        firstLaunch?.type !== "http" ||
-        secondLaunch?.type !== "http" ||
-        thirdLaunch?.type !== "http"
-      ) {
+      if (firstLaunch?.type !== "http" || secondLaunch?.type !== "http") {
         throw new Error("Gateway MCP entry was not launched as HTTP");
       }
       expect(firstLaunch.url).toBe(`http://127.0.0.1:${port}/mcp/backends/cluster`);
@@ -1019,38 +1005,27 @@ describe("agent MCP end-to-end (offline)", () => {
             "content-type": "application/json",
             "X-Paseo-Agent-ID": "caller-supplied-agent",
             "X-Paseo-Server-ID": "caller-supplied-server",
-            "X-Paseo-Member": "codex/caller-supplied",
+            "X-Paseo-Member": "claude/caller-supplied",
+            "X-Paseo-Role": "validator",
           },
           body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
         });
       const firstResponse = await callAs(firstLaunch);
       const secondResponse = await callAs(secondLaunch);
-      const thirdResponse = await callAs(thirdLaunch);
       expect(firstResponse.status).toBe(200);
       expect(firstResponse.headers.get("mcp-session-id")).toBe("s1");
       expect(secondResponse.status).toBe(200);
-      expect(thirdResponse.status).toBe(200);
 
       const status = await fetch(`http://127.0.0.1:${port}/api/status`, {
         headers: { Authorization: "Bearer daemon-secret" },
       });
       const { serverId } = (await status.json()) as { serverId: string };
-      expect(seen.map((headers) => headers["x-paseo-agent-id"])).toEqual([
-        first.id,
-        second.id,
-        third.id,
-      ]);
-      expect(seen.map((headers) => headers["x-paseo-server-id"])).toEqual([
-        serverId,
-        serverId,
-        serverId,
-      ]);
-      expect(seen.map((headers) => headers["x-paseo-member"])).toEqual([
-        "claude/claude-opus-5-5",
-        "claude/claude-sonnet-5-5",
-        undefined,
-      ]);
+      expect(seen.map((headers) => headers["x-paseo-agent-id"])).toEqual([first.id, second.id]);
+      expect(seen.map((headers) => headers["x-paseo-server-id"])).toEqual([serverId, serverId]);
       expect(seen.every((headers) => headers.authorization === undefined)).toBe(true);
+      // Outside session mode the daemon sends no member or role, and the caller's do not pass.
+      expect(seen.every((headers) => headers["x-paseo-member"] === undefined)).toBe(true);
+      expect(seen.every((headers) => headers["x-paseo-role"] === undefined)).toBe(true);
 
       // Neither the daemon password nor a missing token reaches a backend.
       const withPassword = await fetch(firstLaunch.url, {
@@ -1070,7 +1045,118 @@ describe("agent MCP end-to-end (offline)", () => {
       await daemon.agentManager.closeAgent(first.id);
       const afterClose = await callAs(firstLaunch);
       expect(afterClose.status).toBe(401);
-      expect(seen).toHaveLength(3);
+      expect(seen).toHaveLength(2);
+    } finally {
+      await daemon.stop();
+      backend.closeAllConnections();
+      await new Promise<void>((resolve) => backend.close(() => resolve()));
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+      await rm(agentCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+  test("in session mode every agent reaches a gateway backend as the session's member and role", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const recorder: LaunchRecorder = { recordedLaunches: [] };
+
+    const seen: http.IncomingHttpHeaders[] = [];
+    const backend = http.createServer(recordHeadersAndAnswer(seen));
+    await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+    const backendPort = (backend.address() as net.AddressInfo).port;
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createMcpRecordingAgentClients(recorder, { supportsMcpServers: true }),
+        agentStoragePath: path.join(paseoHome, "agents"),
+        auth: { password: hashDaemonPassword("daemon-secret") },
+        mcpGatewayBackends: { cluster: { url: `http://127.0.0.1:${backendPort}/mcp` } },
+        sessionRuntime: {
+          ...DEFAULT_SESSION_RUNTIME_CONFIG,
+          identity: { member: "claude/claude-opus-5-5", role: "implementer" },
+        },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+
+    try {
+      const gatewayConfig: AgentSessionConfig = {
+        provider: "claude",
+        cwd: agentCwd,
+        mcpServers: {
+          cluster: {
+            type: "http",
+            url: "{paseoMcpGatewayUrl}/cluster",
+            headers: { Authorization: "Bearer {paseoAgentToken}" },
+          },
+        },
+      };
+      const create = (model: string) =>
+        daemon.agentManager.createAgent({ ...gatewayConfig, model }, undefined, {
+          workspaceId: undefined,
+        });
+      const first = await create("claude-opus-5-5");
+      const firstLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
+      const second = await create("Claude-Opus-5-5");
+      const secondLaunch = recorder.recordedLaunches.at(-1)?.mcpServers?.cluster;
+      if (firstLaunch?.type !== "http" || secondLaunch?.type !== "http") {
+        throw new Error("Gateway MCP entry was not launched as HTTP");
+      }
+
+      // Another model, or the member's [1m] variant, does not launch, and a running agent cannot switch to one.
+      const refusal =
+        "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-opus-5-5[1m]. A different model needs a new session.";
+      await expect(create("claude-opus-5-5[1m]")).rejects.toThrow(refusal);
+      await expect(create("claude-sonnet-5-5")).rejects.toThrow(
+        "This session's member is claude/claude-opus-5-5.",
+      );
+      await expect(daemon.agentManager.setAgentModel(first.id, "claude-sonnet-5-5")).rejects.toThrow(
+        "A different model needs a new session.",
+      );
+      expect(recorder.recordedLaunches).toHaveLength(2);
+
+      const callAs = (launch: { url: string; headers?: Record<string, string> }) =>
+        fetch(launch.url, {
+          method: "POST",
+          headers: {
+            ...launch.headers,
+            "content-type": "application/json",
+            "X-Paseo-Member": "codex/caller-supplied",
+            "X-Paseo-Role": "infra",
+          },
+          body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+        });
+      expect((await callAs(firstLaunch)).status).toBe(200);
+      expect((await callAs(secondLaunch)).status).toBe(200);
+      // A reloaded agent still calls as the session's member.
+      await daemon.agentManager.reloadAgentSession(first.id);
+      expect((await callAs(firstLaunch)).status).toBe(200);
+
+      expect(seen.map((headers) => headers["x-paseo-agent-id"])).toEqual([
+        first.id,
+        second.id,
+        first.id,
+      ]);
+      expect(seen.map((headers) => headers["x-paseo-member"])).toEqual([
+        "claude/claude-opus-5-5",
+        "claude/claude-opus-5-5",
+        "claude/claude-opus-5-5",
+      ]);
+      expect(seen.map((headers) => headers["x-paseo-role"])).toEqual([
+        "implementer",
+        "implementer",
+        "implementer",
+      ]);
     } finally {
       await daemon.stop();
       backend.closeAllConnections();

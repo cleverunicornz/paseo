@@ -11866,3 +11866,89 @@ test("failed startup history closes the session without registering an agent", a
     for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
   }
 });
+
+test("in session mode an agent launches, switches and reloads only as the session's member", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-session-member-"));
+  const codex = new TestAgentClient("codex");
+  const manager = new AgentManager({
+    clients: { codex, claude: new TestAgentClient("claude") },
+    sessionMember: "codex/gpt-5.4",
+    logger,
+  });
+  const refusal =
+    /^This session's member is codex\/gpt-5\.4\. .+ A different model needs a new session\.$/;
+  const create = (config: Omit<AgentSessionConfig, "cwd">) =>
+    manager.createAgent({ ...config, cwd: workdir }, undefined, { workspaceId: undefined });
+  try {
+    // A mixed-case model id is the member once lowercased; so is the provider's default model.
+    const agent = await create({ provider: "codex", model: "GPT-5.4" });
+    await create({ provider: "codex" });
+    expect(codex.createdConfigs.map((config) => config.model)).toEqual(["GPT-5.4", "gpt-5.4"]);
+
+    // Another model, another provider, and a suffixed variant of the member are all refused.
+    for (const config of [
+      { provider: "codex", model: "gpt-5.4-mini" },
+      { provider: "codex", model: "gpt-5.4[1m]" },
+      { provider: "claude", model: "gpt-5.4" },
+    ]) {
+      await expect(create(config)).rejects.toThrow(refusal);
+    }
+    await expect(
+      manager.resumeAgentFromPersistence(
+        { provider: "codex", sessionId: "other-model", metadata: { cwd: workdir } },
+        { model: "gpt-5.4-mini" },
+      ),
+    ).rejects.toThrow(refusal);
+    expect(codex.createdConfigs).toHaveLength(2);
+    expect(codex.resumeOverrides).toHaveLength(0);
+
+    // Switching a running agent away from the member is refused and changes nothing.
+    await expect(manager.setAgentModel(agent.id, "gpt-5.4-mini")).rejects.toThrow(refusal);
+    await expect(manager.setAgentModel(agent.id, "gpt-5.4[1m]")).rejects.toThrow(refusal);
+    await expect(manager.setAgentModel(agent.id, null)).rejects.toThrow(refusal);
+    expect(manager.getAgent(agent.id)?.config.model).toBe("GPT-5.4");
+    await manager.setAgentModel(agent.id, "gpt-5.4");
+    expect(manager.getAgent(agent.id)?.config.model).toBe("gpt-5.4");
+
+    // Reloading keeps the member; reloading onto another model is refused and leaves the agent running.
+    await expect(manager.reloadAgentSession(agent.id, { model: "gpt-5.4-mini" })).rejects.toThrow(
+      refusal,
+    );
+    expect(manager.getAgent(agent.id)).toMatchObject({
+      lifecycle: "idle",
+      config: { model: "gpt-5.4" },
+    });
+    const reloaded = await manager.reloadAgentSession(agent.id);
+    expect(reloaded.config.model).toBe("gpt-5.4");
+  } finally {
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("outside session mode an agent launches and switches to any model", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-no-session-member-"));
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient("codex"), claude: new TestAgentClient("claude") },
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, model: "gpt-5.4-mini" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.createAgent(
+      { provider: "claude", cwd: workdir, model: "gpt-5.4[1m]" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.setAgentModel(agent.id, "gpt-5.2-codex");
+    expect(manager.getAgent(agent.id)?.config.model).toBe("gpt-5.2-codex");
+    const reloaded = await manager.reloadAgentSession(agent.id, { model: "gpt-5.4" });
+    expect(reloaded.config.model).toBe("gpt-5.4");
+  } finally {
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
