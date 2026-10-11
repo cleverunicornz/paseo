@@ -7,7 +7,12 @@ import type { PluginMcpGatewayUpstreamRequest } from "@getpaseo/plugin/server";
 
 import { extractHttpBearerToken } from "../auth.js";
 import { MCP_GATEWAY_BACKEND_NAME_PATTERN, type McpGatewayBackend } from "./backends.js";
-import { EventStreamRelay, JsonRpcIdScanner, type JsonRpcId } from "./refusal-stream.js";
+import {
+  EventStreamRelay,
+  JsonRpcIdScanner,
+  MAX_REQUEST_ID_CHARS,
+  type RequestIdRead,
+} from "./refusal-stream.js";
 import type { SessionIdentity } from "../session-runtime-config.js";
 
 export type McpGatewayUpstreamRequest = PluginMcpGatewayUpstreamRequest;
@@ -318,34 +323,61 @@ function isEventStream(headers: IncomingHttpHeaders): boolean {
   return (headers["content-type"] ?? "").toLowerCase().startsWith("text/event-stream");
 }
 
-function refusalEvent(id: JsonRpcId, refusal: string): string {
-  const error = { jsonrpc: "2.0", id, error: { code: MCP_GATEWAY_REFUSAL_CODE, message: refusal } };
-  return `event: message\ndata: ${JSON.stringify(error)}\n\n`;
+/**
+ * The most of one event-stream event the gateway holds back for an agent in
+ * session mode while waiting for the blank line that ends it, the same bound
+ * as a finite answer. Over it the event is dropped and the stream ends with an
+ * error for each request.
+ */
+export const MAX_HELD_EVENT_BYTES = 16 * 1024 * 1024;
+
+/** The JSON-RPC error that ends an event stream the gateway cannot pass on. */
+interface StreamEndError {
+  code: number;
+  message: string;
 }
 
 /**
- * Ends an event-stream answer already under way with the refusal as the
- * JSON-RPC error of each request the body carries, so the caller fails the
- * request rather than reading a stream that broke off. The relay passed on
- * whole events only, so the refusal starts at an event boundary. The ids come
- * from the whole body: when it is still arriving, the stream ends once they
- * are read, or after `waitMs`. A body with no id (a notification, a GET
- * stream) has no request to fail, and its stream just ends.
+ * One request's error event. An id longer than the gateway keeps is named
+ * `null` with Invalid Request, the only answer JSON-RPC 2.0 gives a request
+ * whose id could not be read.
  */
-function endWithRefusal(input: {
+function errorEvent(read: RequestIdRead, error: StreamEndError): string {
+  const named =
+    read.id === null
+      ? {
+          code: -32600,
+          message: `Invalid Request: its id is longer than the ${MAX_REQUEST_ID_CHARS / (1024 * 1024)} MiB the gateway reads. ${error.message}`,
+        }
+      : error;
+  return `event: message\ndata: {"jsonrpc":"2.0","id":${read.json},"error":${JSON.stringify(named)}}\n\n`;
+}
+
+/**
+ * Ends an event-stream answer already under way with `error` as the JSON-RPC
+ * error of each request the body carries, so the caller fails the request
+ * rather than reading a stream that broke off. The relay passed on whole
+ * events only, so the error starts at an event boundary. The ids come from the
+ * body: when it is still arriving, the stream ends once they are read, or
+ * after `waitMs`. Of a complete body's duplicate `id` members the last counts,
+ * as with JSON.parse; while the body still arrives, the first one read names
+ * the request. A body with no id (a notification, a GET stream) has no
+ * request to fail, and its stream just ends.
+ */
+function endWithError(input: {
   req: express.Request;
   res: express.Response;
   ids: JsonRpcIdScanner;
-  refusal: string;
+  error: StreamEndError;
   waitMs: number;
 }): void {
-  const { req, res, ids, refusal } = input;
+  const { req, res, ids, error } = input;
   let timer: NodeJS.Timeout | undefined;
   const finish = () => {
     clearTimeout(timer);
     req.off("data", whenSettled);
     if (res.writableEnded || res.destroyed) return;
-    res.end(ids.ids.map((id) => refusalEvent(id, refusal)).join(""));
+    res.end(ids.requests.map((read) => errorEvent(read, error)).join(""));
   };
   const whenSettled = () => {
     if (ids.settled) finish();
@@ -363,27 +395,40 @@ function endWithRefusal(input: {
 
 /**
  * Relays an event-stream answer in whole events, so a refusal never completes
- * or breaks an event the caller has only part of.
+ * or breaks an event the caller has only part of. An event that grows past
+ * `MAX_HELD_EVENT_BYTES` before its blank line is dropped and `onOversized`
+ * ends the stream.
  */
-function relayWholeEvents(
-  upstreamResponse: http.IncomingMessage,
-  res: express.Response,
-  isCut: () => boolean,
-): EventStreamRelay {
+function relayWholeEvents(input: {
+  upstreamResponse: http.IncomingMessage;
+  res: express.Response;
+  isCut: () => boolean;
+  onOversized: () => void;
+}): EventStreamRelay {
+  const { upstreamResponse, res, isCut } = input;
   const events = new EventStreamRelay();
+  let oversized = false;
+  const stopped = () => oversized || isCut();
   upstreamResponse.on("data", (chunk: Buffer) => {
-    if (isCut()) return;
+    if (stopped()) return;
     const whole = events.take(chunk);
+    if (events.heldBytes > MAX_HELD_EVENT_BYTES) {
+      oversized = true;
+      events.drop();
+      if (whole.length > 0) res.write(whole);
+      input.onOversized();
+      return;
+    }
     if (whole.length > 0 && !res.write(whole)) {
       upstreamResponse.pause();
       res.once("drain", () => upstreamResponse.resume());
     }
   });
   upstreamResponse.on("end", () => {
-    if (!isCut()) res.end(events.rest());
+    if (!stopped()) res.end(events.rest());
   });
   upstreamResponse.on("error", () => {
-    if (!isCut()) res.destroy();
+    if (!stopped()) res.destroy();
   });
   return events;
 }
@@ -391,37 +436,54 @@ function relayWholeEvents(
 /**
  * Holds a finite answer until it is whole and sends it only if `isCut` is
  * still false then, so a refusal before the answer is complete still decides
- * the caller's status. An answer over `MAX_HELD_ANSWER_BYTES` is refused.
+ * the caller's status. An answer over `MAX_HELD_ANSWER_BYTES` is refused, and
+ * one whose backend sends no byte for `idleMs` ends in 504: the backend had
+ * the same time to send its head, and a finite answer under way has no reason
+ * to pause longer than that. Neither passes on anything of the answer.
  */
 function sendWholeAnswer(input: {
   upstreamResponse: http.IncomingMessage;
   res: express.Response;
   isCut: () => boolean;
   backend: string;
-  abandon: () => void;
+  idleMs: number;
+  abandon: (reason: string) => void;
 }): void {
   const { upstreamResponse, res, isCut, backend } = input;
   const chunks: Buffer[] = [];
   let held = 0;
-  let oversized = false;
-  const settled = () => oversized || isCut();
+  let given = false;
+  const settled = () => given || isCut();
+  const giveUp = (status: number, message: string) => {
+    given = true;
+    clearTimeout(idle);
+    chunks.length = 0;
+    input.abandon(message);
+    sendError(res, status, message);
+  };
+  const stalled = () => {
+    if (!settled()) {
+      giveUp(504, `MCP backend ${backend} stopped sending its answer for ${input.idleMs} ms`);
+    }
+  };
+  let idle = setTimeout(stalled, input.idleMs);
+  res.once("close", () => clearTimeout(idle));
   upstreamResponse.on("data", (chunk: Buffer) => {
-    if (oversized) return;
+    if (settled()) return;
+    clearTimeout(idle);
     held += chunk.length;
-    if (held <= MAX_HELD_ANSWER_BYTES) {
-      chunks.push(chunk);
+    if (held > MAX_HELD_ANSWER_BYTES) {
+      giveUp(
+        502,
+        `MCP backend ${backend} answered more than 16 MiB; in session mode an answer is held whole before it is passed on, up to 16 MiB`,
+      );
       return;
     }
-    oversized = true;
-    chunks.length = 0;
-    input.abandon();
-    sendError(
-      res,
-      502,
-      `MCP backend ${backend} answered more than 16 MiB; in session mode an answer is held whole before it is passed on, up to 16 MiB`,
-    );
+    chunks.push(chunk);
+    idle = setTimeout(stalled, input.idleMs);
   });
   upstreamResponse.on("end", () => {
+    clearTimeout(idle);
     if (settled() || res.headersSent || res.destroyed) return;
     res.writeHead(
       upstreamResponse.statusCode ?? 502,
@@ -431,6 +493,7 @@ function sendWholeAnswer(input: {
     res.end(Buffer.concat(chunks));
   });
   upstreamResponse.on("error", () => {
+    clearTimeout(idle);
     if (!settled()) sendError(res, 502, `MCP backend ${backend} is unreachable`);
   });
 }
@@ -569,7 +632,13 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       upstreamRequest.destroy();
       if (relayed) {
         relayed.drop();
-        endWithRefusal({ req, res, ids, refusal: reason, waitMs: responseTimeoutMs });
+        endWithError({
+          req,
+          res,
+          ids,
+          error: { code: MCP_GATEWAY_REFUSAL_CODE, message: reason },
+          waitMs: responseTimeoutMs,
+        });
       } else {
         sendError(res, 403, reason);
       }
@@ -592,12 +661,10 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
           res,
           isCut: () => cutOff,
           backend,
-          abandon: () => {
+          idleMs: responseTimeoutMs,
+          abandon: (why) => {
             abandoned = true;
-            logger.warn(
-              { backend, agentId: agent.agentId },
-              "MCP backend answer over 16 MiB refused",
-            );
+            logger.warn({ backend, agentId: agent.agentId, why }, "MCP backend answer refused");
             upstreamRequest.destroy();
           },
         });
@@ -610,7 +677,31 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       );
       res.flushHeaders();
       if (settlesAnswers) {
-        relayed = relayWholeEvents(upstreamResponse, res, () => cutOff);
+        relayed = relayWholeEvents({
+          upstreamResponse,
+          res,
+          isCut: () => cutOff,
+          onOversized: () => {
+            abandoned = true;
+            logger.warn(
+              { backend, agentId: agent.agentId },
+              "MCP backend event over 16 MiB refused",
+            );
+            req.unpipe(upstreamRequest);
+            upstreamRequest.destroy();
+            endWithError({
+              req,
+              res,
+              ids,
+              error: {
+                code: -32603,
+                message: `MCP backend ${backend} sent an event of more than 16 MiB; in session mode an event is held whole before it is passed on, up to 16 MiB`,
+              },
+              waitMs: responseTimeoutMs,
+            });
+            req.resume();
+          },
+        });
         return;
       }
       upstreamResponse.on("error", () => {
