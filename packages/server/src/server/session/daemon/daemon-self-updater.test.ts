@@ -1,11 +1,18 @@
-import { describe, expect, test } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { describe, expect, onTestFinished, test } from "vitest";
 import {
   DaemonSelfUpdateInProgressError,
   DaemonSelfUpdater,
   type DaemonSelfUpdateRuntime,
   type DaemonSelfUpdatePhase,
 } from "./daemon-self-updater.js";
-import type { CommandResult, NpmGlobalPaseoInstall } from "./npm-global-cli.js";
+import {
+  DefaultNpmGlobalPaseoCli,
+  type CommandResult,
+  type NpmGlobalPaseoInstall,
+} from "./npm-global-cli.js";
 
 interface TestLogger {
   errors: Array<{ obj: object; msg?: string }>;
@@ -100,6 +107,48 @@ async function runUpdate(input: {
 }
 
 describe("DaemonSelfUpdater", () => {
+  // This fork's daemons are installed by their release installer and never update through npm.
+  test("probes the running install's prefix when npm defaults elsewhere, then refuses to install over the release", async () => {
+    const prefix = mkdtempSync(path.join(tmpdir(), "custom npm prefix "));
+    onTestFinished(() => rmSync(prefix, { recursive: true, force: true }));
+    const root = process.platform === "win32" ? prefix : path.join(prefix, "lib");
+    const packagePath = path.join(root, "node_modules", "@getpaseo", "cli");
+    mkdirSync(packagePath, { recursive: true });
+    const commands: string[][] = [];
+    let version = "0.1.15";
+    const npm = new DefaultNpmGlobalPaseoCli(async (_command, args) => {
+      commands.push(args);
+      if (args[args.indexOf("--prefix") + 1] !== prefix) {
+        return { exitCode: 1, stdout: "{}", stderr: "No CLI in npm's default prefix" };
+      }
+      if (args.includes("install")) version = "0.1.96";
+      return {
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({
+          path: root,
+          dependencies: { "@getpaseo/cli": { version, path: packagePath } },
+        }),
+      };
+    });
+    const { result } = await runUpdate({
+      runtime: {
+        npm,
+        installOrigin: {
+          resolveCurrentServerPackageRoot: () =>
+            path.join(packagePath, "node_modules", "@getpaseo", "server"),
+        },
+      },
+    });
+    expect(result).toEqual({
+      success: false,
+      error:
+        "This daemon is managed by its release installer. Update the installed release on the host.",
+      newVersion: null,
+    });
+    expect(commands.map((args) => args.slice(-2))).toEqual([["--prefix", prefix]]);
+  });
+
   test("refuses a Desktop-managed daemon without touching npm", async () => {
     const calls: RuntimeCall[] = [];
     const runtime = createRuntime({ calls, inspections: [] });

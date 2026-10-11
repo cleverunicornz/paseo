@@ -19,6 +19,7 @@ import { MCP_GATEWAY_BACKEND_URL_PATTERN } from "../../mcp-gateway/backends.js";
 export const lifecycleEventNames = [
   "agent.created",
   "agent.timeline_item",
+  "agent.closed",
   "agent.turn_started",
   "agent.turn_ended",
   "agent.permission_requested",

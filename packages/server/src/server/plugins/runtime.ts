@@ -1,3 +1,9 @@
+import type { UsageScope } from "@getpaseo/plugin/server/usage";
+import {
+  ProviderStatusSchema,
+  type ProviderStatus,
+  type ProviderStatusRequest,
+} from "@getpaseo/plugin/server/provider";
 import type { PluginBeforeRequests, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { validateBeforeRequest, validateBeforeResult } from "./lifecycle/index.js";
 import { fork } from "node:child_process";
@@ -26,9 +32,12 @@ import type {
   PluginProviderMetadata,
   PluginStopReadinessCapabilities,
   PluginStopReadinessOperation,
+  PluginUsageSourceMetadata,
 } from "./plugin-process-protocol.js";
 import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
 import { PluginSessionSocket } from "./session-socket.js";
+import { InternalPluginChild } from "./internal-child.js";
+import { evaluateBundle } from "./bundle-evaluator.js";
 import {
   TimelineDeliveryLedger,
   type TimelineDelivery,
@@ -92,6 +101,7 @@ interface LoadedPlugin {
   hooks: { events: string[]; before: string[] };
   providers: readonly PluginProviderMetadata[];
   stopReadiness: PluginStopReadinessCapabilities;
+  usageSources: readonly PluginUsageSourceMetadata[];
   child: PluginChild | null;
   outputCapture: PluginOutputCapture | null;
   pending: Map<string, PendingInvocation>;
@@ -313,6 +323,7 @@ async function resolveEntryPaths(directory: string): Promise<{
 
 export class PluginRuntime {
   private readonly plugins = new Map<string, LoadedPlugin>();
+  private readonly pendingEvents = new Set<Promise<void>>();
   private readonly logTails = new Map<string, PluginLogTail>();
   private readonly logger: pino.Logger;
   private readonly spawnChild: () => PluginChild;
@@ -366,6 +377,29 @@ export class PluginRuntime {
     this.appendLog(pluginId, "stdout", "[paseo] Plugin ready");
   }
 
+  async startBuiltinPlugin(input: { id: string; directory: string }): Promise<void> {
+    if (this.plugins.has(input.id)) throw new Error(`Plugin is already running: ${input.id}`);
+    this.appendLog(input.id, "stdout", "[paseo] Loading plugin");
+    const directory = path.resolve(input.directory);
+    const manifest = await readPluginManifest(directory);
+    if (manifest.id !== input.id) {
+      throw new Error(`Built-in plugin ${input.id} has manifest ID ${manifest.id}`);
+    }
+    assertPluginCompatibility({ ...manifest, version: this.daemonVersion, runtime: "daemon" });
+    const bundles = await compilePlugin(await resolveEntryPaths(directory));
+    if (!bundles.serverBundle) throw new Error(`Built-in plugin ${input.id} needs a server entry`);
+    const loaded = await this.launchPlugin({
+      pluginId: input.id,
+      pluginDirectory: directory,
+      requirements: manifest.requirements,
+      child: new InternalPluginChild(evaluateBundle(bundles.serverBundle)),
+      bundle: "",
+      clientBundle: bundles.clientBundle ?? "",
+    });
+    this.plugins.set(input.id, loaded);
+    this.appendLog(input.id, "stdout", "[paseo] Plugin ready");
+  }
+
   async validatePlugin(configuredPath: string): Promise<void> {
     const directory = path.resolve(configuredPath);
     const manifest = await readPluginManifest(directory);
@@ -391,6 +425,44 @@ export class PluginRuntime {
 
   getProviderRegistrations(pluginId: string): readonly PluginProviderMetadata[] {
     return this.plugins.get(pluginId)?.providers ?? [];
+  }
+
+  getUsageSourceRegistrations(pluginId: string): readonly PluginUsageSourceMetadata[] {
+    return this.plugins.get(pluginId)?.usageSources ?? [];
+  }
+
+  fetchUsage(pluginId: string, sourceId: string, input: unknown): Promise<unknown> {
+    const loaded = this.plugins.get(pluginId);
+    if (!loaded) throw new Error(`Plugin is not available: ${pluginId}`);
+    return this.request(loaded, { type: "usage.fetch", requestId: randomUUID(), sourceId, input });
+  }
+
+  discoverUsage(pluginId: string, sourceId: string, scope: UsageScope): Promise<unknown> {
+    const loaded = this.plugins.get(pluginId);
+    if (!loaded) throw new Error(`Plugin is not available: ${pluginId}`);
+    return this.request(loaded, {
+      type: "usage.discover",
+      requestId: randomUUID(),
+      sourceId,
+      scope,
+    });
+  }
+
+  async getProviderStatus(
+    pluginId: string,
+    providerId: string,
+    request: ProviderStatusRequest,
+  ): Promise<ProviderStatus> {
+    const loaded = this.plugins.get(pluginId);
+    if (!loaded) throw new Error(`Plugin is not available: ${pluginId}`);
+    return ProviderStatusSchema.parse(
+      await this.request(loaded, {
+        type: "provider.status",
+        requestId: randomUUID(),
+        providerId,
+        request,
+      }),
+    );
   }
 
   async connectProvider(
@@ -488,19 +560,23 @@ export class PluginRuntime {
         this.deliverTimelineItem(loaded, event as PluginLifecycleEvents["agent.timeline_item"]);
         continue;
       }
-      void this.request(loaded, {
+      const request = this.request(loaded, {
         type: "hook",
         requestId: randomUUID(),
         kind: "event",
         name,
         input: event,
-      }).catch((error) => {
-        this.appendLog(
-          loaded.id,
-          "stderr",
-          `Lifecycle hook ${name} failed: ${describeError(error)}`,
-        );
-      });
+      })
+        .then(() => undefined)
+        .catch((error) => {
+          this.appendLog(
+            loaded.id,
+            "stderr",
+            `Lifecycle hook ${name} failed: ${describeError(error)}`,
+          );
+        });
+      this.pendingEvents.add(request);
+      void request.finally(() => this.pendingEvents.delete(request));
     }
   }
 
@@ -665,6 +741,10 @@ export class PluginRuntime {
       .catch(() => undefined);
   }
 
+  async drainEvents(): Promise<void> {
+    await Promise.all(this.pendingEvents);
+  }
+
   async before<Name extends keyof PluginBeforeRequests>(
     name: Name,
     input: PluginBeforeRequests[Name],
@@ -770,6 +850,7 @@ export class PluginRuntime {
         hooks: { events: [], before: [] },
         providers: [],
         stopReadiness: NO_STOP_READINESS,
+        usageSources: [],
         child: null,
         outputCapture: null,
         pending: new Map(),
@@ -779,9 +860,27 @@ export class PluginRuntime {
         sessionClosed: null,
       };
     }
+    return this.launchPlugin({
+      pluginId,
+      pluginDirectory: directory,
+      requirements: manifest.requirements,
+      child: this.spawnChild(),
+      bundle: serverBundle,
+      clientBundle: bundles.clientBundle ?? "",
+    });
+  }
+
+  private async launchPlugin(input: {
+    pluginId: string;
+    pluginDirectory: string;
+    requirements: PluginRequirements | undefined;
+    child: PluginChild;
+    bundle: string;
+    clientBundle: string;
+  }): Promise<LoadedPlugin> {
+    const { pluginId, requirements, child, bundle, clientBundle } = input;
     const sessionHost = this.sessionHost;
     if (!sessionHost) throw new Error("Plugin Paseo session host is not attached");
-    const child = this.spawnChild();
     const outputCapture = new PluginOutputCapture(child, (stream, message) => {
       this.appendLog(pluginId, stream, message);
     });
@@ -857,8 +956,9 @@ export class PluginRuntime {
           void send(child, {
             type: "initialize",
             pluginId,
+            pluginDirectory: input.pluginDirectory,
             appVersion: this.daemonVersion,
-            bundle: serverBundle,
+            bundle,
             settingsDirectory: this.dependencies.settingsDirectory
               ? path.join(this.dependencies.settingsDirectory, pluginId)
               : undefined,
@@ -873,12 +973,13 @@ export class PluginRuntime {
     }
     loaded = {
       id: pluginId,
-      clientBundle: bundles.clientBundle ?? "",
-      requirements: manifest.requirements,
+      clientBundle,
+      requirements,
       methods: new Set(ready.methods),
       hooks: ready.hooks ?? { events: [], before: [] },
       providers: ready.providers ?? [],
       stopReadiness: ready.stopReadiness ?? NO_STOP_READINESS,
+      usageSources: ready.usageSources ?? [],
       child,
       outputCapture,
       pending,

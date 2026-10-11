@@ -59,11 +59,11 @@ export function probeHarnessExecutable(
   executablePath: string,
   env: HarnessSpawnEnv,
 ): Promise<boolean> {
-  return probeExecutable(executablePath, undefined, env);
+  return probeExecutable(executablePath, { spawnEnv: env });
 }
 
 export function findHarnessExecutable(name: string, env: HarnessSpawnEnv): Promise<string | null> {
-  return findExecutable(name, undefined, env);
+  return findExecutable(name, { spawnEnv: env });
 }
 
 /** `defaultBinary.resolvePath`, when set, probes with the same `env`. */

@@ -1,4 +1,11 @@
 export type {
+  UsageSourceRegistration,
+  UsageReport,
+  UsageWindow,
+  UsageBalance,
+  UsageDetail,
+} from "./usage.js";
+export type {
   PluginHandlerContext,
   PluginServerContext,
   PluginServerContribution,
@@ -26,3 +33,5 @@ export type {
   PluginWipStopReadiness,
 } from "./stop-readiness.js";
 export type { PluginMcpApi, PluginMcpToolCall, PluginMcpToolResult } from "./mcp.js";
+
+export { spawnProcess, execCommand, terminateProcess } from "./process.js";

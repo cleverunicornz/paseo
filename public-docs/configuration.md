@@ -153,7 +153,7 @@ Daemon logging uses separate console and file sinks by default:
 
 - Console: `info` and above
 - File (`$PASEO_HOME/daemon.log`): `trace` and above
-- File rotation: `10m` max file size, `2` retained files total (active + 1 rotated)
+- File rotation: `10m` max file size, `3` rotated files kept alongside the active file
 
 ```json
 {
@@ -167,7 +167,7 @@ Daemon logging uses separate console and file sinks by default:
       "path": "daemon.log",
       "rotate": {
         "maxSize": "10m",
-        "maxFiles": 2
+        "maxFiles": 3
       }
     }
   }
