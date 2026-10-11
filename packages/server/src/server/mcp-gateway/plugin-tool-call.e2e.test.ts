@@ -7,7 +7,12 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import pino from "pino";
+import { ClaudeAgentClient } from "../agent/providers/claude/agent.js";
+import { DEFAULT_SESSION_RUNTIME_CONFIG } from "../session-runtime-config.js";
+import { claudeQueryReportingModel } from "../test-utils/claude-model-report-query.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
+import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 
 interface RecordedRequest {
@@ -396,4 +401,153 @@ test("items whose send failed are offered again at the shutdown drain and reach 
       .sort((a, b) => a - b),
   ).toEqual([...seqs].sort((a, b) => a - b));
   await expectDrainSentEverythingAsTheAgent({ agentId, closedEarlyId, seqs, logged });
+}, 60_000);
+
+const SONNET_REFUSAL =
+  "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.";
+
+/**
+ * A plugin whose `agent.closed` hook calls the `memory` backend for the agent
+ * that closed, and whose stop-readiness drain calls again for the agent named
+ * in `refused-agent.txt`. Its upstream hook logs every agent it ran for.
+ */
+async function writeClosedHookCaller(): Promise<void> {
+  const file = (name: string) => JSON.stringify(path.join(directory, name));
+  await writeFile(
+    path.join(directory, "paseo-plugin.json"),
+    JSON.stringify({ id: "closed-hook", requirements: { paseo: ">=0.8.0" } }),
+  );
+  await writeFile(
+    path.join(directory, "index.server.ts"),
+    `
+import { appendFileSync, readFileSync } from "node:fs";
+const log = (value) => appendFileSync(${file("events.log")}, JSON.stringify(value) + "\\n");
+const whoami = (agentId) =>
+  server.mcp.callTool({ backend: "memory", tool: "whoami", onBehalfOf: agentId });
+let server;
+export default function contribute(context) {
+  server = context;
+  server.before("mcp_gateway.upstream", ({ request }) => {
+    log({ upstreamHookFor: request.agentId });
+    return request;
+  });
+  server.on("agent.closed", async (event) => {
+    try {
+      await whoami(event.agent.id);
+      log({ closedHookCalledFor: event.agent.id, accepted: true });
+    } catch (error) {
+      log({ closedHookCalledFor: event.agent.id, refused: String(error) });
+    }
+  });
+  server.registerStopReadiness({
+    readiness: () => ({
+      ready: false,
+      timeline: { ready: false, epoch: null, emitted_through: null, acknowledged_through: null },
+      wip: { ready: false },
+    }),
+    drain: async () => {
+      const agentId = readFileSync(${file("refused-agent.txt")}, "utf8");
+      try {
+        await whoami(agentId);
+        log({ drainCalledFor: agentId, accepted: true });
+      } catch (error) {
+        log({ drainCalledFor: agentId, refused: String(error) });
+      }
+    },
+  });
+  return () => {};
+}
+`,
+  );
+}
+
+// What the hook cannot do is reach the gateway as the refused agent. A plugin can still resume
+// the agent through its Paseo API; the resumed session runs the member it launches with and is
+// judged anew on what its runtime reports (agent-manager.ts, sessionMemberRefusals).
+test("a refused agent's agent.closed hook gets no gateway identity for it and the gateway forwards nothing for it", async () => {
+  await writeClosedHookCaller();
+  // Claude Code reports Sonnet whatever it was launched with; the session's member is Opus.
+  const launches: string[] = [];
+  const claude = new ClaudeAgentClient({
+    logger: pino({ level: "silent" }),
+    resolveBinary: async () => "/fixture/claude",
+    queryFactory: claudeQueryReportingModel("claude-sonnet-5-5", launches) as never,
+  });
+  const agentClients = createTestAgentClients();
+  agentClients.claude!.createSession = claude.createSession.bind(claude);
+  const running = await startDaemon({
+    agentClients,
+    sessionRuntime: {
+      ...DEFAULT_SESSION_RUNTIME_CONFIG,
+      timelineDrainMs: 30_000,
+      identity: { member: "claude/claude-opus-5-5", role: "implementer" },
+    },
+  });
+  const manager = running.daemon.agentManager;
+  const callGateway = (token: string) =>
+    fetch(`http://127.0.0.1:${running.port}/mcp/backends/memory`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+    });
+  const forwardedFor = (agentId: string) =>
+    backend.recorded.filter((request) => request.headers["x-paseo-agent-id"] === agentId);
+
+  const client = await connectClient(running);
+  let agentId: string;
+  let ownToken: string;
+  try {
+    await client.patchDaemonConfig({ pluginsEnabled: true });
+    await client.installDirectoryPlugin(directory);
+    const agent = await manager.createAgent(
+      { provider: "claude", cwd: directory, model: "claude-opus-5-5" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    agentId = agent.id;
+    ownToken = manager.issueAgentToken(agentId);
+    // While the agent runs the member, the gateway forwards its calls.
+    expect((await callGateway(ownToken)).status).toBe(200);
+    expect(forwardedFor(agentId)).toHaveLength(1);
+
+    await expect(manager.runAgent(agentId, "/model claude-sonnet-5-5")).rejects.toThrow(
+      SONNET_REFUSAL,
+    );
+    await expect
+      .poll(async () => (await readLogged()).some((entry) => "closedHookCalledFor" in entry))
+      .toBe(true);
+  } finally {
+    await client.close();
+  }
+
+  expect(launches).toEqual(["claude-opus-5-5"]);
+  expect(manager.getAgent(agentId)).toBeNull();
+  expect(manager.getSessionMemberRefusal(agentId)).toBe(SONNET_REFUSAL);
+  // The hook could not call for the agent: the daemon issues no caller token for it.
+  expect(await readLogged()).toContainEqual({
+    closedHookCalledFor: agentId,
+    refused: expect.stringContaining(`No live agent ${agentId}`),
+  });
+  // Neither its own token nor a token minted for its id after the refusal is forwarded.
+  expect((await callGateway(ownToken)).status).toBe(401);
+  expect((await callGateway(manager.issueAgentToken(agentId))).status).toBe(401);
+
+  // The shutdown did not close the refused agent, so its drain cannot call for it either.
+  await writeFile(path.join(directory, "refused-agent.txt"), agentId);
+  const result = await shutDown(running);
+  expect(result.timelineDrain).toEqual({ status: "drained" });
+
+  const logged = await readLogged();
+  expect(logged).toContainEqual({
+    drainCalledFor: agentId,
+    refused: expect.stringContaining(`No live agent ${agentId}`),
+  });
+  expect(logged.some((entry) => "accepted" in entry)).toBe(false);
+  // The only call the backend and the upstream hook saw for the agent is the one before the refusal.
+  expect(forwardedFor(agentId)).toHaveLength(1);
+  expect(logged.filter((entry) => entry.upstreamHookFor === agentId)).toHaveLength(1);
 }, 60_000);
