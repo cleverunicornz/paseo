@@ -1070,12 +1070,15 @@ export async function createPaseoDaemon(
   pluginRuntime.bindGatewayToolCaller(
     createPluginGatewayToolCaller({
       getGatewayBaseUrl: () => createLoopbackDaemonUrl(boundListenTarget, MCP_GATEWAY_ROUTE),
-      // A refused agent's own token stays refused, live or not.
-      issueCallerToken: (agentId) =>
-        agentManager.getAgent(agentId) !== null &&
-        agentManager.getSessionMemberRefusal(agentId) === null
-          ? agentManager.issueAgentToken(agentId)
-          : drainGatewayCallers.issue(agentId),
+      issueCallerToken: (agentId, { delivering }) => {
+        const live = agentManager.getAgent(agentId) !== null;
+        // A refused agent's own token stays refused, live or not; a plugin gets a
+        // daemon-only token for it only to deliver its timeline items once it closed.
+        if (agentManager.getSessionMemberRefusal(agentId) !== null) {
+          return delivering && !live ? drainGatewayCallers.issue(agentId) : null;
+        }
+        return live ? agentManager.issueAgentToken(agentId) : drainGatewayCallers.issue(agentId);
+      },
     }),
   );
   // Control endpoints for whatever stops this daemon's host, behind the same

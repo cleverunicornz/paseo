@@ -86,6 +86,8 @@ export type PluginProcessMessage =
       arguments: Record<string, unknown>;
       onBehalfOf: string;
       timeoutMs: number;
+      /** The event hook the call is made from, when it is made from one. */
+      hookRequestId?: string;
     }
   | {
       type: "provider.connected";
@@ -257,6 +259,7 @@ export const PluginProcessMessageSchema: z.ZodType<PluginProcessMessage> = z.dis
         arguments: z.record(z.string(), z.unknown()),
         onBehalfOf: z.string().min(1),
         timeoutMs: z.number().int().min(1).max(600_000),
+        hookRequestId: z.string().min(1).optional(),
       })
       .strict(),
     z

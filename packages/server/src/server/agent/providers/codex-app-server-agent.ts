@@ -3479,6 +3479,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   /** The model Codex last said the thread runs, when it differs from the one Paseo set. */
   private reportedModel: string | null = null;
+  /** Codex's latest report of the model the thread runs, given to each new subscriber. */
+  private lastModelReport: AgentStreamEvent | null = null;
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
   private historyPending = false;
@@ -4069,6 +4071,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       const response = await this.client.request("thread/resume", params);
       this.rememberResolvedSandboxPolicy(response);
+      this.reportResumedThreadModel(response);
     } catch (error) {
       const threadId = this.currentThreadId;
       const message = error instanceof Error ? error.message : String(error);
@@ -4082,6 +4085,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         }
         const response = await this.client.request("thread/resume", params);
         this.rememberResolvedSandboxPolicy(response);
+        this.reportResumedThreadModel(response);
         this.logger.info({ threadId }, "Unarchived Codex thread to restore active Paseo agent");
         return;
       }
@@ -4534,6 +4538,10 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
     this.subscribers.add(callback);
+    // The model Codex reported is state, not only an event: a report made
+    // before this subscriber came (the thread/resume of a session being
+    // resumed) still reaches it.
+    if (this.lastModelReport) callback(this.lastModelReport);
     return () => {
       this.subscribers.delete(callback);
     };
@@ -4616,6 +4624,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   async setModel(modelId: string | null): Promise<void> {
     this.config.model = modelId ?? undefined;
     this.reportedModel = null;
+    this.lastModelReport = null;
     if (!codexModelSupportsFastMode(this.config.model)) {
       this.serviceTier = null;
     }
@@ -6327,14 +6336,31 @@ export class CodexAppServerAgentSession implements AgentSession {
   private handleModelReportedNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "model_reported" }>,
   ): void {
-    if (parsed.model === (this.reportedModel ?? this.config.model)) return;
-    this.reportedModel = parsed.model === this.config.model ? null : parsed.model;
+    // The first report counts even when it names the configured model: it is
+    // the runtime's own word for the model, which the configuration is not.
+    const unchanged = parsed.model === (this.reportedModel ?? this.config.model);
+    if (unchanged && this.lastModelReport) return;
+    this.reportModel(parsed.model);
+  }
+
+  /** Codex named the model the thread runs; it is announced as the runtime's own report. */
+  private reportModel(model: string): void {
+    this.reportedModel = model === this.config.model ? null : model;
     this.cachedRuntimeInfo = null;
-    this.emitEvent({
+    const report: AgentStreamEvent = {
       type: "model_changed",
       provider: CODEX_PROVIDER,
       runtimeInfo: this.currentRuntimeInfo(),
-    });
+      reported: true,
+    };
+    this.lastModelReport = report;
+    this.emitEvent(report);
+  }
+
+  /** A resumed thread's response names the model it runs: always reported, changed or not. */
+  private reportResumedThreadModel(response: unknown): void {
+    const model = toObjectRecord(response)?.model;
+    if (typeof model === "string" && model.length > 0) this.reportModel(model);
   }
 
   private handleContextCompactedNotification(
