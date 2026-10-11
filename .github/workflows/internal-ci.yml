@@ -230,5 +230,15 @@ jobs:
           command -v rg >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q ripgrep; }
       - name: Build server dependencies
         run: npm run build:server-deps
+      - name: Report the runner's file-watch limits
+        run: |
+          for limit in max_user_instances max_user_watches max_queued_events; do
+            echo "fs.inotify.$limit=$(cat /proc/sys/fs/inotify/$limit)"
+          done
+          echo "open files: $(ulimit -n); uid: $(id -u); nproc: $(nproc)"
       - name: Run the whole server unit suite
         run: npm run test:unit --workspace=@getpaseo/server -- --maxWorkers=6
+      - name: Diagnose the file observer suite alone
+        if: failure()
+        working-directory: packages/server
+        run: DEBUG=paseo:* npx vitest run src/server/file-observer/index.test.ts --maxWorkers=1
