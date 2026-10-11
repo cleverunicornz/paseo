@@ -49,7 +49,7 @@ paseo run --output-schema schema.json "extract release notes"
 paseo run --output-schema '{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}' "summarize release notes"
 ```
 
-From a human shell, a bare `paseo run` creates a new local workspace for the current directory. Use `--workspace <id>` to add the agent to an existing workspace, or `--new-workspace local|worktree` to explicitly create a separate workspace for the run.
+From a human shell, a bare `paseo run` creates a new local workspace for the current directory. Use `--workspace <id>` to add the agent to an existing workspace, or `--new-workspace local|worktree` to explicitly create a separate workspace for the run. When the daemon refuses the agent, for example a model other than a session's member, the run archives the workspace it created and prints `Removed workspace <id>`; a workspace it did not create is left as it was.
 
 Worktree creation accepts `--worktree-mode branch-off|checkout-branch|checkout-pr` plus the matching `--new-branch`/`--base`, `--branch`, or `--pr-number`/`--forge` options. Use `--worktree-slug` to choose the managed directory slug.
 

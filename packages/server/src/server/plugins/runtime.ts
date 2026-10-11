@@ -595,6 +595,11 @@ export class PluginRuntime {
     return this.timelineDeliveries.unacknowledged();
   }
 
+  /** Whether any plugin still has a pending or failed timeline item of this agent. */
+  hasUnacknowledgedTimeline(agentId: string): boolean {
+    return this.timelineDeliveries.hasUnacknowledged(agentId);
+  }
+
   /**
    * `readiness` answers within a short timeout. `stop` and `drain` run until
    * the provider settles them; aborting `signal` aborts the provider's signal.

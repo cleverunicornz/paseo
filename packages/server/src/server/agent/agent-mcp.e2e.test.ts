@@ -316,7 +316,8 @@ interface ScriptedClaudeTurn {
 
 interface HarnessGatewayCall {
   turn: number;
-  status: number;
+  /** The gateway's HTTP status, once it answered. */
+  status: Promise<number>;
 }
 
 /**
@@ -324,7 +325,7 @@ interface HarnessGatewayCall {
  * `turns[index]`: it replies, calls the `cluster` MCP server once the way
  * Claude Code runs a tool (an HTTP request to the configured URL, with the
  * configured headers, made by the harness while the turn runs), then replies
- * again and completes. `calls` records the gateway's answer to every call.
+ * again and completes. `calls` records every call the harness made.
  */
 function claudeQueryAnsweringTurns(
   turns: ScriptedClaudeTurn[],
@@ -349,12 +350,13 @@ function claudeQueryAnsweringTurns(
     const callCluster = (turn: number) => async () => {
       const cluster = launch.mcpServers?.cluster;
       if (!cluster?.url) throw new Error("The cluster MCP server was not launched");
-      const response = await fetch(cluster.url, {
+      const status = fetch(cluster.url, {
         method: "POST",
         headers: { ...cluster.headers, "content-type": "application/json" },
         body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pr_read"}}',
-      });
-      calls.push({ turn, status: response.status });
+      }).then((response) => response.status);
+      calls.push({ turn, status });
+      await status;
     };
     const scriptTurn = (turn: number) => {
       const { model, reportedBy } = turns[turn] ?? { model: "", reportedBy: "init" };
@@ -1580,7 +1582,8 @@ describe("agent MCP end-to-end (offline)", () => {
       manager,
       agent,
       launches,
-      calls,
+      callStatuses: async () =>
+        Promise.all(calls.map(async (call) => ({ turn: call.turn, status: await call.status }))),
       seen,
       timelineTexts: () =>
         timeline.flatMap((event) =>
@@ -1614,22 +1617,23 @@ describe("agent MCP end-to-end (offline)", () => {
       ]);
       try {
         await session.manager.runAgent(session.agent.id, "read the open PRs");
-        expect(session.calls).toEqual([{ turn: 0, status: 200 }]);
+        expect(await session.callStatuses()).toEqual([{ turn: 0, status: 200 }]);
         expect(session.seen).toHaveLength(1);
 
         await expect(
           session.manager.runAgent(session.agent.id, "reply OK, then read the open PRs"),
         ).rejects.toThrow(SONNET_REFUSAL);
 
-        // The Sonnet turn's tool call was refused at the gateway and never reached the backend.
-        await vi.waitFor(() => expect(session.calls).toHaveLength(2));
-        expect([401, 403]).toContain(session.calls[1]?.status);
+        // Claude Code may be stopped before it calls the tool; a call it does make is
+        // refused at the gateway. Either way nothing of the Sonnet turn reaches the backend.
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        const sonnetCalls = (await session.callStatuses()).filter((call) => call.turn === 1);
+        for (const call of sonnetCalls) expect([401, 403]).toContain(call.status);
         expect(session.seen).toHaveLength(1);
         expect(session.seen.map((headers) => headers["x-paseo-member"])).toEqual([
           "claude/claude-opus-5-5",
         ]);
         // The agent is stopped, the turn ended before its last reply, and the timeline says why.
-        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
         expect(session.manager.getSessionMemberRefusal(session.agent.id)).toBe(SONNET_REFUSAL);
         expect(session.timelineTexts()).toContainEqual(expect.stringContaining(SONNET_REFUSAL));
         expect(session.timelineTexts().filter((text) => text === "The call succeeded.")).toEqual([

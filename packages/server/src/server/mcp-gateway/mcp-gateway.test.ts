@@ -84,6 +84,8 @@ async function startUpstream(handler?: UpstreamHandler): Promise<Upstream> {
 const AGENTS: Record<string, McpGatewayAgent> = {
   "token-a": { agentId: "agent-a", sessionId: "session-a", workspaceId: "workspace-a" },
   "token-b": { agentId: "agent-b", sessionId: null, workspaceId: null },
+  // A plugin's daemon-only token for agent-b while its timeline items are delivered.
+  "drain-token-b": { agentId: "agent-b", sessionId: null, workspaceId: null, drain: true },
 };
 
 const SESSION_IDENTITY: SessionIdentity = { member: "codex/gpt-6-astra", role: "validator" };
@@ -299,6 +301,37 @@ describe("MCP gateway", () => {
     expect(upstream.requests.map((request) => request.headers["x-paseo-agent-id"])).toEqual([
       "agent-a",
     ]);
+  });
+
+  test("forwards a plugin's drain call for a refused agent as that agent, and still none of the agent's own", async () => {
+    const upstream = await startUpstream();
+    const refusal =
+      "This session's member is codex/gpt-6-astra. This agent would run codex/gpt-5.4. A different model needs a new session.";
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: (agentId) => (agentId === "agent-b" ? refusal : null),
+    });
+
+    const own = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-b" },
+      body: MCP_INIT,
+    });
+    const drain = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer drain-token-b" },
+      body: MCP_INIT,
+    });
+
+    expect(own.status).toBe(403);
+    expect(drain.status).toBe(200);
+    expect(upstream.requests).toHaveLength(1);
+    expect(upstream.requests[0]!.headers).toMatchObject({
+      "x-paseo-agent-id": "agent-b",
+      "x-paseo-member": "codex/gpt-6-astra",
+      "x-paseo-role": "validator",
+    });
   });
 
   test("forwards nothing for an agent refused while its request waits on the upstream hook", async () => {

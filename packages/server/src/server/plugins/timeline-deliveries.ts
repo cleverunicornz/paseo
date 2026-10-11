@@ -121,6 +121,14 @@ export class TimelineDeliveryLedger {
     };
   }
 
+  /** Whether any plugin has a pending or failed delivery of this agent's items. */
+  hasUnacknowledged(agentId: string): boolean {
+    for (const stream of this.streams.values()) {
+      if (stream.agentId === agentId && stream.pending.size + stream.failed.size > 0) return true;
+    }
+    return false;
+  }
+
   private hasPending(): boolean {
     for (const stream of this.streams.values()) {
       if (stream.pending.size > 0) return true;

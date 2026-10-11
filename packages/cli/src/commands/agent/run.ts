@@ -497,6 +497,8 @@ function parseKeyValueFlags(
 interface RunWorkspace {
   id?: string;
   cwd: string;
+  /** This run minted the workspace, so it removes it again if no agent comes of the run. */
+  created?: boolean;
 }
 
 export interface RunWorkspaceLookupClient {
@@ -573,7 +575,45 @@ async function resolveRunWorkspace(
   console.error(
     "Tip: pass --workspace <id> (or set PASEO_WORKSPACE_ID) to run in an existing workspace.",
   );
-  return { id: result.workspace.id, cwd: result.workspace.workspaceDirectory ?? cwd };
+  return {
+    id: result.workspace.id,
+    cwd: result.workspace.workspaceDirectory ?? cwd,
+    created: true,
+  };
+}
+
+/**
+ * Creates the run's agent. When the daemon refuses it, a workspace this run
+ * created for it is archived again, so a refused run leaves no workspace.
+ */
+async function createRunAgent(
+  client: ConnectedDaemonClient,
+  workspace: RunWorkspace,
+  input: Parameters<ConnectedDaemonClient["createAgent"]>[0],
+): Promise<AgentSnapshotPayload> {
+  try {
+    return await client.createAgent(input);
+  } catch (error) {
+    if (workspace.created && workspace.id) {
+      await removeRunWorkspace(client, workspace.id);
+    }
+    throw error;
+  }
+}
+
+async function removeRunWorkspace(
+  client: ConnectedDaemonClient,
+  workspaceId: string,
+): Promise<void> {
+  const failure = await client.archiveWorkspace(workspaceId).then(
+    (result) => result.error,
+    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  );
+  if (failure) {
+    console.error(`Could not remove workspace ${workspaceId} created for this run: ${failure}`);
+    return;
+  }
+  console.error(`Removed workspace ${workspaceId}: no agent was created in it`);
 }
 
 export async function runRunCommand(
@@ -621,7 +661,7 @@ export async function runRunCommand(
 
       const callStructuredTurn = async (structuredPrompt: string): Promise<string> => {
         if (!structuredAgent) {
-          structuredAgent = await client.createAgent({
+          structuredAgent = await createRunAgent(client, workspace, {
             provider: resolvedProviderModel.provider,
             cwd: runCwd,
             workspaceId,
@@ -692,7 +732,7 @@ export async function runRunCommand(
     }
 
     // Create the agent
-    const agent = await client.createAgent({
+    const agent = await createRunAgent(client, workspace, {
       provider: resolvedProviderModel.provider,
       cwd: runCwd,
       workspaceId,

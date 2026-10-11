@@ -754,6 +754,7 @@ export default function contribute(plugin: unknown) {
     expect(announced).toHaveLength(1);
     expect(announced[0]).toMatchObject({
       level: 30,
+      module: "bootstrap",
       member: "claude/claude-opus-5-5",
       role: "implementer",
       msg: expect.stringContaining("claude/claude-opus-5-5"),
@@ -761,7 +762,7 @@ export default function contribute(plugin: unknown) {
     expect(String(announced[0]?.msg)).toContain("implementer");
     // The line names who the session runs as and nothing else: no credential.
     expect(Object.keys(announced[0] ?? {}).sort()).toEqual(
-      ["hostname", "level", "member", "msg", "pid", "role", "time"].sort(),
+      ["hostname", "level", "member", "module", "msg", "pid", "role", "time"].sort(),
     );
     expect(JSON.stringify(announced[0])).not.toMatch(/daemon-secret|\$2[aby]\$|token|password/i);
 

@@ -47,6 +47,7 @@ interface PluginRuntimePort {
   drainTimelineDeliveries?(deadline: AbortSignal): Promise<TimelineDrainFailure[]>;
   listStopReadinessProviders?(operation: PluginStopReadinessOperation): string[];
   unacknowledgedTimeline?(): UnacknowledgedTimeline | null;
+  hasUnacknowledgedTimeline?(agentId: string): boolean;
   reofferFailedTimelineItems?(minAgeMs: number): void;
   requestStopReadiness?(input: {
     pluginId: string;
@@ -446,6 +447,10 @@ export class PluginService {
 
   reofferFailedTimelineItems(minAgeMs: number): void {
     this.runtime.reofferFailedTimelineItems?.(minAgeMs);
+  }
+
+  hasUnacknowledgedTimeline(agentId: string): boolean {
+    return this.runtime.hasUnacknowledgedTimeline?.(agentId) ?? false;
   }
 
   requestStopReadiness(input: {

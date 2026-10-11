@@ -15,6 +15,12 @@ export interface McpGatewayAgent {
   agentId: string;
   sessionId: string | null;
   workspaceId: string | null;
+  /**
+   * A plugin calling, with a daemon-only token, for an agent that no longer runs
+   * while its timeline items are delivered. The session's refusal of that agent
+   * applies to the agent's own calls, not to this delivery.
+   */
+  drain?: boolean;
 }
 
 export interface McpGatewayOptions {
@@ -24,7 +30,10 @@ export interface McpGatewayOptions {
   serverId: string;
   /** In session mode, the member and role every forwarded request carries, whichever agent calls. */
   sessionIdentity: SessionIdentity | null;
-  /** Why the session refused this agent, or null; a refused agent's requests are not forwarded. */
+  /**
+   * Why the session refused this agent, or null; a refused agent's requests are
+   * not forwarded, except a plugin's drain calls for it.
+   */
   agentRefusal?: (agentId: string) => string | null;
   /** Runs the `mcp_gateway.upstream` plugin hooks. */
   resolveUpstream: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
@@ -263,6 +272,8 @@ function sendError(res: express.Response, status: number, error: string): void {
 export function createMcpGatewayHandler(options: McpGatewayOptions): express.RequestHandler {
   const logger = options.logger.child({ module: "mcp-gateway" });
   const defaultResponseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+  const refusalOf = (agent: McpGatewayAgent): string | null =>
+    agent.drain ? null : (options.agentRefusal?.(agent.agentId) ?? null);
 
   const handle = async (req: express.Request, res: express.Response): Promise<void> => {
     const agent = options.resolveAgent(extractHttpBearerToken(req.headers.authorization));
@@ -270,7 +281,7 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       sendError(res, 401, "Unauthorized");
       return;
     }
-    const refusal = options.agentRefusal?.(agent.agentId);
+    const refusal = refusalOf(agent);
     if (refusal) {
       sendError(res, 403, refusal);
       return;
@@ -321,7 +332,7 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       return;
     }
     // The agent may have been refused while the upstream hook ran.
-    const lateRefusal = options.agentRefusal?.(agent.agentId);
+    const lateRefusal = refusalOf(agent);
     if (lateRefusal) {
       sendError(res, 403, lateRefusal);
       return;
