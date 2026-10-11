@@ -133,7 +133,7 @@ import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import { AgentTokenRegistry } from "./agent/agent-tokens.js";
-import { createMcpGatewayHandler } from "./mcp-gateway/mcp-gateway.js";
+import { createMcpGatewayHandler, McpGatewayRequests } from "./mcp-gateway/mcp-gateway.js";
 import { MCP_GATEWAY_ROUTE, type McpGatewayBackend } from "./mcp-gateway/backends.js";
 import {
   createPaseoToolCatalog,
@@ -207,6 +207,7 @@ import { withTimeout } from "../utils/promise-timeout.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   DEFAULT_SESSION_RUNTIME_CONFIG,
+  type SessionIdentity,
   type SessionRuntimeConfig,
 } from "./session-runtime-config.js";
 import {
@@ -216,7 +217,7 @@ import {
 } from "./stop-readiness.js";
 import { createWebBasePathMiddleware, stripUpgradeBasePath } from "./web-base-path.js";
 import { createPluginGatewayToolCaller } from "./mcp-gateway/plugin-tool-call.js";
-import { ShutdownGatewayCallers } from "./mcp-gateway/shutdown-callers.js";
+import { DrainGatewayCallers } from "./mcp-gateway/drain-callers.js";
 import {
   createRequireBearerMiddleware,
   authorizeAgentMcpRequest,
@@ -641,6 +642,7 @@ export async function createPaseoDaemon(
   const elapsed = () => `${(performance.now() - bootstrapStart).toFixed(0)}ms`;
   const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
   const sessionRuntime = resolveSessionRuntime(config);
+  logSessionMode(logger, sessionRuntime.identity);
   const initialMutableConfig = createInitialMutableDaemonConfig(config);
   const daemonConfigStore = new DaemonConfigStore(config.paseoHome, initialMutableConfig, logger, {
     relayEnabledMutable: config.relayEnabledMutable ?? true,
@@ -1018,6 +1020,18 @@ export async function createPaseoDaemon(
       ),
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
+  // Agents that no longer run keep their gateway identity for the plugin calls
+  // that deliver their remaining timeline items: those the shutdown closes until
+  // its drain ends (see stop()), and those the session refused for running
+  // another model while any of their items is unacknowledged, at most
+  // timelineDrainMs from the refusal.
+  const drainGatewayCallers = new DrainGatewayCallers({
+    hasUndeliveredTimeline: (agentId) => pluginRuntime.hasUnacknowledgedTimeline(agentId),
+    refusedDrainMs: sessionRuntime.timelineDrainMs,
+  });
+  // The gateway requests in flight per agent, cut off when the session refuses
+  // the agent and again when a refused agent's token is revoked at close.
+  const mcpGatewayRequests = new McpGatewayRequests();
   const agentManager = new AgentManager({
     pluginLifecycle: pluginRuntime,
     clients: initialAgentManagerState.clients,
@@ -1035,7 +1049,15 @@ export async function createPaseoDaemon(
     prepareToolTree: localToolsRuntime.prepareToolTree,
     singleAgent: sessionRuntime.singleAgent,
     sessionIdentity: sessionRuntime.identity,
+    onSessionMemberRefusal: ({ refusal, ...agent }) => {
+      drainGatewayCallers.retainRefused(agent);
+      mcpGatewayRequests.refuse(agent.agentId, refusal);
+    },
     logger,
+  });
+  agentTokens.onRevoke((agentId) => {
+    const refusal = agentManager.getSessionMemberRefusal(agentId);
+    if (refusal) mcpGatewayRequests.refuse(agentId, refusal);
   });
   const stopReadiness = new StopReadinessService({
     plugins: pluginRuntime,
@@ -1045,16 +1067,15 @@ export async function createPaseoDaemon(
     },
     logger,
   });
-  // Agents the shutdown closes keep their gateway identity for plugin calls
-  // until the timeline drain ends; see stop().
-  const shutdownGatewayCallers = new ShutdownGatewayCallers();
   pluginRuntime.bindGatewayToolCaller(
     createPluginGatewayToolCaller({
       getGatewayBaseUrl: () => createLoopbackDaemonUrl(boundListenTarget, MCP_GATEWAY_ROUTE),
+      // A refused agent's own token stays refused, live or not.
       issueCallerToken: (agentId) =>
-        agentManager.getAgent(agentId) !== null
+        agentManager.getAgent(agentId) !== null &&
+        agentManager.getSessionMemberRefusal(agentId) === null
           ? agentManager.issueAgentToken(agentId)
-          : shutdownGatewayCallers.issue(agentId),
+          : drainGatewayCallers.issue(agentId),
     }),
   );
   // Control endpoints for whatever stops this daemon's host, behind the same
@@ -1086,7 +1107,7 @@ export async function createPaseoDaemon(
       resolveAgent: (token) => {
         const agentId = agentTokens.resolve(token);
         if (!agentId) {
-          return shutdownGatewayCallers.resolve(token);
+          return drainGatewayCallers.resolve(token);
         }
         const agent = agentManager.getAgent(agentId);
         if (agent) {
@@ -1103,6 +1124,7 @@ export async function createPaseoDaemon(
       serverId,
       sessionIdentity: sessionRuntime.identity,
       agentRefusal: (agentId) => agentManager.getSessionMemberRefusal(agentId),
+      requests: mcpGatewayRequests,
       resolveUpstream: (request) => pluginRuntime.before("mcp_gateway.upstream", request),
       logger,
     }),
@@ -1968,7 +1990,7 @@ export async function createPaseoDaemon(
     agentManager.prepareForShutdown();
     // Plugins draining timeline items still call the gateway for the agents
     // closed below, with the identity each had, until the drain ends.
-    shutdownGatewayCallers.retain(
+    drainGatewayCallers.retain(
       agentManager.listAgents().map((agent) => ({
         agentId: agent.id,
         sessionId: agent.persistence?.sessionId ?? null,
@@ -1987,7 +2009,7 @@ export async function createPaseoDaemon(
     // still delivers what it emits but cannot end clean.
     const timelineDrain = await stopReadiness
       .drainForShutdown(sessionRuntime.timelineDrainMs, unclosedAgents)
-      .finally(() => shutdownGatewayCallers.end());
+      .finally(() => drainGatewayCallers.end());
     reportTimelineDrain(logger, timelineDrain);
     await pluginRuntime.stopAllPlugins();
     terminalManager.killAll();
@@ -2029,6 +2051,15 @@ export async function createPaseoDaemon(
     getListenTarget: () => boundListenTarget,
     getServerId: () => serverId,
   };
+}
+
+/** One line at startup naming the session's member and role; nothing outside session mode. */
+function logSessionMode(logger: Logger, identity: SessionIdentity | null): void {
+  if (!identity) return;
+  logger.info(
+    { member: identity.member, role: identity.role },
+    `Session mode: member ${identity.member}, role ${identity.role}`,
+  );
 }
 
 function resolveSessionRuntime(config: PaseoDaemonConfig): SessionRuntimeConfig {

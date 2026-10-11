@@ -14,7 +14,10 @@ import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { DEFAULT_SESSION_RUNTIME_CONFIG } from "../session-runtime-config.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { ClaudeAgentClient } from "./providers/claude/agent.js";
+import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
+import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -301,6 +304,450 @@ function claudeQueryReportingModel(
         return this;
       },
     };
+  };
+}
+
+/** Where Claude Code first reports the model of a turn's model request. */
+type ClaudeModelReport = "init" | "message_start" | "assistant";
+
+interface ScriptedClaudeTurn {
+  /** The model the turn's frames carry. */
+  model: string;
+  /** The first frame carrying it; earlier frames of the turn carry no model. */
+  reportedBy: ClaudeModelReport;
+}
+
+interface HarnessGatewayCall {
+  turn: number;
+  /** The gateway's HTTP status, once it answered. */
+  status: Promise<number>;
+}
+
+/**
+ * A scripted Claude Code query that answers each prompt as a turn of
+ * `turns[index]`: it replies, calls the `cluster` MCP server once the way
+ * Claude Code runs a tool (an HTTP request to the configured URL, with the
+ * configured headers, made by the harness while the turn runs), then replies
+ * again and completes. `calls` records every call the harness made.
+ */
+function claudeQueryAnsweringTurns(
+  turns: ScriptedClaudeTurn[],
+  launches: string[],
+  calls: HarnessGatewayCall[],
+) {
+  return ({
+    prompt,
+    options: launch,
+  }: {
+    prompt: AsyncIterable<unknown>;
+    options: {
+      model?: string;
+      mcpServers?: Record<string, { url?: string; headers?: Record<string, string> }>;
+    };
+  }) => {
+    launches.push(String(launch.model));
+    const prompts = prompt[Symbol.asyncIterator]();
+    const frames: Array<Record<string, unknown> | (() => Promise<void>)> = [];
+    let turnIndex = 0;
+    const state = { closed: false };
+    const callCluster = (turn: number) => async () => {
+      const cluster = launch.mcpServers?.cluster;
+      if (!cluster?.url) throw new Error("The cluster MCP server was not launched");
+      const status = fetch(cluster.url, {
+        method: "POST",
+        headers: { ...cluster.headers, "content-type": "application/json" },
+        body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pr_read"}}',
+      }).then((response) => response.status);
+      calls.push({ turn, status });
+      await status;
+    };
+    const scriptTurn = (turn: number) => {
+      const { model, reportedBy } = turns[turn] ?? { model: "", reportedBy: "init" };
+      const modelFrom = (report: ClaudeModelReport) =>
+        reportedBy === "init" ||
+        (reportedBy === "message_start" && report !== "init") ||
+        report === "assistant"
+          ? { model }
+          : {};
+      const assistant = (id: string, content: unknown[]) => ({
+        type: "assistant",
+        parent_tool_use_id: null,
+        session_id: "fixture-claude",
+        message: { id, role: "assistant", ...modelFrom("assistant"), content },
+      });
+      frames.push(
+        {
+          type: "system",
+          subtype: "init",
+          session_id: "fixture-claude",
+          permissionMode: "default",
+          ...modelFrom("init"),
+        },
+        {
+          type: "stream_event",
+          parent_tool_use_id: null,
+          session_id: "fixture-claude",
+          event: {
+            type: "message_start",
+            message: { id: `msg-${turn}`, ...modelFrom("message_start") },
+          },
+        },
+        assistant(`msg-${turn}`, [{ type: "text", text: "OK" }]),
+        assistant(`msg-${turn}`, [
+          { type: "tool_use", id: `toolu-${turn}`, name: "mcp__cluster__pr_read", input: {} },
+        ]),
+        // Claude Code runs the tool once its tool_use block is complete.
+        callCluster(turn),
+        {
+          type: "user",
+          parent_tool_use_id: null,
+          session_id: "fixture-claude",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: `toolu-${turn}`, content: "[]" }],
+          },
+        },
+        assistant(`msg-${turn}-after`, [{ type: "text", text: "The call succeeded." }]),
+        {
+          type: "result",
+          subtype: "success",
+          session_id: "fixture-claude",
+          usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+          total_cost_usd: 0,
+        },
+      );
+    };
+    return {
+      next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+        while (!state.closed) {
+          const frame = frames.shift();
+          if (typeof frame === "function") {
+            await frame();
+            continue;
+          }
+          if (frame) return { done: false, value: frame };
+          const next = await prompts.next();
+          if (next.done) break;
+          scriptTurn(turnIndex++);
+        }
+        return { done: true, value: undefined };
+      },
+      return: async () => {
+        state.closed = true;
+        return { done: true, value: undefined };
+      },
+      interrupt: async () => {
+        state.closed = true;
+      },
+      close: () => {
+        state.closed = true;
+      },
+      applyFlagSettings: async () => undefined,
+      setPermissionMode: async () => undefined,
+      setModel: async () => undefined,
+      supportedModels: async () => [],
+      supportedCommands: async () => [],
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  };
+}
+
+/** A Claude Code query the test feeds frame by frame. */
+function claudeFrameQueue() {
+  const frames: Array<Record<string, unknown>> = [];
+  const state = { closed: false, wake: null as (() => void) | null };
+  const close = () => {
+    state.closed = true;
+    state.wake?.();
+  };
+  return {
+    push(frame: Record<string, unknown>) {
+      frames.push(frame);
+      state.wake?.();
+    },
+    next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+      while (!state.closed && frames.length === 0) {
+        await new Promise<void>((resolve) => {
+          state.wake = resolve;
+        });
+      }
+      const frame = frames.shift();
+      return frame ? { done: false, value: frame } : { done: true, value: undefined };
+    },
+    return: async () => {
+      close();
+      return { done: true, value: undefined };
+    },
+    interrupt: async () => close(),
+    close,
+    applyFlagSettings: async () => undefined,
+    setPermissionMode: async () => undefined,
+    setModel: async () => undefined,
+    supportedModels: async () => [],
+    supportedCommands: async () => [],
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+}
+
+type ModelReportKind =
+  | { provider: "claude"; kind: ClaudeModelReport }
+  | { provider: "codex"; kind: "model/rerouted" | "thread/settings/updated" };
+
+interface BackendCall {
+  /** The whole request body reached the backend, so its tool ran. */
+  ranAfterRefusal: boolean | null;
+}
+
+/** The JSON-RPC error code of the gateway's refusal, on the wire. */
+const MCP_GATEWAY_REFUSAL_CODE = -32003;
+
+interface ToolAnswer {
+  status: number;
+  body: string;
+  /** The answer's stream broke off instead of ending. */
+  aborted: boolean;
+}
+
+/**
+ * What the harness receives for one tool request, and `head`, which resolves
+ * when the answer's head arrives. A request cut off with no answer has status 0.
+ */
+function readToolAnswer(
+  request: http.ClientRequest,
+): Promise<ToolAnswer> & { head: Promise<void> } {
+  let headArrived = () => undefined as void;
+  const head = new Promise<void>((resolve) => {
+    headArrived = resolve;
+  });
+  const answer = new Promise<ToolAnswer>((resolve) => {
+    request.on("response", (response) => {
+      headArrived();
+      const chunks: Buffer[] = [];
+      let aborted = false;
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("aborted", () => {
+        aborted = true;
+      });
+      response.on("error", () => {
+        aborted = true;
+      });
+      response.on("close", () =>
+        resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+          aborted: aborted || !response.complete,
+        }),
+      );
+    });
+    request.on("error", () => resolve({ status: 0, body: "", aborted: true }));
+  });
+  return Object.assign(answer, { head });
+}
+
+/**
+ * A daemon in session mode whose one agent runs the real Claude or Codex
+ * adapter on its member, with a `fixture` gateway backend that records when
+ * each tool request's body completes. With `holdResponses`, the backend
+ * answers only when `releaseResponses` is called.
+ */
+async function startReportingSession(provider: "claude" | "codex") {
+  const member = provider === "claude" ? "claude-opus-5-5" : "gpt-6-astra";
+  const switched = provider === "claude" ? "claude-sonnet-5-5" : "gpt-5.4";
+  const queue = claudeFrameQueue();
+  const appServer =
+    provider === "codex"
+      ? createFakeCodexAppServer({
+          "thread/loaded/list": () => ({ data: ["thread-1"] }),
+          "thread/unsubscribe": () => ({}),
+          "turn/interrupt": () => ({}),
+        })
+      : null;
+  const clients = createTestAgentClients({ supportsMcpServers: true });
+  if (appServer) {
+    clients.codex!.createSession = async (config, context) =>
+      new CodexAppServerAgentSession(
+        config,
+        null,
+        pino({ level: "silent" }),
+        async () => appServer.child,
+        {},
+        false,
+        false,
+        false,
+        context?.agentId,
+      );
+  } else {
+    const claude = new ClaudeAgentClient({
+      logger: pino({ level: "silent" }),
+      resolveBinary: async () => "/fixture/claude",
+      queryFactory: (() => queue) as never,
+    });
+    clients.claude!.createSession = claude.createSession.bind(claude);
+  }
+
+  const calls: BackendCall[] = [];
+  const arrived: Array<() => void> = [];
+  const held: Array<() => void> = [];
+  let holdResponses = false;
+  // With an early answer, the backend sends its 200 head before the body has arrived.
+  let early: "event-stream" | "json" | null = null;
+  let refused = () => false;
+  const backend = http.createServer((req, res) => {
+    const call: BackendCall = { ranAfterRefusal: null };
+    calls.push(call);
+    const answerType = early;
+    if (answerType) {
+      res.writeHead(200, {
+        "content-type": answerType === "event-stream" ? "text/event-stream" : "application/json",
+      });
+      if (answerType === "event-stream") res.write(": stream open\n\n");
+      else res.flushHeaders();
+    }
+    req.once("data", () => arrived.shift()?.());
+    req.resume();
+    req.on("end", () => {
+      call.ranAfterRefusal = refused();
+      const answer = () =>
+        res.end(
+          answerType === "event-stream"
+            ? 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+            : '{"jsonrpc":"2.0","id":1,"result":{}}',
+        );
+      if (holdResponses) held.push(answer);
+      else answer();
+    });
+  });
+  await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+  const backendPort = (backend.address() as net.AddressInfo).port;
+  const running = await createTestPaseoDaemon({
+    agentClients: clients,
+    mcpGatewayBackends: { fixture: { url: `http://127.0.0.1:${backendPort}/mcp` } },
+    sessionRuntime: {
+      ...DEFAULT_SESSION_RUNTIME_CONFIG,
+      timelineDrainMs: 200,
+      identity: { member: `${provider}/${member}`, role: "implementer" },
+    },
+  });
+  const manager = running.daemon.agentManager;
+  const agent = await manager.createAgent(
+    {
+      provider,
+      cwd: running.paseoHome,
+      model: member,
+      ...(provider === "codex" ? { modeId: "full-access" } : {}),
+    },
+    undefined,
+    { workspaceId: undefined },
+  );
+  refused = () => manager.getSessionMemberRefusal(agent.id) !== null;
+  const token = manager.issueAgentToken(agent.id);
+  const url = `http://127.0.0.1:${running.port}/mcp/backends/fixture`;
+
+  return {
+    manager,
+    agent,
+    calls,
+    refusal: `This session's member is ${provider}/${member}. This agent would run ${provider}/${switched}. A different model needs a new session.`,
+    /** Starts a turn and waits until the harness runs it on the member. */
+    startTurn: async () => {
+      const turn = manager.runAgent(agent.id, "read two things").then(
+        () => null,
+        (error: Error) => error.message,
+      );
+      if (appServer) {
+        await appServer.waitForTurnStart();
+        appServer.startsTurn({ threadId: "thread-1", turnId: "turn-1" });
+      } else {
+        queue.push({
+          type: "system",
+          subtype: "init",
+          session_id: "fixture-claude",
+          permissionMode: "default",
+          model: member,
+        });
+      }
+      // Wrapped, so awaiting the start does not wait for the turn.
+      return { ended: turn };
+    },
+    /** The harness reports the switched model the way `kind` does. */
+    report: (kind: ModelReportKind["kind"]) => {
+      const shared = { session_id: "fixture-claude", parent_tool_use_id: null };
+      if (kind === "init") {
+        queue.push({ ...shared, type: "system", subtype: "init", model: switched });
+      } else if (kind === "message_start") {
+        queue.push({
+          ...shared,
+          type: "stream_event",
+          event: { type: "message_start", message: { id: "msg-switch", model: switched } },
+        });
+      } else if (kind === "assistant") {
+        queue.push({
+          ...shared,
+          type: "assistant",
+          message: { id: "msg-switch", model: switched, content: [{ type: "text", text: "OK" }] },
+        });
+      } else {
+        const params =
+          kind === "model/rerouted"
+            ? { threadId: "thread-1", turnId: "turn-1", fromModel: member, toModel: switched }
+            : {
+                threadId: "thread-1",
+                threadSettings: { model: switched, modelProvider: "openai" },
+              };
+        appServer!.child.stdout.write(`${JSON.stringify({ method: kind, params })}\n`);
+      }
+    },
+    /** Tool requests whose whole body reached the backend before the refusal. */
+    completedBeforeRefusal: () => calls.filter((call) => call.ranAfterRefusal === false).length,
+    /** Waits until `count` whole tool requests reached the backend before the refusal. */
+    wholeBodiesArrived: (count: number) =>
+      vi.waitFor(() =>
+        expect(calls.filter((call) => call.ranAfterRefusal === false)).toHaveLength(count),
+      ),
+    /** Tool requests whose whole body reached the backend after the refusal: their tool ran. */
+    completedAfterRefusal: () => calls.filter((call) => call.ranAfterRefusal === true).length,
+    holdResponses: () => {
+      holdResponses = true;
+    },
+    /** The backend sends its 200 head at once, then holds its answer until released. */
+    answerEarly: (answerType: "event-stream" | "json") => {
+      early = answerType;
+      holdResponses = true;
+    },
+    releaseResponses: () => {
+      for (const answer of held.splice(0)) answer();
+    },
+    /**
+     * Opens a tool request as the agent's harness and resolves once the backend
+     * received its first bytes: the body's first half, or all of it.
+     */
+    openToolRequest: async (body: "streamed" | "complete") => {
+      const payload = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"pr_read"}}';
+      const reachedBackend = new Promise<void>((resolve) => arrived.push(resolve));
+      const request = http.request(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+      });
+      const answer = readToolAnswer(request);
+      if (body === "complete") request.end(payload);
+      else request.write(payload.slice(0, 40));
+      await reachedBackend;
+      return {
+        answer,
+        status: answer.then((received) => received.status),
+        finish: () => request.end(payload.slice(40)),
+      };
+    },
+    close: async () => {
+      queue.close();
+      await running.close();
+      backend.closeAllConnections();
+      await new Promise<void>((resolve) => backend.close(() => resolve()));
+    },
   };
 }
 
@@ -1358,6 +1805,297 @@ describe("agent MCP end-to-end (offline)", () => {
       await session.close();
     }
   }, 30_000);
+
+  /**
+   * A daemon in session mode as claude/claude-opus-5-5 with one Claude agent,
+   * launched on Opus with the `cluster` gateway backend, whose harness answers
+   * each prompt as the next of `turns`.
+   */
+  async function startScriptedClaudeSession(turns: ScriptedClaudeTurn[]) {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const seen: http.IncomingHttpHeaders[] = [];
+    const backend = http.createServer(recordHeadersAndAnswer(seen));
+    await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+    const backendPort = (backend.address() as net.AddressInfo).port;
+
+    const launches: string[] = [];
+    const calls: HarnessGatewayCall[] = [];
+    const claude = new ClaudeAgentClient({
+      logger: pino({ level: "silent" }),
+      resolveBinary: async () => "/fixture/claude",
+      queryFactory: claudeQueryAnsweringTurns(turns, launches, calls) as never,
+    });
+    const clients = createTestAgentClients({ supportsMcpServers: true });
+    clients.claude!.createSession = claude.createSession.bind(claude);
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: clients,
+        agentStoragePath: path.join(paseoHome, "agents"),
+        mcpGatewayBackends: { cluster: { url: `http://127.0.0.1:${backendPort}/mcp` } },
+        sessionRuntime: {
+          ...DEFAULT_SESSION_RUNTIME_CONFIG,
+          identity: { member: "claude/claude-opus-5-5", role: "implementer" },
+        },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const manager = daemon.agentManager;
+    const agent = await manager.createAgent(
+      {
+        provider: "claude",
+        cwd: agentCwd,
+        model: "claude-opus-5-5",
+        mcpServers: {
+          cluster: {
+            type: "http",
+            url: "{paseoMcpGatewayUrl}/cluster",
+            headers: { Authorization: "Bearer {paseoAgentToken}" },
+          },
+        },
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const token = manager.issueAgentToken(agent.id);
+    const timeline: AgentStreamEvent[] = [];
+    manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream" && event.event.type === "timeline") {
+          timeline.push(event.event);
+        }
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    return {
+      manager,
+      agent,
+      launches,
+      callStatuses: async () =>
+        Promise.all(calls.map(async (call) => ({ turn: call.turn, status: await call.status }))),
+      seen,
+      timelineTexts: () =>
+        timeline.flatMap((event) =>
+          event.type === "timeline" && "text" in event.item ? [event.item.text] : [],
+        ),
+      callGatewayAsAgent: () =>
+        fetch(`http://127.0.0.1:${port}/mcp/backends/cluster`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+        }),
+      close: async () => {
+        await daemon.stop();
+        backend.closeAllConnections();
+        await new Promise<void>((resolve) => backend.close(() => resolve()));
+        await rm(paseoHome, { recursive: true, force: true });
+        await rm(staticDir, { recursive: true, force: true });
+        await rm(agentCwd, { recursive: true, force: true });
+      },
+    };
+  }
+
+  test.each<ClaudeModelReport>(["init", "message_start", "assistant"])(
+    "in session mode a turn whose harness reports another model by %s is stopped before its tool call reaches a backend",
+    async (reportedBy) => {
+      // The live G-15 sequence: an Opus turn, then `/model claude-sonnet-5-5` took
+      // effect inside Claude Code, and the next turn runs Sonnet and calls a tool.
+      const session = await startScriptedClaudeSession([
+        { model: "claude-opus-5-5", reportedBy: "init" },
+        { model: "claude-sonnet-5-5", reportedBy },
+      ]);
+      try {
+        await session.manager.runAgent(session.agent.id, "read the open PRs");
+        expect(await session.callStatuses()).toEqual([{ turn: 0, status: 200 }]);
+        expect(session.seen).toHaveLength(1);
+
+        await expect(
+          session.manager.runAgent(session.agent.id, "reply OK, then read the open PRs"),
+        ).rejects.toThrow(SONNET_REFUSAL);
+
+        // Claude Code may be stopped before it calls the tool; a call it does make is
+        // refused at the gateway. Either way nothing of the Sonnet turn reaches the backend.
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        const sonnetCalls = (await session.callStatuses()).filter((call) => call.turn === 1);
+        for (const call of sonnetCalls) expect([401, 403]).toContain(call.status);
+        expect(session.seen).toHaveLength(1);
+        expect(session.seen.map((headers) => headers["x-paseo-member"])).toEqual([
+          "claude/claude-opus-5-5",
+        ]);
+        // The agent is stopped, the turn ended before its last reply, and the timeline says why.
+        expect(session.manager.getSessionMemberRefusal(session.agent.id)).toBe(SONNET_REFUSAL);
+        expect(session.timelineTexts()).toContainEqual(expect.stringContaining(SONNET_REFUSAL));
+        expect(session.timelineTexts().filter((text) => text === "The call succeeded.")).toEqual([
+          "The call succeeded.",
+        ]);
+        expect([401, 403]).toContain((await session.callGatewayAsAgent()).status);
+        expect(session.seen).toHaveLength(1);
+        expect(session.launches).toEqual(["claude-opus-5-5"]);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  const MODEL_REPORT_KINDS: ModelReportKind[] = [
+    { provider: "claude", kind: "init" },
+    { provider: "claude", kind: "message_start" },
+    { provider: "claude", kind: "assistant" },
+    { provider: "codex", kind: "model/rerouted" },
+    { provider: "codex", kind: "thread/settings/updated" },
+  ];
+
+  const MODEL_REPORTS_BY_BODY: Array<ModelReportKind & { body: "streamed" | "complete" }> = [];
+  for (const report of MODEL_REPORT_KINDS) {
+    MODEL_REPORTS_BY_BODY.push(
+      { provider: report.provider, kind: report.kind, body: "streamed" } as ModelReportKind & {
+        body: "streamed";
+      },
+      { provider: report.provider, kind: report.kind, body: "complete" } as ModelReportKind & {
+        body: "complete";
+      },
+    );
+  }
+
+  test.each(MODEL_REPORT_KINDS)(
+    "in session mode tool requests a $provider agent streamed before its $kind report are cut off at the refusal",
+    async ({ provider, kind }) => {
+      // The harness already sent two tool requests of the switched turn, each with
+      // part of its body, when the daemon reads the report of the other model.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        const requests = [
+          await session.openToolRequest("streamed"),
+          await session.openToolRequest("streamed"),
+        ];
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        for (const request of requests) request.finish();
+
+        expect(await Promise.all(requests.map((request) => request.status))).toEqual([403, 403]);
+        expect(await turn.ended).toBe(session.refusal);
+        // Neither body ever completed at the backend, so neither tool ran.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(session.calls).toEqual([{ ranAfterRefusal: null }, { ranAfterRefusal: null }]);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(MODEL_REPORT_KINDS)(
+    "in session mode tool requests a $provider agent completed before its $kind report get the refusal, not the backend's answer",
+    async ({ provider, kind }) => {
+      // The backend has both whole requests but has not answered when the report arrives.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        session.holdResponses();
+        const requests = [
+          await session.openToolRequest("complete"),
+          await session.openToolRequest("complete"),
+        ];
+        await vi.waitFor(() => expect(session.completedBeforeRefusal()).toBe(2));
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        session.releaseResponses();
+
+        expect(await Promise.all(requests.map((request) => request.status))).toEqual([403, 403]);
+        expect(await turn.ended).toBe(session.refusal);
+        expect(session.calls).toEqual([{ ranAfterRefusal: false }, { ranAfterRefusal: false }]);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(MODEL_REPORTS_BY_BODY)(
+    "in session mode a $provider agent's streamed tool answer already begun at its $kind report ends with the refusal as a JSON-RPC error ($body body)",
+    async ({ provider, kind, body }) => {
+      // The backend sent the 200 head of an event stream before the report, so
+      // the status is out; the stream must end with the refusal, not break off.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        session.answerEarly("event-stream");
+        const requests = [await session.openToolRequest(body), await session.openToolRequest(body)];
+        await Promise.all(requests.map((request) => request.answer.head));
+        await session.wholeBodiesArrived(body === "complete" ? 2 : 0);
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        if (body === "streamed") for (const request of requests) request.finish();
+        session.releaseResponses();
+
+        const refusalEvent = `event: message\ndata: ${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 7,
+          error: { code: MCP_GATEWAY_REFUSAL_CODE, message: session.refusal },
+        })}\n\n`;
+        for (const answer of await Promise.all(requests.map((request) => request.answer))) {
+          expect(answer).toMatchObject({ status: 200, aborted: false });
+          expect(answer.body.startsWith(": stream open\n\n")).toBe(true);
+          expect(answer.body.endsWith(refusalEvent)).toBe(true);
+          expect(answer.body).not.toContain('"result"');
+        }
+        expect(await turn.ended).toBe(session.refusal);
+        expect(session.completedAfterRefusal()).toBe(0);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(MODEL_REPORTS_BY_BODY)(
+    "in session mode a $provider agent's JSON tool answer whose head the backend sent before its $kind report is answered 403 ($body body)",
+    async ({ provider, kind, body }) => {
+      // The backend flushed a 200 JSON head early; the gateway holds a finite
+      // answer until it is whole, so the refusal still decides the status.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        session.answerEarly("json");
+        const requests = [await session.openToolRequest(body), await session.openToolRequest(body)];
+        await session.wholeBodiesArrived(body === "complete" ? 2 : 0);
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        if (body === "streamed") for (const request of requests) request.finish();
+        session.releaseResponses();
+
+        for (const answer of await Promise.all(requests.map((request) => request.answer))) {
+          expect(answer).toMatchObject({
+            status: 403,
+            body: JSON.stringify({ error: session.refusal }),
+            aborted: false,
+          });
+        }
+        expect(await turn.ended).toBe(session.refusal);
+        expect(session.completedAfterRefusal()).toBe(0);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
 
   test("in session mode the member's [1m] context variant is the same member", async () => {
     // Claude Code reports the 1M-context variant of the member; the adapter reads it as the member.

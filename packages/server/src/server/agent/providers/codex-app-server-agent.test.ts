@@ -2821,6 +2821,51 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("reports the model Codex says the thread runs as soon as it says so, not at turn completion", async () => {
+    const session = createSession({ model: "gpt-6-astra" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const reportedModels = () =>
+      events.flatMap((event) => (event.type === "model_changed" ? [event.runtimeInfo.model] : []));
+
+    // Settings that keep the launched model report nothing new.
+    asInternals(session).handleNotification("thread/settings/updated", {
+      threadId: "test-thread",
+      threadSettings: { model: "gpt-6-astra", modelProvider: "openai" },
+    });
+    expect(reportedModels()).toEqual([]);
+
+    // Codex moves the running turn to another model.
+    asInternals(session).handleNotification("model/rerouted", {
+      threadId: "test-thread",
+      turnId: "test-turn",
+      fromModel: "gpt-6-astra",
+      toModel: "gpt-5.4",
+      reason: "highRiskCyberActivity",
+    });
+    expect(reportedModels()).toEqual(["gpt-5.4"]);
+    expect((await session.getRuntimeInfo()).model).toBe("gpt-5.4");
+
+    // Another client of the same app-server sets the thread's model.
+    asInternals(session).handleNotification("thread/settings/updated", {
+      threadId: "test-thread",
+      threadSettings: { model: "gpt-5.5", modelProvider: "openai" },
+    });
+    expect(reportedModels()).toEqual(["gpt-5.4", "gpt-5.5"]);
+    expect((await session.getRuntimeInfo()).model).toBe("gpt-5.5");
+
+    // A sub-agent's thread runs its own model; the agent's model is unchanged.
+    asInternals(session).handleNotification("model/rerouted", {
+      threadId: "child-thread-1",
+      turnId: "child-turn",
+      fromModel: "gpt-5.5",
+      toModel: "gpt-5.4-mini",
+      reason: "highRiskCyberActivity",
+    });
+    expect(reportedModels()).toEqual(["gpt-5.4", "gpt-5.5"]);
+    expect(events.find((event) => event.type === "turn_completed")).toBeUndefined();
+  });
+
   test("converts Codex collab agent notifications through the normal timeline path", () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];

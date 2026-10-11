@@ -368,6 +368,18 @@ export interface AgentManagerOptions {
    * runtime reports another model is stopped.
    */
   sessionIdentity?: SessionIdentity | null;
+  /**
+   * Called when the session refuses an agent for running another model, before
+   * it records the refusal or closes the agent, with the identity the agent has
+   * now and the refusal. The gateway's requests in flight for it are cut off,
+   * and plugins still deliver its timeline items after it closes.
+   */
+  onSessionMemberRefusal?: (refused: {
+    agentId: string;
+    sessionId: string | null;
+    workspaceId: string | null;
+    refusal: string;
+  }) => void;
   beforeSteerUnavailableFallback?: (input: {
     agentId: string;
     expectedTurnId: string;
@@ -811,10 +823,12 @@ export class AgentManager {
   private readonly sessionMemberGate: SessionMemberGate | null;
   /** Agents stopped for running another member, with the refusal; the gateway forwards nothing for them. */
   private readonly sessionMemberRefusals = new Map<string, SessionMemberError>();
+  private readonly onSessionMemberRefusal: AgentManagerOptions["onSessionMemberRefusal"];
 
   constructor(options: AgentManagerOptions) {
     this.pluginLifecycle = options.pluginLifecycle;
     this.sessionMemberGate = SessionMemberGate.of(options.sessionIdentity);
+    this.onSessionMemberRefusal = options.onSessionMemberRefusal;
     this.idFactory = options?.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
@@ -3981,6 +3995,12 @@ export class AgentManager {
     }
     const agentId = agent.id;
     const unsubscribe = agent.session.subscribe((event: AgentStreamEvent) => {
+      // The session's member is checked on the runtime's report itself, before
+      // the event waits behind others: the gateway refuses the agent from here.
+      if (event.type === "model_changed") {
+        const current = this.agents.get(agentId);
+        if (current) this.enforceRuntimeSessionMember(current, event.runtimeInfo.model);
+      }
       this.enqueueSessionEvent(agentId, event);
     });
     agent.unsubscribeSession = unsubscribe;
@@ -4179,18 +4199,33 @@ export class AgentManager {
   /**
    * Stops an agent whose runtime reports a model other than the session's
    * member, however it came to run it: the gateway refuses the agent at once,
-   * and closing it ends its turn. The member header itself never changes.
+   * the timeline records why, and closing it ends its turn. The member header
+   * itself never changes.
    */
-  private enforceRuntimeSessionMember(agent: ActiveManagedAgent): void {
-    const model = agent.runtimeInfo?.model;
+  private enforceRuntimeSessionMember(
+    agent: ActiveManagedAgent,
+    model: string | null | undefined = agent.runtimeInfo?.model,
+  ): void {
     if (!this.sessionMemberGate || !model || this.sessionMemberRefusals.has(agent.id)) return;
     const refusal = this.sessionMemberGate.refusal(agent.provider, model);
     if (!refusal) return;
     this.sessionMemberRefusals.set(agent.id, refusal);
     agent.lastError = refusal.message;
+    this.onSessionMemberRefusal?.({
+      agentId: agent.id,
+      sessionId: agent.persistence?.sessionId ?? null,
+      workspaceId: agent.workspaceId ?? null,
+      refusal: refusal.message,
+    });
     this.logger.warn(
       { agentId: agent.id, member: refusal.member, reported: refusal.attempted },
       "Agent runtime reported a model other than the session's member; stopping it",
+    );
+    this.recordAndDispatchTimelineItem(
+      agent.id,
+      { type: "assistant_message", text: `${SYSTEM_ERROR_PREFIX} ${refusal.message}` },
+      agent.provider,
+      agent.activeForegroundTurnId ?? undefined,
     );
     void this.closeAgent(agent.id, { reason: refusal.message }).catch((error: unknown) => {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to stop agent after refusal");

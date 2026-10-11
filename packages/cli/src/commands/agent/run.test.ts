@@ -9,6 +9,18 @@ import {
 
 const daemonTarget = { kind: "endpoint" as const, host: "example.test:12345" };
 
+// A test that sets `connected.client` runs against that fake daemon; the rest connect for real.
+const connected = vi.hoisted(() => ({ client: null as unknown }));
+vi.mock("../../utils/client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../utils/client.js")>();
+  return {
+    ...actual,
+    connectToDaemon: vi.fn(async (...args: Parameters<typeof actual.connectToDaemon>) =>
+      connected.client ? connected.client : actual.connectToDaemon(...args),
+    ),
+  };
+});
+
 // Answers fetchAgent the way a daemon does: an unknown id is an error.
 function daemonWithAgents(...agentIds: string[]) {
   return {
@@ -154,5 +166,94 @@ describe("runRunCommand option validation", () => {
       { newWorkspace: "worktree", worktreeMode: "container" },
       /Unsupported worktree mode/,
     );
+  });
+});
+
+describe("a run whose agent the daemon refuses", () => {
+  const refusal =
+    "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.";
+  const originalWorkspaceId = process.env.PASEO_WORKSPACE_ID;
+  const originalAgentId = process.env.PASEO_AGENT_ID;
+
+  beforeEach(() => {
+    delete process.env.PASEO_WORKSPACE_ID;
+    delete process.env.PASEO_AGENT_ID;
+  });
+
+  afterEach(() => {
+    connected.client = null;
+    for (const [name, value] of [
+      ["PASEO_WORKSPACE_ID", originalWorkspaceId],
+      ["PASEO_AGENT_ID", originalAgentId],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  /** A daemon holding `existing` workspaces whose session refuses every agent. */
+  function refusingDaemon(existing: string[] = []) {
+    const active = new Set(existing);
+    let created = 0;
+    const daemon = {
+      active,
+      fetchWorkspaces: vi.fn(async () => ({
+        entries: [...active].map((id) => ({ id, workspaceDirectory: "/work/repo" })),
+        pageInfo: { nextCursor: null },
+      })),
+      createWorkspace: vi.fn(async () => {
+        const id = `wks_created_${++created}`;
+        active.add(id);
+        return {
+          workspace: { id, name: "repo", workspaceDirectory: "/work/repo" },
+          setupTerminalId: null,
+          error: null,
+          requestId: "request",
+        };
+      }),
+      createAgent: vi.fn(async () => {
+        throw new Error(refusal);
+      }),
+      archiveWorkspace: vi.fn(async (workspaceId: string) => {
+        active.delete(workspaceId);
+        return { requestId: "request", workspaceId, archivedAt: "now", error: null };
+      }),
+      close: vi.fn(async () => undefined),
+    };
+    connected.client = daemon;
+    return daemon;
+  }
+
+  const run = (options: Partial<AgentRunOptions> = {}) =>
+    runRunCommand(
+      "reply OK",
+      {
+        provider: "claude/claude-sonnet-5-5",
+        cwd: "/work/repo",
+        background: true,
+        daemonTarget,
+        ...options,
+      },
+      {} as never,
+    );
+
+  it("leaves no workspace behind when it created one for the refused agent", async () => {
+    const daemon = refusingDaemon(["wks_existing"]);
+
+    await expect(run()).rejects.toThrow(refusal);
+
+    expect(daemon.createWorkspace).toHaveBeenCalledTimes(1);
+    expect(daemon.archiveWorkspace).toHaveBeenCalledWith("wks_created_1");
+    expect([...daemon.active]).toEqual(["wks_existing"]);
+  });
+
+  it("keeps a workspace it did not create", async () => {
+    const daemon = refusingDaemon(["wks_existing"]);
+
+    await expect(run({ workspace: "wks_existing" })).rejects.toThrow(refusal);
+
+    expect(daemon.createWorkspace).not.toHaveBeenCalled();
+    expect(daemon.archiveWorkspace).not.toHaveBeenCalled();
+    expect([...daemon.active]).toEqual(["wks_existing"]);
   });
 });

@@ -2182,6 +2182,17 @@ const ThreadStartedNotificationSchema = z
   })
   .passthrough();
 
+const ModelReroutedNotificationSchema = z
+  .object({ threadId: z.string(), toModel: z.string().min(1) })
+  .passthrough();
+
+const ThreadSettingsUpdatedNotificationSchema = z
+  .object({
+    threadId: z.string(),
+    threadSettings: z.object({ model: z.string().min(1) }).passthrough(),
+  })
+  .passthrough();
+
 const TurnStartedNotificationSchema = z
   .object({
     threadId: z.string().optional(),
@@ -2569,6 +2580,7 @@ type ParsedCodexNotification =
     }
   | { kind: "thread_rolled_back"; numTurns: number; threadId: string | null }
   | { kind: "context_compacted"; threadId: string; turnId: string | null }
+  | { kind: "model_reported"; threadId: string; model: string }
   | { kind: "invalid_payload"; method: string; params: unknown }
   | { kind: "unknown_method"; method: string; params: unknown };
 
@@ -2714,6 +2726,41 @@ const CodexNotificationSchema = z.union([
       }),
     ),
   z.object({ method: z.literal("thread/compacted"), params: z.unknown() }).transform(
+    ({ method, params }): ParsedCodexNotification => ({
+      kind: "invalid_payload",
+      method,
+      params,
+    }),
+  ),
+  z
+    .object({ method: z.literal("model/rerouted"), params: ModelReroutedNotificationSchema })
+    .transform(
+      ({ params }): ParsedCodexNotification => ({
+        kind: "model_reported",
+        threadId: params.threadId,
+        model: params.toModel,
+      }),
+    ),
+  z.object({ method: z.literal("model/rerouted"), params: z.unknown() }).transform(
+    ({ method, params }): ParsedCodexNotification => ({
+      kind: "invalid_payload",
+      method,
+      params,
+    }),
+  ),
+  z
+    .object({
+      method: z.literal("thread/settings/updated"),
+      params: ThreadSettingsUpdatedNotificationSchema,
+    })
+    .transform(
+      ({ params }): ParsedCodexNotification => ({
+        kind: "model_reported",
+        threadId: params.threadId,
+        model: params.threadSettings.model,
+      }),
+    ),
+  z.object({ method: z.literal("thread/settings/updated"), params: z.unknown() }).transform(
     ({ method, params }): ParsedCodexNotification => ({
       kind: "invalid_payload",
       method,
@@ -3430,6 +3477,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private activeForegroundTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
+  /** The model Codex last said the thread runs, when it differs from the one Paseo set. */
+  private reportedModel: string | null = null;
   private serviceTier: "fast" | null = null;
   private planModeEnabled = false;
   private historyPending = false;
@@ -4523,10 +4572,15 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!this.currentThreadId) {
       await this.ensureThread();
     }
+    return this.currentRuntimeInfo();
+  }
+
+  private currentRuntimeInfo(): AgentRuntimeInfo {
+    if (this.cachedRuntimeInfo) return { ...this.cachedRuntimeInfo };
     const info: AgentRuntimeInfo = {
       provider: CODEX_PROVIDER,
       sessionId: this.currentThreadId,
-      model: this.config.model ?? null,
+      model: this.reportedModel ?? this.config.model ?? null,
       thinkingOptionId: normalizeCodexThinkingOptionId(this.config.thinkingOptionId) ?? null,
       modeId: this.currentMode ?? null,
       extra: this.resolvedCollaborationMode
@@ -4561,6 +4615,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   async setModel(modelId: string | null): Promise<void> {
     this.config.model = modelId ?? undefined;
+    this.reportedModel = null;
     if (!codexModelSupportsFastMode(this.config.model)) {
       this.serviceTier = null;
     }
@@ -5422,6 +5477,9 @@ export class CodexAppServerAgentSession implements AgentSession {
       case "token_usage_updated":
         this.handleTokenUsageUpdatedNotification(parsed);
         return;
+      case "model_reported":
+        this.handleModelReportedNotification(parsed);
+        return;
       case "exec_command_started":
         this.handleExecCommandStartedNotification(parsed);
         return;
@@ -6258,6 +6316,25 @@ export class CodexAppServerAgentSession implements AgentSession {
     parsed: Extract<ParsedCodexNotification, { kind: "thread_rolled_back" }>,
   ): void {
     this.truncateCodexUserMessageTurns(parsed.numTurns);
+  }
+
+  /**
+   * Codex says which model the thread runs when it moves a turn to another
+   * model (`model/rerouted`) or when the thread's settings change
+   * (`thread/settings/updated`), before the turn completes. A model other than
+   * the one reported so far is announced at once.
+   */
+  private handleModelReportedNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "model_reported" }>,
+  ): void {
+    if (parsed.model === (this.reportedModel ?? this.config.model)) return;
+    this.reportedModel = parsed.model === this.config.model ? null : parsed.model;
+    this.cachedRuntimeInfo = null;
+    this.emitEvent({
+      type: "model_changed",
+      provider: CODEX_PROVIDER,
+      runtimeInfo: this.currentRuntimeInfo(),
+    });
   }
 
   private handleContextCompactedNotification(

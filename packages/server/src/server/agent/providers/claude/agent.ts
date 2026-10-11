@@ -2246,6 +2246,10 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
+    return this.currentRuntimeInfo();
+  }
+
+  private currentRuntimeInfo(): AgentRuntimeInfo {
     if (this.cachedRuntimeInfo) {
       return { ...this.cachedRuntimeInfo };
     }
@@ -4226,17 +4230,9 @@ class ClaudeAgentSession implements AgentSession {
         this.appendUserMessageEvents(message, events);
         this.appendSidechainResultEvents(message, events);
         break;
-      case "assistant": {
-        const timelineItems = this.mapBlocksToTimeline(message.message.content, {
-          suppressAssistantText: options?.suppressAssistantText ?? false,
-          suppressReasoning: options?.suppressReasoning ?? false,
-        });
-        for (const item of timelineItems) {
-          events.push({ type: "timeline", item, provider: "claude" });
-        }
-        this.appendSidechainResultEvents(message, events);
+      case "assistant":
+        this.appendAssistantMessageEvents(message, events, options);
         break;
-      }
       case "stream_event":
         this.appendStreamEventEvents(message, events, options);
         break;
@@ -4370,7 +4366,9 @@ class ClaudeAgentSession implements AgentSession {
     events: AgentStreamEvent[],
   ): void {
     if (message.subtype === "init") {
+      const modelBefore = this.lastOptionsModel;
       const sessionUpdate = this.handleSystemMessage(message);
+      if (this.lastOptionsModel !== modelBefore) this.pushModelChanged(events);
       if (sessionUpdate.notice) {
         events.push({
           type: "timeline",
@@ -4553,11 +4551,31 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private appendAssistantMessageEvents(
+    message: Extract<SDKMessage, { type: "assistant" }>,
+    events: AgentStreamEvent[],
+    options: { suppressAssistantText?: boolean; suppressReasoning?: boolean } | undefined,
+  ): void {
+    this.observeRuntimeModel(toObjectRecord(message.message)?.model, events);
+    const timelineItems = this.mapBlocksToTimeline(message.message.content, {
+      suppressAssistantText: options?.suppressAssistantText ?? false,
+      suppressReasoning: options?.suppressReasoning ?? false,
+    });
+    for (const item of timelineItems) {
+      events.push({ type: "timeline", item, provider: "claude" });
+    }
+    this.appendSidechainResultEvents(message, events);
+  }
+
   private appendStreamEventEvents(
     message: Extract<SDKMessage, { type: "stream_event" }>,
     events: AgentStreamEvent[],
     options: { suppressAssistantText?: boolean; suppressReasoning?: boolean } | undefined,
   ): void {
+    const streamEvent = toObjectRecord(message.event);
+    if (readTrimmedString(streamEvent?.type) === "message_start") {
+      this.observeRuntimeModel(toObjectRecord(streamEvent?.message)?.model, events);
+    }
     const usageUpdatedEvent = this.contextUsage.buildStreamUsageEvent(message.event);
     if (usageUpdatedEvent) {
       events.push(usageUpdatedEvent);
@@ -4655,6 +4673,31 @@ class ClaudeAgentSession implements AgentSession {
       threadStartedSessionId: sessionId,
       notice: this.createClaudeSessionChangedNotice(oldSessionId, sessionId),
     };
+  }
+
+  /**
+   * Takes the model a main-thread frame says the request runs: a model request's
+   * `message_start` or an assistant frame. Claude Code reports a model switched
+   * inside the harness (`/model`, a fallback model) on these frames and in the
+   * next init, never to Paseo directly, so the first report is announced at once
+   * rather than at turn completion. Placeholders such as `<synthetic>` report nothing.
+   */
+  private observeRuntimeModel(reported: unknown, events: AgentStreamEvent[]): void {
+    const normalized =
+      typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null;
+    if (!normalized || normalized === this.lastOptionsModel) return;
+    this.lastOptionsModel = normalized;
+    this.lastRuntimeModel = reported as string;
+    this.cachedRuntimeInfo = null;
+    this.pushModelChanged(events);
+  }
+
+  private pushModelChanged(events: AgentStreamEvent[]): void {
+    events.push({
+      type: "model_changed",
+      provider: "claude",
+      runtimeInfo: this.currentRuntimeInfo(),
+    });
   }
 
   private handleSystemMessage(message: SDKSystemMessage): {
