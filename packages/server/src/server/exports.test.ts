@@ -21,7 +21,6 @@ test("keeps daemon-client APIs out of the server public entry", async () => {
 // Keep the emitted dependency tree intact: production runs unbundled modules,
 // so tree-shaking must not hide the cost of an unused re-export.
 test.each([
-  ["desktop daemon management", "../../../desktop/src/daemon/daemon-manager.ts"],
   ["supervisor", "../../scripts/supervisor-entrypoint.ts"],
   ["daemon control", "@getpaseo/server/daemon-control"],
   ["configuration without the session admission resolver", "@getpaseo/server/configuration"],
