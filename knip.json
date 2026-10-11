@@ -2,12 +2,21 @@
   "$schema": "./node_modules/knip/schema.json",
   "workspaces": {
     "plugins": {
-      "entry": ["**/index.{server,client}.{ts,tsx}", "**/*.test.ts"],
-      "project": ["**/*.{ts,tsx}"]
+      "entry": [
+        "**/index.{server,client}.{ts,tsx}",
+        "**/*.test.ts"
+      ],
+      "project": [
+        "**/*.{ts,tsx}"
+      ]
     },
     ".": {
-      "entry": ["scripts/**/*.{js,mjs,cjs,ts}"],
-      "project": ["scripts/**/*.{js,mjs,cjs,ts}"]
+      "entry": [
+        "scripts/**/*.{js,mjs,cjs,ts}"
+      ],
+      "project": [
+        "scripts/**/*.{js,mjs,cjs,ts}"
+      ]
     },
     "packages/server": {
       "entry": [
@@ -24,7 +33,10 @@
         "src/**/*.e2e.ts",
         "src/**/*.e2e.tsx"
       ],
-      "project": ["src/**/*.{ts,tsx}", "scripts/**/*.{ts,mts,mjs,cjs,js}"]
+      "project": [
+        "src/**/*.{ts,tsx}",
+        "scripts/**/*.{ts,mts,mjs,cjs,js}"
+      ]
     },
     "packages/app": {
       "entry": [
@@ -40,36 +52,71 @@
         "vitest.config.{ts,js}",
         "test-stubs/**/*.ts"
       ],
-      "project": ["**/*.{ts,tsx,js,jsx}"],
+      "project": [
+        "**/*.{ts,tsx,js,jsx}"
+      ],
       "paths": {
-        "@server/*": ["../server/src/*"]
+        "@server/*": [
+          "../server/src/*"
+        ]
       },
-      "ignore": ["android/**", "ios/**", ".expo/**", "dist/**", "scripts/reset-project.js"]
+      "ignore": [
+        "android/**",
+        "ios/**",
+        ".expo/**",
+        "dist/**",
+        "scripts/reset-project.js"
+      ]
     },
     "packages/cli": {
-      "entry": ["src/index.ts", "bin/paseo", "src/**/*.test.{ts,tsx}", "tests/**/*.{ts,tsx}"],
-      "project": ["src/**/*.{ts,tsx}", "tests/**/*.{ts,tsx}"]
+      "entry": [
+        "src/index.ts",
+        "bin/paseo",
+        "src/**/*.test.{ts,tsx}",
+        "tests/**/*.{ts,tsx}"
+      ],
+      "project": [
+        "src/**/*.{ts,tsx}",
+        "tests/**/*.{ts,tsx}"
+      ]
     },
     "packages/relay": {
-      "entry": ["src/index.ts", "src/e2ee.ts", "src/cloudflare-adapter.ts", "src/**/*.test.ts"],
-      "project": ["src/**/*.ts"]
-    },
-    "packages/website": {
-      "entry": ["src/router.tsx", "vite.config.ts", "src/routes/**/*.tsx"],
-      "project": ["src/**/*.{ts,tsx}"],
-      "ignore": ["src/routeTree.gen.ts"]
+      "entry": [
+        "src/index.ts",
+        "src/e2ee.ts",
+        "src/cloudflare-adapter.ts",
+        "src/**/*.test.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
     },
     "packages/desktop": {
-      "entry": ["src/main.ts", "src/preload.ts", "src/**/*.test.ts"],
-      "project": ["src/**/*.ts"]
+      "entry": [
+        "src/main.ts",
+        "src/preload.ts",
+        "src/**/*.test.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
     },
     "packages/highlight": {
-      "entry": ["src/index.ts", "src/**/*.test.ts"],
-      "project": ["src/**/*.ts"]
+      "entry": [
+        "src/index.ts",
+        "src/**/*.test.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
     },
     "packages/expo-two-way-audio": {
-      "entry": ["src/index.ts"],
-      "project": ["src/**/*.ts"]
+      "entry": [
+        "src/index.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
     }
   },
   "ignoreDependencies": [
