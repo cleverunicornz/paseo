@@ -7,6 +7,7 @@ import type { PluginMcpGatewayUpstreamRequest } from "@getpaseo/plugin/server";
 
 import { extractHttpBearerToken } from "../auth.js";
 import { MCP_GATEWAY_BACKEND_NAME_PATTERN, type McpGatewayBackend } from "./backends.js";
+import { EventStreamRelay, JsonRpcIdScanner, type JsonRpcId } from "./refusal-stream.js";
 import type { SessionIdentity } from "../session-runtime-config.js";
 
 export type McpGatewayUpstreamRequest = PluginMcpGatewayUpstreamRequest;
@@ -304,82 +305,124 @@ function sendError(res: express.Response, status: number, error: string): void {
  */
 export const MCP_GATEWAY_REFUSAL_CODE = -32003;
 
-/** Enough of a request body to read its JSON-RPC id. */
-const BODY_START_LIMIT = 64 * 1024;
-
-const JSON_SCALAR = String.raw`"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null`;
-/** `id` among the object's leading scalar members, so a nested `id` is never taken for it. */
-const LEADING_ID = new RegExp(
-  String.raw`^\s*\{(?:\s*"(?:[^"\\]|\\.)*"\s*:\s*(?:${JSON_SCALAR})\s*,)*\s*"id"\s*:\s*(${JSON_SCALAR})\s*[,}]`,
-);
-
 /**
- * The JSON-RPC id of the request whose body starts with `bodyStart`, which may
- * be incomplete; null when there is none, as for a GET stream or a batch.
+ * The most of a finite answer the gateway holds for an agent in session mode.
+ * Claude Code passes at most 25,000 tokens (about 100 KB of text) of one MCP
+ * tool result to its model by default, and an image result is a few MB of
+ * base64, so 16 MiB leaves room for every answer an agent can use while one
+ * held answer cannot grow without limit. A larger answer is refused with 502.
  */
-export function jsonRpcRequestId(bodyStart: string): string | number | null {
-  try {
-    const message: unknown = JSON.parse(bodyStart);
-    if (message && typeof message === "object" && !Array.isArray(message) && "id" in message) {
-      const id = (message as { id: unknown }).id;
-      return typeof id === "string" || typeof id === "number" ? id : null;
-    }
-    return null;
-  } catch {
-    const match = LEADING_ID.exec(bodyStart);
-    if (!match?.[1]) return null;
-    const id: unknown = JSON.parse(match[1]);
-    return typeof id === "string" || typeof id === "number" ? id : null;
-  }
-}
-
-/** Keeps the start of a request body as it streams through, to read its JSON-RPC id. */
-function recordBodyStart(req: express.Request): () => string {
-  const chunks: Buffer[] = [];
-  let kept = 0;
-  req.on("data", (chunk: Buffer) => {
-    if (kept >= BODY_START_LIMIT) return;
-    chunks.push(chunk);
-    kept += chunk.length;
-  });
-  return () => Buffer.concat(chunks).toString("utf8");
-}
+export const MAX_HELD_ANSWER_BYTES = 16 * 1024 * 1024;
 
 function isEventStream(headers: IncomingHttpHeaders): boolean {
   return (headers["content-type"] ?? "").toLowerCase().startsWith("text/event-stream");
 }
 
+function refusalEvent(id: JsonRpcId, refusal: string): string {
+  const error = { jsonrpc: "2.0", id, error: { code: MCP_GATEWAY_REFUSAL_CODE, message: refusal } };
+  return `event: message\ndata: ${JSON.stringify(error)}\n\n`;
+}
+
 /**
  * Ends an event-stream answer already under way with the refusal as the
- * JSON-RPC error of the request, so the caller fails the request rather than
- * reading a stream that broke off. The blank lines first close any event the
- * relay left partial.
+ * JSON-RPC error of each request the body carries, so the caller fails the
+ * request rather than reading a stream that broke off. The relay passed on
+ * whole events only, so the refusal starts at an event boundary. The ids come
+ * from the whole body: when it is still arriving, the stream ends once they
+ * are read, or after `waitMs`. A body with no id (a notification, a GET
+ * stream) has no request to fail, and its stream just ends.
  */
-function endWithRefusalEvent(
+function endWithRefusal(input: {
+  req: express.Request;
+  res: express.Response;
+  ids: JsonRpcIdScanner;
+  refusal: string;
+  waitMs: number;
+}): void {
+  const { req, res, ids, refusal } = input;
+  let timer: NodeJS.Timeout | undefined;
+  const finish = () => {
+    clearTimeout(timer);
+    req.off("data", whenSettled);
+    if (res.writableEnded || res.destroyed) return;
+    res.end(ids.ids.map((id) => refusalEvent(id, refusal)).join(""));
+  };
+  const whenSettled = () => {
+    if (ids.settled) finish();
+  };
+  if (ids.settled || req.readableEnded) {
+    finish();
+    return;
+  }
+  req.on("data", whenSettled);
+  req.once("end", finish);
+  req.once("close", finish);
+  timer = setTimeout(finish, input.waitMs);
+  timer.unref();
+}
+
+/**
+ * Relays an event-stream answer in whole events, so a refusal never completes
+ * or breaks an event the caller has only part of.
+ */
+function relayWholeEvents(
+  upstreamResponse: http.IncomingMessage,
   res: express.Response,
-  id: string | number | null,
-  refusal: string,
-): void {
-  if (res.writableEnded || res.destroyed) return;
-  const error = { jsonrpc: "2.0", id, error: { code: MCP_GATEWAY_REFUSAL_CODE, message: refusal } };
-  res.end(`\n\nevent: message\ndata: ${JSON.stringify(error)}\n\n`);
+  isCut: () => boolean,
+): EventStreamRelay {
+  const events = new EventStreamRelay();
+  upstreamResponse.on("data", (chunk: Buffer) => {
+    if (isCut()) return;
+    const whole = events.take(chunk);
+    if (whole.length > 0 && !res.write(whole)) {
+      upstreamResponse.pause();
+      res.once("drain", () => upstreamResponse.resume());
+    }
+  });
+  upstreamResponse.on("end", () => {
+    if (!isCut()) res.end(events.rest());
+  });
+  upstreamResponse.on("error", () => {
+    if (!isCut()) res.destroy();
+  });
+  return events;
 }
 
 /**
  * Holds a finite answer until it is whole and sends it only if `isCut` is
  * still false then, so a refusal before the answer is complete still decides
- * the caller's status.
+ * the caller's status. An answer over `MAX_HELD_ANSWER_BYTES` is refused.
  */
-function sendWholeAnswer(
-  upstreamResponse: http.IncomingMessage,
-  res: express.Response,
-  isCut: () => boolean,
-  unreachable: string,
-): void {
+function sendWholeAnswer(input: {
+  upstreamResponse: http.IncomingMessage;
+  res: express.Response;
+  isCut: () => boolean;
+  backend: string;
+  abandon: () => void;
+}): void {
+  const { upstreamResponse, res, isCut, backend } = input;
   const chunks: Buffer[] = [];
-  upstreamResponse.on("data", (chunk: Buffer) => chunks.push(chunk));
+  let held = 0;
+  let oversized = false;
+  const settled = () => oversized || isCut();
+  upstreamResponse.on("data", (chunk: Buffer) => {
+    if (oversized) return;
+    held += chunk.length;
+    if (held <= MAX_HELD_ANSWER_BYTES) {
+      chunks.push(chunk);
+      return;
+    }
+    oversized = true;
+    chunks.length = 0;
+    input.abandon();
+    sendError(
+      res,
+      502,
+      `MCP backend ${backend} answered more than 16 MiB; in session mode an answer is held whole before it is passed on, up to 16 MiB`,
+    );
+  });
   upstreamResponse.on("end", () => {
-    if (isCut() || res.headersSent || res.destroyed) return;
+    if (settled() || res.headersSent || res.destroyed) return;
     res.writeHead(
       upstreamResponse.statusCode ?? 502,
       upstreamResponse.statusMessage,
@@ -388,7 +431,7 @@ function sendWholeAnswer(
     res.end(Buffer.concat(chunks));
   });
   upstreamResponse.on("error", () => {
-    if (!isCut()) sendError(res, 502, unreachable);
+    if (!settled()) sendError(res, 502, `MCP backend ${backend} is unreachable`);
   });
 }
 
@@ -514,19 +557,27 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
     // head is sent the caller gets 403; an event stream already under way ends
     // with the refusal as the request's JSON-RPC error.
     let cutOff = false;
-    let relayed: http.IncomingMessage | null = null;
-    const bodyStart = recordBodyStart(req);
+    let abandoned = false;
+    let relayed: EventStreamRelay | null = null;
+    const ids = new JsonRpcIdScanner();
+    req.on("data", (chunk: Buffer) => ids.push(chunk));
+    req.on("end", () => ids.end());
     const untrack = trackForRefusal(options.requests, agent, (reason) => {
       cutOff = true;
       clearTimeout(responseTimer);
       req.unpipe(upstreamRequest);
-      relayed?.unpipe(res);
       upstreamRequest.destroy();
-      if (relayed) endWithRefusalEvent(res, jsonRpcRequestId(bodyStart()), reason);
-      else sendError(res, 403, reason);
+      if (relayed) {
+        relayed.drop();
+        endWithRefusal({ req, res, ids, refusal: reason, waitMs: responseTimeoutMs });
+      } else {
+        sendError(res, 403, reason);
+      }
       req.resume();
     });
-    const holdsFiniteAnswers = options.sessionIdentity !== null && !agent.drain;
+    // In session mode a refusal must decide what the agent receives: finite
+    // answers are held whole, event streams relayed in whole events.
+    const settlesAnswers = options.sessionIdentity !== null && !agent.drain;
 
     upstreamRequest.on("response", (upstreamResponse) => {
       clearTimeout(responseTimer);
@@ -534,22 +585,34 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
         upstreamResponse.destroy();
         return;
       }
-      if (holdsFiniteAnswers && !isEventStream(upstreamResponse.headers)) {
-        sendWholeAnswer(
+      const eventStream = isEventStream(upstreamResponse.headers);
+      if (settlesAnswers && !eventStream) {
+        sendWholeAnswer({
           upstreamResponse,
           res,
-          () => cutOff,
-          `MCP backend ${backend} is unreachable`,
-        );
+          isCut: () => cutOff,
+          backend,
+          abandon: () => {
+            abandoned = true;
+            logger.warn(
+              { backend, agentId: agent.agentId },
+              "MCP backend answer over 16 MiB refused",
+            );
+            upstreamRequest.destroy();
+          },
+        });
         return;
       }
-      relayed = upstreamResponse;
       res.writeHead(
         upstreamResponse.statusCode ?? 502,
         upstreamResponse.statusMessage,
         buildResponseHeaders(upstreamResponse.headers),
       );
       res.flushHeaders();
+      if (settlesAnswers) {
+        relayed = relayWholeEvents(upstreamResponse, res, () => cutOff);
+        return;
+      }
       upstreamResponse.on("error", () => {
         if (!cutOff) res.destroy();
       });
@@ -557,7 +620,7 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
     });
     upstreamRequest.on("error", (error) => {
       clearTimeout(responseTimer);
-      if (timedOut || cutOff) return;
+      if (timedOut || cutOff || abandoned) return;
       logger.warn({ err: error, backend, agentId: agent.agentId }, "MCP backend unreachable");
       sendError(res, 502, `MCP backend ${backend} is unreachable`);
     });

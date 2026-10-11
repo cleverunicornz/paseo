@@ -145,9 +145,12 @@ stopped for running another member gets `403` with the refusal until it is close
 closing revokes its token. Neither request is forwarded. A request already being forwarded when the
 agent is stopped is cut off: a body still arriving never completes at the backend. In session mode
 the gateway holds an agent's finite (non-event-stream) answers until they are whole, so such a
-request is answered `403`. An event-stream answer is relayed as it arrives; when its `200` head has
-already gone out, the stream ends with one last event, a JSON-RPC error for the request's `id` (or
-`null` when it has none) with code `-32003` and the refusal as its message.
+request is answered `403`; a finite answer over 16 MiB is refused with `502`. An event-stream
+answer is relayed in whole events as they arrive. When its `200` head has already gone out, the
+event the agent has only part of is dropped and the stream ends with one last event for each
+request the body carries: a JSON-RPC error for that request's `id`, read from the whole body
+whatever its size, with code `-32003` and the refusal as its message. A body with no `id`, such as
+a notification or a GET stream, has no request to fail, and its stream just ends.
 
 Paseo holds no backend credential. A plugin supplies one per request through the
 [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks); without one the request goes
