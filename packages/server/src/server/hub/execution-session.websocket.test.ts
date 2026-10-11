@@ -280,7 +280,7 @@ test("Hub receives standard server info but not broadcasts outside its scope", a
   const trustedStatus = await hub.trustedDaemonStatus();
 
   expect(trustedBroadcasts).toBe(0);
-  expect(trustedStatus).toMatchObject({ pid: process.pid, relay: { enabled: false } });
+  expect(trustedStatus).toMatchObject({ pid: process.pid, relay: null });
   expect(hub.observedTrustedLifecycleMessages()).toEqual(["server_info"]);
 });
 

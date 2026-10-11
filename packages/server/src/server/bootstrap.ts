@@ -170,7 +170,6 @@ import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createConfiguredTerminalManager } from "../terminal/terminal-manager-factory.js";
 import { applyTerminalAgentHookSetting } from "../terminal/agent-hooks/terminal-agent-hook-setting.js";
 import { loadOrCreateDaemonKeyPair } from "./daemon-keypair.js";
-import { createRelayRuntime, type RelayRuntime } from "./relay-runtime.js";
 import { getOrCreateServerId } from "./server-id.js";
 import { resolveDaemonVersion } from "./daemon-version.js";
 import type { AgentClient, AgentProvider } from "./agent/agent-sdk-types.js";
@@ -516,7 +515,6 @@ export interface PaseoDaemonDependencies {
   createHubDaemonId?: () => string;
   serverFeatureOverrides?: {
     daemonStatusRpc?: boolean;
-    relayConfig?: boolean;
   };
 }
 
@@ -671,7 +669,6 @@ export async function createPaseoDaemon(
   void reconcileManagedProcessLedger(managedProcesses, logger).catch((error) => {
     logger.warn({ err: error }, "Failed to reconcile managed helper process ledger");
   });
-  let relayRuntime: RelayRuntime | null = null;
 
   const staticDir = config.staticDir;
   const downloadTokenTtlMs = config.downloadTokenTtlMs ?? 60000;
@@ -1769,11 +1766,6 @@ export async function createPaseoDaemon(
             daemonConfigStore.onFieldChange("appendSystemPrompt", (value) => {
               agentManager.setAppendSystemPrompt(typeof value === "string" ? value : "");
             });
-            const relayEnabled = config.relayEnabled ?? true;
-            const relayEndpoint = config.relayEndpoint ?? "relay.paseo.sh:443";
-            const relayPublicEndpoint = config.relayPublicEndpoint ?? relayEndpoint;
-            const relayUseTls = config.relayUseTls ?? relayEndpoint === "relay.paseo.sh:443";
-            const relayPublicUseTls = config.relayPublicUseTls ?? relayUseTls;
             if (boundListenTarget.type === "tcp") {
               logger.info(
                 {
@@ -1812,7 +1804,6 @@ export async function createPaseoDaemon(
                 getAllowedOrigins: () => allowedOrigins,
                 getHostnames: () => configuredHostnames,
                 daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
-                relayConfig: dependencies.serverFeatureOverrides?.relayConfig,
                 startPaused: true,
               },
               workspaceAutoName,
@@ -1846,14 +1837,6 @@ export async function createPaseoDaemon(
                   return appBaseUrl;
                 },
                 desktopManaged: config.desktopManaged === true,
-                getRelayConfig: () =>
-                  relayRuntime?.getConfig() ?? {
-                    enabled: daemonConfigStore.get().relay?.enabled ?? relayEnabled,
-                    endpoint: relayEndpoint,
-                    publicEndpoint: relayPublicEndpoint,
-                    useTls: relayUseTls,
-                    publicUseTls: relayPublicUseTls,
-                  },
               },
               serviceProxyPublicBaseUrl,
               browserToolsBroker,
@@ -1867,25 +1850,6 @@ export async function createPaseoDaemon(
             await pluginRuntime.start();
             providerSnapshotManager.settlePluginProviders();
             wsServer.beginAcceptingConnections();
-            relayRuntime = createRelayRuntime({
-              config: {
-                enabled: relayEnabled,
-                endpoint: relayEndpoint,
-                publicEndpoint: relayPublicEndpoint,
-                useTls: relayUseTls,
-                publicUseTls: relayPublicUseTls,
-              },
-              logger,
-              attachSocket: async (ws, metadata) => {
-                if (!wsServer) throw new Error("WebSocket server is not ready");
-                await wsServer.attachExternalSocket(ws, metadata);
-              },
-              serverId,
-              daemonKeyPair: daemonKeyPair.keyPair,
-            });
-            daemonConfigStore.onFieldChange("relay.enabled", (value) => {
-              relayRuntime?.setEnabled(value === true);
-            });
             await hubRelationships.start();
           };
 
@@ -1965,7 +1929,6 @@ export async function createPaseoDaemon(
     await pluginRuntime.stopAllPlugins();
     terminalManager.killAll();
     await scheduleService.stop().catch(() => undefined);
-    await relayRuntime?.stop().catch(() => undefined);
     if (wsServer) {
       await wsServer.close();
     }

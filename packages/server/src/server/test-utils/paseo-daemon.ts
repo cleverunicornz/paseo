@@ -25,7 +25,6 @@ interface TestPaseoDaemonOptions {
   relayUseTls?: boolean;
   relayPublicUseTls?: boolean;
   daemonStatusRpcCapability?: boolean;
-  relayConfigCapability?: boolean;
   agentClients?: Partial<Record<AgentProvider, AgentClient>>;
   providerOverrides?: PaseoDaemonConfig["providerOverrides"];
   paseoHomeRoot?: string;
@@ -98,7 +97,6 @@ export async function createTestPaseoDaemon(
       builtinPlugins: options.builtinPlugins ?? new BuiltinPluginLoader(undefined, []),
       serverFeatureOverrides: {
         daemonStatusRpc: options.daemonStatusRpcCapability,
-        relayConfig: options.relayConfigCapability,
       },
     });
     try {

@@ -187,7 +187,7 @@ describe("DaemonSession", () => {
     const { subsystem, emitted } = makeSubsystem({
       serverId: "srv-1",
       daemonVersion: "1.2.3",
-      daemonRuntimeConfig: { listen: "127.0.0.1:6767", getRelayConfig: () => null },
+      daemonRuntimeConfig: { listen: "127.0.0.1:6767" },
       listProviderAvailability: async () => [
         { provider: "claude", available: true, error: null },
         { provider: "codex", available: false, error: "boom" },
@@ -221,7 +221,7 @@ describe("DaemonSession", () => {
     const { subsystem, emitted } = makeSubsystem({
       serverId: "srv-1",
       daemonVersion: "1.2.3",
-      daemonRuntimeConfig: { listen: "127.0.0.1:6767", getRelayConfig: () => null },
+      daemonRuntimeConfig: { listen: "127.0.0.1:6767" },
       listProviderAvailability: async () => {
         throw new Error("provider listing failed");
       },
@@ -271,20 +271,11 @@ describe("DaemonSession", () => {
     const { subsystem, emitted, paseoHome } = makeSubsystem({
       serverId: "srv-1",
       daemonVersion: "1.2.3",
-      daemonRuntimeConfig: {
-        listen: "127.0.0.1:6767",
-        getRelayConfig: () => ({
-          enabled: true,
-          endpoint: "relay.secret.test:443",
-          publicEndpoint: "relay.secret.test:443",
-          useTls: true,
-          publicUseTls: true,
-        }),
-      },
+      daemonRuntimeConfig: { listen: "127.0.0.1:6767" },
     });
     writeFileSync(
       join(paseoHome, "daemon.log"),
-      "first line\nrelay.secret.test:443 token=super-secret paseo://pairing-secret\n",
+      "first line\n127.0.0.1:6767 token=super-secret paseo://pairing-secret\n",
     );
 
     await subsystem.handleDiagnosticsRequest({ type: "diagnostics.request", requestId: "d-1" });
@@ -298,7 +289,7 @@ describe("DaemonSession", () => {
     expect(message.payload.requestId).toBe("d-1");
     expect(message.payload.diagnostic).toContain("Daemon log tail");
     expect(message.payload.diagnostic).toContain("first line");
-    expect(message.payload.diagnostic).not.toContain("relay.secret.test:443");
+    expect(message.payload.diagnostic).not.toContain("127.0.0.1:6767 token");
     expect(message.payload.diagnostic).not.toContain("super-secret");
     expect(message.payload.diagnostic).not.toContain("pairing-secret");
   });

@@ -17,13 +17,6 @@ export interface DaemonRuntimeConfig {
   worktreesRoot?: string;
   appBaseUrl?: string;
   desktopManaged?: boolean;
-  getRelayConfig(): {
-    enabled: boolean;
-    endpoint: string;
-    publicEndpoint: string;
-    useTls: boolean;
-    publicUseTls: boolean;
-  } | null;
 }
 
 export interface DaemonSessionHost {
@@ -56,7 +49,7 @@ export interface DaemonSessionOptions {
 
 /**
  * A client's read surface for the daemon process itself: its runtime status
- * (pid-lock start time, listen address, relay config, provider availability).
+ * (pid-lock start time, listen address, provider availability).
  * Owns the `daemon.*` RPCs. Reaches no state beyond the never-mutated runtime values injected at
  * construction and the outbound channel.
  */
@@ -187,7 +180,8 @@ export class DaemonSession {
           nodePath: process.execPath,
           startedAt: pidInfo?.startedAt ?? null,
           listen: this.daemonRuntimeConfig?.listen ?? null,
-          relay: this.daemonRuntimeConfig?.getRelayConfig() ?? null,
+          // This daemon has no relay connection.
+          relay: null,
           providers,
         },
       });

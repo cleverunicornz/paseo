@@ -144,14 +144,8 @@ function collectProcessEntries(options: DaemonDiagnosticsOptions): DiagnosticEnt
 }
 
 function collectRuntimeConfigEntries(options: DaemonDiagnosticsOptions): DiagnosticEntry[] {
-  const relay = options.daemonRuntimeConfig?.getRelayConfig() ?? null;
   return [
     { label: "Listen", value: formatListenKind(options.daemonRuntimeConfig?.listen ?? null) },
-    { label: "Relay enabled", value: relay ? String(relay.enabled) : "false" },
-    { label: "Relay endpoint configured", value: relay?.endpoint ? "true" : "false" },
-    { label: "Relay public endpoint configured", value: relay?.publicEndpoint ? "true" : "false" },
-    { label: "Relay TLS", value: relay ? String(relay.useTls) : "n/a" },
-    { label: "Relay public TLS", value: relay ? String(relay.publicUseTls) : "n/a" },
   ];
 }
 
@@ -545,11 +539,9 @@ export function redactDiagnostic(
   options?: Partial<DaemonDiagnosticsOptions>,
 ): string {
   let redacted = value;
-  const sensitiveValues = [
-    options?.daemonRuntimeConfig?.listen,
-    options?.daemonRuntimeConfig?.getRelayConfig()?.endpoint,
-    options?.daemonRuntimeConfig?.getRelayConfig()?.publicEndpoint,
-  ].filter((item): item is string => Boolean(item));
+  const sensitiveValues = [options?.daemonRuntimeConfig?.listen].filter((item): item is string =>
+    Boolean(item),
+  );
 
   for (const sensitive of sensitiveValues) {
     redacted = redacted.split(sensitive).join("[redacted]");

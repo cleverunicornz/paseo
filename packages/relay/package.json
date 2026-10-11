@@ -1,7 +1,7 @@
 {
   "name": "@getpaseo/relay",
   "version": "0.11.2",
-  "description": "Paseo relay for bridging daemon and client connections",
+  "description": "End-to-end encryption for Paseo relay connections",
   "files": [
     "dist",
     "!dist/**/*.map"
@@ -16,10 +16,6 @@
     "./e2ee": {
       "types": "./dist/e2ee.d.ts",
       "default": "./dist/e2ee.js"
-    },
-    "./cloudflare": {
-      "types": "./dist/cloudflare-adapter.d.ts",
-      "default": "./dist/cloudflare-adapter.js"
     }
   },
   "publishConfig": {
