@@ -21,15 +21,6 @@ import {
   snapshotGitCommandRuntimeMetrics,
 } from "../utils/run-git-command.js";
 import { DEFAULT_GIT_PROCESS_POLICY } from "../utils/git-process-scheduler.js";
-import type {
-  HubEnrollment,
-  HubEnrollmentResult,
-  HubRelationshipRemote,
-  HubRevocation,
-  HubSocketConnection,
-  HubSocketCredentials,
-  HubSocketEvents,
-} from "./hub/relationship-remote.js";
 
 interface HeldAgentClose {
   started: Promise<void>;
