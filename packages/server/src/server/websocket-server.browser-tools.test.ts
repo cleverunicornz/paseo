@@ -309,8 +309,6 @@ function createVoiceAssistantWebSocketServer(params: {
     createWorkspaceAutoNameStub(),
     undefined,
     undefined,
-    undefined,
-    undefined,
     "1.2.3-test",
     undefined,
     undefined,

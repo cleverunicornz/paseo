@@ -33,7 +33,6 @@ import {
   type ArchiveDependencies,
 } from "../../workspace-archive-service.js";
 import { createAgentCommand, type CreateAgentFromMcpInput } from "../create-agent/create.js";
-import type { VoiceCallerContext, VoiceSpeakHandler } from "../../voice-types.js";
 import type { FirstAgentContext } from "../../messages.js";
 import { everyMsToFiveFieldCron } from "@getpaseo/protocol/schedule/cadence";
 import { expandUserPath, isSameOrDescendantPath, resolvePathFromBase } from "../../path-utils.js";
@@ -146,14 +145,6 @@ export interface PaseoToolHostDependencies {
    * Used for cwd/mode inheritance when agents spawn child agents.
    */
   callerAgentId?: string;
-  /**
-   * Optional resolver for session-bound speak handlers.
-   * Used by hidden voice agents to narrate through daemon-managed TTS.
-   */
-  resolveSpeakHandler?: (callerAgentId: string) => VoiceSpeakHandler | null;
-  resolveCallerContext?: (callerAgentId: string) => VoiceCallerContext | null;
-  enableVoiceTools?: boolean;
-  voiceOnly?: boolean;
   logger: Logger;
 }
 
@@ -573,12 +564,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     providerSnapshotManager,
     daemonConfigStore,
     callerAgentId,
-    resolveSpeakHandler,
-    resolveCallerContext,
     logger,
   } = options;
   const childLogger = logger.child({ module: "agent", component: "paseo-tool-catalog" });
-  const callerContext = callerAgentId ? (resolveCallerContext?.(callerAgentId) ?? null) : null;
 
   const parseToolInput = async (tool: PaseoToolDefinition, input: unknown): Promise<unknown> => {
     const inputSchema = tool.inputSchema;
@@ -680,8 +668,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       return resolveChildAgentCwd({
         parentCwd: callerAgent.cwd,
         requestedCwd,
-        lockedCwd: callerContext?.lockedCwd,
-        allowCustomCwd: callerContext?.allowCustomCwd ?? true,
+        allowCustomCwd: true,
       });
     }
 
@@ -1184,49 +1171,6 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   type TopLevelCreateAgentArgs = z.infer<typeof canonicalTopLevelCreateAgentArgsSchema>;
   type LegacyTopLevelCreateAgentArgs = z.infer<typeof legacyTopLevelCreateAgentArgsSchema>;
 
-  if (options.voiceOnly || options.enableVoiceTools || callerContext?.enableVoiceTools) {
-    registerTool(
-      "speak",
-      {
-        title: "Speak",
-        description:
-          "Speak text to the user via daemon-managed voice output. Blocks until playback completes.",
-        inputSchema: {
-          text: z
-            .string()
-            .trim()
-            .min(1, "text is required")
-            .max(4000, "text must be 4000 characters or fewer"),
-        },
-        outputSchema: {
-          ok: z.boolean(),
-        },
-      },
-      async (args, context) => {
-        if (!callerAgentId) {
-          throw new Error("speak is only available to agent-scoped tool sessions");
-        }
-        const handler = resolveSpeakHandler?.(callerAgentId) ?? null;
-        if (!handler) {
-          throw new Error(`No speak handler registered for your session '${callerAgentId}'`);
-        }
-        await handler({
-          text: args.text,
-          callerAgentId,
-          signal: context?.signal,
-        });
-        return {
-          content: [],
-          structuredContent: ensureValidJson({ ok: true }),
-        };
-      },
-    );
-  }
-
-  if (options.voiceOnly) {
-    return toCatalog();
-  }
-
   if (options.browserToolsEnabled && options.browserToolsBroker) {
     registerBrowserTools({
       registerTool,
@@ -1510,7 +1454,6 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           notifyOnFinish,
           detached: resolvedArgs.detached,
           callerAgentId,
-          callerContext,
           worktree,
         },
       );
@@ -1847,10 +1790,6 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       const cwd = workspace.cwd
         ? resolveScopedCwd(workspace.cwd, { required: true })
         : existingWorkspace.cwd;
-      const lockedCwd = callerContext?.lockedCwd?.trim();
-      if (lockedCwd && !isSameOrDescendantPath(expandUserPath(lockedCwd), cwd)) {
-        throw new Error(`Workspace ${workspace.workspaceId} is outside the allowed cwd`);
-      }
       return {
         cwd,
         workspaceId: workspace.workspaceId,
