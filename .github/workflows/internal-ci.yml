@@ -233,8 +233,8 @@ jobs:
       - name: Run the whole server unit suite
         run: npm run test:unit --workspace=@getpaseo/server -- --maxWorkers=6 --exclude "src/server/file-observer/**"
       - name: Run the file observer suites alone
-        # Upstream's thousand-write stress test hangs to its 90 s timeout now and then (about one
-        # whole-file run in six, v0.11.2 and this branch alike) and under the parallel run's load on
-        # these runners every time. Alone, with retries, it still has to pass.
+        # Upstream's thousand-write stress test hit its 90 s timeout in all three full parallel runs
+        # on these runners that included it, and in some workbench runs of this file on v0.11.2 and
+        # this branch alike (#13, G-2). Alone, with retries, it still has to pass.
         working-directory: packages/server
         run: npx vitest run src/server/file-observer --maxWorkers=1 --retry=2
