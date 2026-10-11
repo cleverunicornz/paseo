@@ -268,51 +268,75 @@ const CR = 0x0d;
  * that ends an event go on at once, and an event whose blank line has not
  * arrived is held back. Cutting the stream off then never completes, or
  * breaks, an event the caller has only part of. Lines end with LF, CRLF or CR.
+ *
+ * An event is bounded by its full size, from its first byte to its last byte
+ * before the line endings that end it, however the stream is chunked: an
+ * event over `maxEventBytes` is never passed on, even when its last bytes
+ * and blank line arrive in one chunk. The events before it are, and the
+ * relay passes nothing further.
  */
 export class EventStreamRelay {
   private held: Buffer[] = [];
-  private heldLength = 0;
+  // Stream offsets: of the next byte to arrive, and of the current event's first byte.
+  private consumed = 0;
+  private eventStart = 0;
   private lineEmpty = true;
   private afterCR = false;
   private lastWasBoundary = false;
+  private over = false;
+
+  constructor(private readonly maxEventBytes: number) {}
+
+  /** An event grew past `maxEventBytes`; it and everything after it are dropped. */
+  get oversized(): boolean {
+    return this.over;
+  }
 
   /** What of the held bytes and `chunk` ends on an event boundary; the rest is held. */
   take(chunk: Buffer): Buffer {
-    let boundary = -1;
-    for (let index = 0; index < chunk.length; index += 1) {
-      const byte = chunk[index];
-      if (this.afterCR) {
-        this.afterCR = false;
-        // The LF of a CRLF whose CR already ended the line.
-        if (byte === LF) {
-          if (this.lastWasBoundary) boundary = index + 1;
-          continue;
-        }
-      }
-      if (byte === LF || byte === CR) {
-        this.lastWasBoundary = this.lineEmpty;
-        if (this.lineEmpty) boundary = index + 1;
-        this.lineEmpty = true;
-        this.afterCR = byte === CR;
-      } else {
-        this.lineEmpty = false;
-        this.lastWasBoundary = false;
-      }
+    if (this.over) return Buffer.alloc(0);
+    const base = this.consumed;
+    this.consumed += chunk.length;
+    for (let index = 0; index < chunk.length && !this.over; index += 1) {
+      this.read(chunk[index], base + index);
     }
-    if (boundary < 0) {
-      this.held.push(chunk);
-      this.heldLength += chunk.length;
+    if (this.eventStart <= base) {
+      // No event ended in this chunk.
+      if (this.over) this.drop();
+      else this.held.push(chunk);
       return Buffer.alloc(0);
     }
-    const whole = Buffer.concat([...this.held, chunk.subarray(0, boundary)]);
-    this.held = boundary < chunk.length ? [chunk.subarray(boundary)] : [];
-    this.heldLength = chunk.length - boundary;
+    const ended = this.eventStart - base;
+    const whole = Buffer.concat([...this.held, chunk.subarray(0, ended)]);
+    this.held = !this.over && ended < chunk.length ? [chunk.subarray(ended)] : [];
     return whole;
   }
 
-  /** The bytes of the event held back so far, waiting for its blank line. */
-  get heldBytes(): number {
-    return this.heldLength;
+  private read(byte: number, at: number): void {
+    if (this.afterCR) {
+      this.afterCR = false;
+      // The LF of a CRLF whose CR already ended the line.
+      if (byte === LF) {
+        if (this.lastWasBoundary) this.eventEnds(at);
+        return;
+      }
+    }
+    if (byte === LF || byte === CR) {
+      this.lastWasBoundary = this.lineEmpty;
+      if (this.lineEmpty) this.eventEnds(at);
+      this.lineEmpty = true;
+      this.afterCR = byte === CR;
+      return;
+    }
+    this.lineEmpty = false;
+    this.lastWasBoundary = false;
+    // The event so far, up to this byte: line endings that end it never count.
+    if (at + 1 - this.eventStart > this.maxEventBytes) this.over = true;
+  }
+
+  /** The blank line at `at` ends the event: the next one starts after it. */
+  private eventEnds(at: number): void {
+    this.eventStart = at + 1;
   }
 
   /** At the stream's end: whatever is held, passed on as it came. */
@@ -325,6 +349,5 @@ export class EventStreamRelay {
   /** At a refusal, or an event over the bound: the unfinished event is dropped. */
   drop(): void {
     this.held = [];
-    this.heldLength = 0;
   }
 }
