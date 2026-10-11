@@ -427,7 +427,17 @@ export type AgentStreamEvent =
       currentModeId: string | null;
       availableModes: AgentMode[];
     }
-  | { type: "model_changed"; provider: AgentProvider; runtimeInfo: AgentRuntimeInfo }
+  | {
+      type: "model_changed";
+      provider: AgentProvider;
+      runtimeInfo: AgentRuntimeInfo;
+      /**
+       * The runtime itself named this model (a stream frame, an app-server
+       * notification or response), rather than a configured value echoed back.
+       * Only such a report admits an agent the session refused again.
+       */
+      reported?: boolean;
+    }
   | {
       type: "thinking_option_changed";
       provider: AgentProvider;

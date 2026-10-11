@@ -510,6 +510,12 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  /**
+   * In session mode, the `<provider>/<model>` the session refused this agent
+   * for running. It stays refused, across closes, resumes and daemon restarts,
+   * until its runtime itself reports the session's member.
+   */
+  sessionMemberRefused?: string;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
@@ -659,6 +665,13 @@ interface SteerEventBarrier {
 
 const BUSY_STATUSES: Set<AgentLifecycleStatus> = new Set(["initializing", "running"]);
 const AgentIdSchema = z.guid();
+
+/** A native session, as the refusals of the agents running it are keyed: `provider:sessionId`. */
+function nativeSessionKey(
+  persistence: { provider: string; sessionId?: string | null } | null | undefined,
+): string | null {
+  return persistence?.sessionId ? `${persistence.provider}:${persistence.sessionId}` : null;
+}
 
 function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
@@ -856,12 +869,23 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
   private readonly admission: AgentAdmission;
   private readonly sessionMemberGate: SessionMemberGate | null;
+  /** Agents stopped for running another member, with the refusal; the gateway forwards nothing for them. */
+  private readonly sessionMemberRefusals = new Map<string, SessionMemberError>();
   /**
-   * Agents stopped for running another model than the session's member, or
-   * outside session mode than their creation model, with the refusal; the
-   * gateway forwards nothing for them.
+   * Refusals by native session (`nativeSessionKey`). A refusal belongs to the
+   * native session an agent ran: every agent running it, live or still
+   * starting under another agent id, is refused with it.
    */
-  private readonly sessionMemberRefusals = new Map<string, SessionMemberError | ModelPinError>();
+  private readonly nativeSessionRefusals = new Map<string, SessionMemberError>();
+  /** The native session each agent being resumed or imported starts, until it is registered. */
+  private readonly startingNativeSessions = new Map<string, string>();
+  /**
+   * Outside session mode, live agents stopped for running another model than
+   * their creation model, with the refusal; the gateway forwards nothing for
+   * them. A new session for the agent launches on its creation model, so the
+   * refusal ends with the session it stopped.
+   */
+  private readonly modelPinRefusals = new Map<string, ModelPinError>();
   private readonly onSessionMemberRefusal: AgentManagerOptions["onSessionMemberRefusal"];
 
   constructor(options: AgentManagerOptions) {
@@ -971,14 +995,39 @@ export class AgentManager {
     context.modelPin = creationModel;
   }
 
-  /** Clears an agent's error, except the refusal of an agent the session stopped. */
+  /** Clears an agent's error, except the refusal of an agent the daemon stopped. */
   private clearLastError(agent: ManagedAgent): void {
-    agent.lastError = this.sessionMemberRefusals.get(agent.id)?.message;
+    agent.lastError = this.modelRefusalOf(agent.id)?.message;
   }
 
   /** Why the daemon stopped this agent for running another member or creation model, or null. */
   getSessionMemberRefusal(agentId: string): string | null {
-    return this.sessionMemberRefusals.get(agentId)?.message ?? null;
+    return this.modelRefusalOf(agentId)?.message ?? null;
+  }
+
+  /** The agent's session-member refusal or, outside session mode, its creation-model refusal. */
+  private modelRefusalOf(agentId: string): SessionMemberError | ModelPinError | undefined {
+    return this.sessionMemberRefusalOf(agentId) ?? this.modelPinRefusals.get(agentId);
+  }
+
+  /** The agent's own refusal, or that of a native session it runs or is starting. */
+  private sessionMemberRefusalOf(agentId: string): SessionMemberError | undefined {
+    const own = this.sessionMemberRefusals.get(agentId);
+    if (own) return own;
+    for (const key of this.nativeSessionKeysOf(agentId)) {
+      const refusal = this.nativeSessionRefusals.get(key);
+      if (refusal) return refusal;
+    }
+    return undefined;
+  }
+
+  private nativeSessionKeysOf(agentId: string): string[] {
+    const keys: string[] = [];
+    const starting = this.startingNativeSessions.get(agentId);
+    if (starting) keys.push(starting);
+    const running = nativeSessionKey(this.agents.get(agentId)?.persistence);
+    if (running && running !== starting) keys.push(running);
+    return keys;
   }
 
   updateProviderRegistry(input: {
@@ -1606,17 +1655,50 @@ export class AgentManager {
       "resumeAgentFromPersistence",
     );
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
-    // Decide residency from durable state inside the lifecycle lane. A loader may
-    // have read the record before a queued archive or restore completed. Residency is
-    // settled before the config is prepared, because a history load reads an archived
-    // agent whose working directory may be gone.
-    const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
-    const creationModel = resumedCreationModel(record, metadata);
     const mergedConfig = {
       ...metadata,
       ...overrides,
       provider: handle.provider,
     } as AgentSessionConfig;
+    // From here until it is registered, the agent is refused with any refusal of its native session.
+    const nativeSession = nativeSessionKey(handle);
+    if (nativeSession) this.startingNativeSessions.set(resolvedAgentId, nativeSession);
+    try {
+      return await this.resumeStartingAgent({
+        handle,
+        mergedConfig,
+        resolvedAgentId,
+        options,
+        resumeOptions,
+      });
+    } finally {
+      if (this.startingNativeSessions.get(resolvedAgentId) === nativeSession) {
+        this.startingNativeSessions.delete(resolvedAgentId);
+      }
+    }
+  }
+
+  private async resumeStartingAgent(input: {
+    handle: AgentPersistenceHandle;
+    mergedConfig: AgentSessionConfig;
+    resolvedAgentId: string;
+    options: Parameters<AgentManager["resumeAgentFromPersistence"]>[3];
+    resumeOptions: AgentResumeSessionOptions | undefined;
+  }): Promise<ManagedAgent> {
+    const { handle, mergedConfig, resolvedAgentId, options, resumeOptions } = input;
+    // Decide residency from durable state inside the lifecycle lane. A loader may
+    // have read the record before a queued archive or restore completed. Residency is
+    // settled before the config is prepared, because a history load reads an archived
+    // agent whose working directory may be gone.
+    const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
+    this.restoreSessionMemberRefusal(
+      resolvedAgentId,
+      record?.sessionMemberRefused ?? (await this.refusedModelOfNativeSession(handle)),
+    );
+    const creationModel = resumedCreationModel(
+      record,
+      (handle.metadata ?? {}) as Partial<AgentSessionConfig>,
+    );
     // A session resumed without a model runs the one it was created with, never a
     // provider default that has changed since.
     if (!this.sessionMemberGate && creationModel && !mergedConfig.model?.trim()) {
@@ -1725,11 +1807,29 @@ export class AgentManager {
   }): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
-    const release = await this.admission.admitAgent(resolvedAgentId, "new");
+    // An import starts the native session under a new agent id, as an explicit
+    // resume does: it keeps the native session's refusal.
+    const nativeSession = nativeSessionKey({
+      provider: input.provider,
+      sessionId: input.providerHandleId,
+    });
+    if (nativeSession) this.startingNativeSessions.set(resolvedAgentId, nativeSession);
     try {
-      return await this.importAdmittedSession(input, resolvedAgentId);
+      this.restoreSessionMemberRefusal(
+        resolvedAgentId,
+        await this.refusedModelOfNativeSession({
+          provider: input.provider,
+          sessionId: input.providerHandleId,
+        }),
+      );
+      const release = await this.admission.admitAgent(resolvedAgentId, "new");
+      try {
+        return await this.importAdmittedSession(input, resolvedAgentId);
+      } finally {
+        release();
+      }
     } finally {
-      release();
+      this.startingNativeSessions.delete(resolvedAgentId);
     }
   }
 
@@ -2685,8 +2785,8 @@ export class AgentManager {
 
     finalText = this.getLastAssistantMessageFromTimeline(timeline) ?? "";
 
-    // The session stopped this agent mid-run for running another member.
-    const refusal = this.sessionMemberRefusals.get(agentId);
+    // The daemon stopped this agent mid-run for running another member or creation model.
+    const refusal = this.modelRefusalOf(agentId);
     if (refusal) throw refusal;
     const agent = this.requireAgent(agentId);
     const sessionId = agent.persistence?.sessionId;
@@ -3853,6 +3953,17 @@ export class AgentManager {
         durableTimelineHasRows,
         options,
       });
+      // Outside session mode a new session launches pinned to the creation model and is
+      // judged on what its runtime reports, so a creation-model refusal ends here.
+      this.modelPinRefusals.delete(resolvedAgentId);
+      // A refused agent stays refused in its new session, as does one starting a
+      // refused native session: only its runtime's own report of the member admits it again.
+      const keptRefusal = this.sessionMemberRefusalOf(resolvedAgentId);
+      if (keptRefusal) {
+        this.sessionMemberRefusals.set(resolvedAgentId, keptRefusal);
+        managed.sessionMemberRefused = keptRefusal.attempted;
+        managed.lastError = keptRefusal.message;
+      }
 
       // Read history before publishing the agent: a provider failure must leave the
       // session unregistered so the registration catch closes it.
@@ -3902,8 +4013,6 @@ export class AgentManager {
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
       this.subscribeToSession(managed);
-      // A new session for this agent is judged on what its runtime reports now.
-      this.sessionMemberRefusals.delete(managed.id);
       this.enforceRuntimeSessionMember(managed);
       return { ...managed };
     } catch (error) {
@@ -4116,7 +4225,11 @@ export class AgentManager {
       // the event waits behind others: the gateway refuses the agent from here.
       if (event.type === "model_changed") {
         const current = this.agents.get(agentId);
-        if (current) this.enforceRuntimeSessionMember(current, event.runtimeInfo.model);
+        if (current) {
+          this.enforceRuntimeSessionMember(current, event.runtimeInfo.model, {
+            reported: event.reported === true,
+          });
+        }
       }
       this.enqueueSessionEvent(agentId, event);
     });
@@ -4314,27 +4427,118 @@ export class AgentManager {
   }
 
   /**
-   * Stops an agent whose runtime reports a model other than the session's
-   * member, or outside session mode than the agent's creation model, however
-   * it came to run it: the gateway refuses the agent at once, the timeline
-   * records why, and closing it ends its turn. The member header itself never
-   * changes.
+   * Judges the model an agent runs against the session's member. An agent
+   * that runs another model is refused: the gateway refuses it at once, the
+   * timeline records why, and closing it ends its turn. A refused agent stays
+   * refused, whatever starts it again, until a model its runtime itself
+   * reports (`reported`) is the member; a configured model never admits it,
+   * and a reported model other than the member stops it again. The member
+   * header itself never changes. Outside session mode the agent's creation
+   * model takes the member's place; see enforceCreationModel.
    */
   private enforceRuntimeSessionMember(
     agent: ActiveManagedAgent,
     model: string | null | undefined = agent.runtimeInfo?.model,
+    options: { reported?: boolean } = {},
   ): void {
-    if (!model || this.sessionMemberRefusals.has(agent.id)) return;
-    const refusal = this.runtimeModelRefusal(agent, model);
+    if (!model) return;
+    if (!this.sessionMemberGate) {
+      this.enforceCreationModel(agent, model);
+      return;
+    }
+    const refusal = this.sessionMemberGate.refusal(agent.provider, model);
+    const kept = this.sessionMemberRefusalOf(agent.id);
+    if (kept) {
+      if (!options.reported) return;
+      // A refused agent already closing is not stopped twice.
+      if (refusal && !this.inFlightAgentCloses.has(agent.id)) this.stopRefusedAgent(agent, refusal);
+      else if (!refusal) this.readmitSessionMember(agent, kept);
+      return;
+    }
     if (!refusal) return;
-    this.sessionMemberRefusals.set(agent.id, refusal);
-    agent.lastError = refusal.message;
+    this.refuseAgent(agent.id, refusal);
+    agent.sessionMemberRefused = refusal.attempted;
+    this.refuseNativeSession(agent.id, refusal);
+    this.stopRefusedAgent(agent, refusal);
+  }
+
+  /**
+   * Outside session mode, stops an agent whose runtime reports another model
+   * than its creation model, configured or reported, as session mode stops one
+   * off its member. The refusal lasts while the session it stopped does: a new
+   * session launches pinned to the creation model and is judged on what its own
+   * runtime reports. An agent created on a provider default it did not name
+   * takes the first model its runtime reports as its creation model.
+   */
+  private enforceCreationModel(agent: ActiveManagedAgent, model: string): void {
+    if (this.modelPinRefusals.has(agent.id)) return;
+    if (agent.creationModel === null) {
+      agent.creationModel = model;
+      return;
+    }
+    const refusal = modelPinRefusal(agent.creationModel, model);
+    if (!refusal) return;
+    this.modelPinRefusals.set(agent.id, refusal);
     this.onSessionMemberRefusal?.({
       agentId: agent.id,
       sessionId: agent.persistence?.sessionId ?? null,
       workspaceId: agent.workspaceId ?? null,
       refusal: refusal.message,
     });
+    this.stopRefusedAgent(agent, refusal);
+  }
+
+  /** Records `refusal` for the agent: from now on the gateway forwards nothing for it. */
+  private refuseAgent(agentId: string, refusal: SessionMemberError): void {
+    this.sessionMemberRefusals.set(agentId, refusal);
+    const agent = this.agents.get(agentId);
+    if (agent) agent.sessionMemberRefused = refusal.attempted;
+    this.onSessionMemberRefusal?.({
+      agentId,
+      sessionId: agent?.persistence?.sessionId ?? null,
+      workspaceId: agent?.workspaceId ?? null,
+      refusal: refusal.message,
+    });
+  }
+
+  /**
+   * The refusal belongs to the native session the agent runs: every other
+   * agent running it, live or still starting, is refused with it at once. A
+   * live one stays refused, as a resumed one does, until its own runtime
+   * reports the member.
+   */
+  private refuseNativeSession(agentId: string, refusal: SessionMemberError): void {
+    const keys = new Set(this.nativeSessionKeysOf(agentId));
+    for (const key of keys) this.nativeSessionRefusals.set(key, refusal);
+    const aliases = new Set<string>();
+    for (const [id, key] of this.startingNativeSessions) if (keys.has(key)) aliases.add(id);
+    for (const other of this.agents.values()) {
+      const key = nativeSessionKey(other.persistence);
+      if (key && keys.has(key)) aliases.add(other.id);
+    }
+    aliases.delete(agentId);
+    for (const alias of aliases) {
+      if (this.sessionMemberRefusals.has(alias)) continue;
+      this.refuseAgent(alias, refusal);
+      const live = this.agents.get(alias);
+      if (live) {
+        live.lastError = refusal.message;
+        this.recordAndDispatchTimelineItem(
+          alias,
+          { type: "assistant_message", text: `${SYSTEM_ERROR_PREFIX} ${refusal.message}` },
+          live.provider,
+          live.activeForegroundTurnId ?? undefined,
+        );
+        this.emitState(live);
+      }
+    }
+  }
+
+  private stopRefusedAgent(
+    agent: ActiveManagedAgent,
+    refusal: SessionMemberError | ModelPinError,
+  ): void {
+    agent.lastError = refusal.message;
     if (refusal instanceof SessionMemberError) {
       this.logger.warn(
         { agentId: agent.id, member: refusal.member, reported: refusal.attempted },
@@ -4357,22 +4561,40 @@ export class AgentManager {
     });
   }
 
+  /** The agent's runtime reported the session's member: the session admits it again. */
+  private readmitSessionMember(agent: ActiveManagedAgent, kept: SessionMemberError): void {
+    this.sessionMemberRefusals.delete(agent.id);
+    // Its runtime reported the member in this native session, which is admitted again.
+    for (const key of this.nativeSessionKeysOf(agent.id)) this.nativeSessionRefusals.delete(key);
+    agent.sessionMemberRefused = undefined;
+    if (agent.lastError === kept.message) agent.lastError = undefined;
+    this.logger.info(
+      { agentId: agent.id, member: kept.member, refused: kept.attempted },
+      "Agent runtime reports the session's member again; admitting it",
+    );
+    this.emitState(agent);
+  }
+
   /**
-   * The refusal for an agent whose runtime reports `model`: against the
-   * session's member, or outside session mode against the agent's creation
-   * model. An agent created on a provider default it did not name takes the
-   * first model its runtime reports as its creation model.
+   * The model the session refused any agent for that ran this native session.
+   * A resume or an import under a new agent id starts the same native session,
+   * so it keeps that refusal too.
    */
-  private runtimeModelRefusal(
-    agent: ActiveManagedAgent,
-    model: string,
-  ): SessionMemberError | ModelPinError | null {
-    if (this.sessionMemberGate) return this.sessionMemberGate.refusal(agent.provider, model);
-    if (agent.creationModel === null) {
-      agent.creationModel = model;
-      return null;
-    }
-    return modelPinRefusal(agent.creationModel, model);
+  private async refusedModelOfNativeSession(
+    handle: Pick<AgentPersistenceHandle, "provider" | "sessionId">,
+  ): Promise<string | undefined> {
+    if (!this.sessionMemberGate || !this.registry || !handle.sessionId) return undefined;
+    const records = await this.registry.listByProviderSession(handle.provider, handle.sessionId);
+    return records.find((record) => record.sessionMemberRefused)?.sessionMemberRefused;
+  }
+
+  /** Restores the refusal recorded for an agent before it is started again. */
+  private restoreSessionMemberRefusal(agentId: string, refused: string | undefined): void {
+    if (!this.sessionMemberGate || !refused || this.sessionMemberRefusals.has(agentId)) return;
+    this.sessionMemberRefusals.set(
+      agentId,
+      new SessionMemberError(this.sessionMemberGate.member, refused),
+    );
   }
 
   private async refreshRuntimeInfo(
@@ -4387,14 +4609,15 @@ export class AgentManager {
         newInfo.sessionId !== agent.runtimeInfo?.sessionId ||
         newInfo.modeId !== agent.runtimeInfo?.modeId;
       agent.runtimeInfo = newInfo;
-      // Registration checks once it has subscribed; see registerSession.
-      if (agent.unsubscribeSession) this.enforceRuntimeSessionMember(agent);
       if (!agent.persistence && newInfo.sessionId) {
         agent.persistence = attachPersistenceCwd(
           { provider: agent.provider, sessionId: newInfo.sessionId },
           agent.cwd,
         );
       }
+      // Registration checks once it has subscribed; see registerSession. A refusal
+      // is recorded for the native session too, so it is known first.
+      if (agent.unsubscribeSession) this.enforceRuntimeSessionMember(agent);
       // Emit state if runtimeInfo changed so clients get the updated model
       if (changed && options?.emit !== false) {
         this.emitState(agent);
@@ -4765,8 +4988,8 @@ export class AgentManager {
         this.emitState(agent);
         return undefined;
       case "model_changed":
+        // The session subscription judged this report against the member already.
         agent.runtimeInfo = event.runtimeInfo;
-        this.enforceRuntimeSessionMember(agent);
         if (!agent.persistence && event.runtimeInfo.sessionId) {
           agent.persistence = attachPersistenceCwd(
             { provider: agent.provider, sessionId: event.runtimeInfo.sessionId },

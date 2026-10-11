@@ -2177,6 +2177,8 @@ class ClaudeAgentSession implements AgentSession {
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
+  /** Whether Claude Code reported its model since the current query started. */
+  private runtimeModelReported = false;
   private compacting = false;
   private compactionMarkerOpen = false;
   private queryPumpPromise: Promise<void> | null = null;
@@ -3241,6 +3243,7 @@ class ClaudeAgentSession implements AgentSession {
     const options = await this.buildOptions();
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
+    this.runtimeModelReported = false;
     this.query = claudeQuery(
       { prompt: input.iterable, options },
       {
@@ -4379,7 +4382,11 @@ class ClaudeAgentSession implements AgentSession {
     if (message.subtype === "init") {
       const modelBefore = this.lastOptionsModel;
       const sessionUpdate = this.handleSystemMessage(message);
-      if (this.lastOptionsModel !== modelBefore) this.pushModelChanged(events);
+      const reported = Boolean(this.reportedRuntimeModel(message.model));
+      if (this.lastOptionsModel !== modelBefore || (reported && !this.runtimeModelReported)) {
+        this.pushModelChanged(events, reported);
+      }
+      if (reported) this.runtimeModelReported = true;
       if (sessionUpdate.notice) {
         events.push({
           type: "timeline",
@@ -4695,11 +4702,14 @@ class ClaudeAgentSession implements AgentSession {
    */
   private observeRuntimeModel(reported: unknown, events: AgentStreamEvent[]): void {
     const normalized = this.reportedRuntimeModel(reported);
-    if (!normalized || normalized === this.lastOptionsModel) return;
+    if (!normalized) return;
+    const first = !this.runtimeModelReported;
+    this.runtimeModelReported = true;
+    if (normalized === this.lastOptionsModel && !first) return;
     this.lastOptionsModel = normalized;
     this.lastRuntimeModel = reported as string;
     this.cachedRuntimeInfo = null;
-    this.pushModelChanged(events);
+    this.pushModelChanged(events, true);
   }
 
   /**
@@ -4714,11 +4724,16 @@ class ClaudeAgentSession implements AgentSession {
     return typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null;
   }
 
-  private pushModelChanged(events: AgentStreamEvent[]): void {
+  /**
+   * `reported` when Claude Code itself named the model; otherwise the model is
+   * the configured one, taken while no report has come.
+   */
+  private pushModelChanged(events: AgentStreamEvent[], reported: boolean): void {
     events.push({
       type: "model_changed",
       provider: "claude",
       runtimeInfo: this.currentRuntimeInfo(),
+      reported,
     });
   }
 
