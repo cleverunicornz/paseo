@@ -128,4 +128,22 @@ describe("withRuntimePaseoMcpServer", () => {
       url: "{paseoMcpGatewayUrl}/cluster",
     });
   });
+
+  test("passes a stdio server stored without a type through unchanged", () => {
+    // Schedules store MCP servers as untyped records, so a Claude-style
+    // `{ command, args }` entry reaches the launch without `type: "stdio"`.
+    const untypedStdio = { command: "node", args: ["{agentId}.js"] };
+    const result = withRuntimePaseoMcpServer({
+      config: {
+        ...BASE_CONFIG,
+        mcpServers: { docs: untypedStdio } as unknown as AgentSessionConfig["mcpServers"],
+      },
+      agentId: "agent-1",
+      mcpBaseUrl: null,
+      agentToken: "agent-1-token",
+      mcpGatewayBaseUrl: null,
+    });
+
+    expect(result.mcpServers?.docs).toEqual(untypedStdio);
+  });
 });

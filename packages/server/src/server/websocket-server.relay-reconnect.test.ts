@@ -258,6 +258,7 @@ function createServer(options?: {
       subscribe: vi.fn(() => () => {}),
       setAgentAttentionCallback: vi.fn(),
       getAgent: vi.fn(() => null),
+      isSingleAgent: vi.fn(() => false),
       getMetricsSnapshot: vi.fn(() => ({
         totalAgents: 0,
         idleAgents: 0,
@@ -1146,6 +1147,8 @@ describe("relay external socket reconnect behavior", () => {
     expect(serverInfo.features?.["terminal-input-mode-replay"]).toBe(true);
     expect(serverInfo.features?.["terminal-size-ownership"]).toBe(true);
     expect(serverInfo.features?.agentTurnIdentity).toBeUndefined();
+    expect(serverInfo.features?.agentForkContext).toBe(true);
+    expect(serverInfo.features?.singleAgent).toBeUndefined();
     expect(serverInfo.permissions).toEqual(DAEMON_PERMISSIONS);
     await server.close();
   });

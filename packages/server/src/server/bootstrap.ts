@@ -443,7 +443,7 @@ export interface PaseoDaemonConfig {
   mcpGatewayModelBackends?: Record<string, string>;
   /** Names and `NAME_*` prefixes a gateway harness may inherit beyond the base variables. */
   mcpGatewayEnvPassthrough?: string[];
-  /** The Codex executable serving the local tools; absent or null, they are off. */
+  /** The executable serving the local tools (see LocalToolsConfig); absent or null, they are off. */
   localTools?: LocalToolsConfig | null;
   /** Per-agent tool trees. */
   toolTree?: ToolTreeConfig;

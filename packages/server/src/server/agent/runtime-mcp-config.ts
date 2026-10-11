@@ -19,7 +19,9 @@ export function substituteMcpServerValues(
 
   const result: Record<string, McpServerConfig> = {};
   for (const [name, server] of Object.entries(servers)) {
-    if (server.type === "stdio") {
+    // Only URL servers carry placeholders. Stored schedules may hold a stdio
+    // server without its `type`, so anything that is not HTTP or SSE passes through.
+    if (server.type !== "http" && server.type !== "sse") {
       result[name] = server;
       continue;
     }
