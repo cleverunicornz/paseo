@@ -152,6 +152,8 @@ import type { SpawnEnvOptions } from "../../../../utils/spawn.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
+import { assertModelPin } from "../../model-pin.js";
+import { pinnedRuntimeModel } from "./pinned-runtime-model.js";
 
 const fsPromises = promises;
 const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
@@ -428,6 +430,7 @@ interface ClaudeAgentSessionOptions {
   agentId?: string;
   launchEnv?: Record<string, string>;
   modelGateway?: AgentModelGateway;
+  modelPin?: string;
   harnessEnvironment: HarnessEnvironment;
   persistSession?: boolean;
   logger: Logger;
@@ -1551,6 +1554,7 @@ export class ClaudeAgentClient implements AgentClient {
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       modelGateway: launchContext?.modelGateway,
+      modelPin: launchContext?.modelPin,
       harnessEnvironment: this.harnessEnvironment,
       persistSession: options?.persistSession,
       logger: this.logger,
@@ -1583,6 +1587,7 @@ export class ClaudeAgentClient implements AgentClient {
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       modelGateway: launchContext?.modelGateway,
+      modelPin: launchContext?.modelPin,
       harnessEnvironment: this.harnessEnvironment,
       logger: this.logger,
       queryFactory: this.queryFactory,
@@ -2109,6 +2114,8 @@ class ClaudeAgentSession implements AgentSession {
   private readonly config: ClaudeAgentConfig;
   private readonly launchEnv?: Record<string, string>;
   private readonly modelGateway?: AgentModelGateway;
+  /** The one model this session may run, when the daemon pins the agent's creation model. */
+  private readonly modelPin?: string;
   private readonly harnessEnvironment: HarnessEnvironment;
   private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
@@ -2193,6 +2200,7 @@ class ClaudeAgentSession implements AgentSession {
     assertClaudeThinkingOptionSupported(config.model, config.thinkingOptionId);
     this.launchEnv = options.launchEnv;
     this.modelGateway = options.modelGateway;
+    this.modelPin = options.modelPin;
     // A gateway route always launches under the allowlist.
     this.harnessEnvironment = options.modelGateway
       ? { kind: "allowlist", envPassthrough: options.modelGateway.envPassthrough }
@@ -2515,6 +2523,8 @@ class ClaudeAgentSession implements AgentSession {
   async setModel(modelId: string | null): Promise<void> {
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
+    // Refused before the query starts or hears of it.
+    assertModelPin(this.modelPin, normalizedModelId);
     const activeQuery = await this.ensureQuery();
     await activeQuery.setModel(normalizedModelId ?? undefined);
     this.config.model = normalizedModelId ?? undefined;
@@ -3432,6 +3442,7 @@ class ClaudeAgentSession implements AgentSession {
       base.mcpServers = this.normalizeMcpServers(this.config.mcpServers);
     }
 
+    assertModelPin(this.modelPin, this.config.model);
     if (this.config.model) {
       base.model = this.config.model;
     }
@@ -4371,7 +4382,7 @@ class ClaudeAgentSession implements AgentSession {
     if (message.subtype === "init") {
       const modelBefore = this.lastOptionsModel;
       const sessionUpdate = this.handleSystemMessage(message);
-      const reported = Boolean(normalizeClaudeRuntimeModelId(message.model));
+      const reported = Boolean(this.reportedRuntimeModel(message.model));
       if (this.lastOptionsModel !== modelBefore || (reported && !this.runtimeModelReported)) {
         this.pushModelChanged(events, reported);
       }
@@ -4690,8 +4701,7 @@ class ClaudeAgentSession implements AgentSession {
    * rather than at turn completion. Placeholders such as `<synthetic>` report nothing.
    */
   private observeRuntimeModel(reported: unknown, events: AgentStreamEvent[]): void {
-    const normalized =
-      typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null;
+    const normalized = this.reportedRuntimeModel(reported);
     if (!normalized) return;
     const first = !this.runtimeModelReported;
     this.runtimeModelReported = true;
@@ -4700,6 +4710,18 @@ class ClaudeAgentSession implements AgentSession {
     this.lastRuntimeModel = reported as string;
     this.cachedRuntimeInfo = null;
     this.pushModelChanged(events, true);
+  }
+
+  /**
+   * The model a runtime frame reports. A pinned session compares the reported
+   * ID exactly, with only the listed spellings of its pin (see
+   * pinned-runtime-model.ts), so a model the manifest does not know, or one
+   * that merely normalises to the pin, still reads as a switch. An unpinned
+   * session, session mode's among them, reports the normalised model.
+   */
+  private reportedRuntimeModel(reported: unknown): string | null {
+    if (this.modelPin !== undefined) return pinnedRuntimeModel(this.modelPin, reported);
+    return typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null;
   }
 
   /**
@@ -4763,7 +4785,7 @@ class ClaudeAgentSession implements AgentSession {
     }
     this.persistence = null;
     if (message.model) {
-      const normalizedRuntimeModel = normalizeClaudeRuntimeModelId(message.model);
+      const normalizedRuntimeModel = this.reportedRuntimeModel(message.model);
       this.logger.debug(
         { runtimeModel: message.model, normalizedRuntimeModel },
         "Captured runtime model from SDK init",

@@ -56,6 +56,9 @@ const STORED_AGENT_SCHEMA = z.object({
   lastStatus: AgentStatusSchema.default("closed"),
   lastModeId: z.string().nullable().optional(),
   config: SERIALIZABLE_CONFIG_SCHEMA,
+  // Outside session mode the agent runs no other model. Absent in records written before
+  // agents recorded it; the agent then keeps `config.model`.
+  creationModel: z.string().nullable().optional(),
   runtimeInfo: z
     .object({
       provider: z.string(),

@@ -87,6 +87,7 @@ export function toStoredAgentRecord(
     lastStatus: agent.lifecycle,
     lastModeId: agent.currentModeId ?? config?.modeId ?? null,
     config: config ?? null,
+    creationModel: agent.creationModel,
     runtimeInfo,
     features: normalizeFeatures(agent.features),
     persistence,
