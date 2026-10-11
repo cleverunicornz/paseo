@@ -145,12 +145,19 @@ stopped for running another member gets `403` with the refusal until it is close
 closing revokes its token. Neither request is forwarded. A request already being forwarded when the
 agent is stopped is cut off: a body still arriving never completes at the backend. In session mode
 the gateway holds an agent's finite (non-event-stream) answers until they are whole, so such a
-request is answered `403`; a finite answer over 16 MiB is refused with `502`. An event-stream
-answer is relayed in whole events as they arrive. When its `200` head has already gone out, the
-event the agent has only part of is dropped and the stream ends with one last event for each
-request the body carries: a JSON-RPC error for that request's `id`, read from the whole body
-whatever its size, with code `-32003` and the refusal as its message. A body with no `id`, such as
-a notification or a GET stream, has no request to fail, and its stream just ends.
+request is answered `403`. A finite answer over 16 MiB is refused with `502`, and one whose
+backend sends no byte after its head for the backend's response timeout (default 30 s) ends in
+`504`; neither passes on anything of the answer. An event-stream answer is relayed in whole events
+as they arrive; one event over 16 MiB is dropped and the stream ends with a JSON-RPC error,
+code `-32603`, for each request. When a refused agent's `200` head has already gone out, the event
+it has only part of is dropped and the stream ends with one last event for each request the body
+carries: a JSON-RPC error for that request's `id`, code `-32003` with the refusal as its message.
+The `id` is read from the whole body, whatever its size and however its name is escaped, and named
+exactly as the body wrote it, up to 16 MiB; a longer id is named `null` with Invalid Request
+(`-32600`), the answer JSON-RPC gives a request whose id could not be read. Of duplicate `id`
+members the last counts once the body is complete, as with `JSON.parse`; while the body still
+arrives, the first one read names the request. A body with no `id`, such as a notification or a
+GET stream, has no request to fail, and its stream just ends.
 
 Paseo holds no backend credential. A plugin supplies one per request through the
 [`mcp_gateway.upstream` hook](/docs/plugins/reference#before-hooks); without one the request goes

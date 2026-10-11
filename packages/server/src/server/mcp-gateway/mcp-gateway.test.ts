@@ -1053,7 +1053,9 @@ type SdkRefusalCase =
   /** A result event cut off inside its JSON. */
   | "unfinished-result"
   /** A body still arriving, whose `id` follows a nested object. */
-  | "id-after-object";
+  | "id-after-object"
+  /** The `id` member's name written with a JSON escape, `"\u0069d"`. */
+  | "escaped-key";
 
 const SDK_REFUSAL =
   "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.";
@@ -1151,6 +1153,10 @@ async function refuseSdkToolCall(mode: SdkRefusalCase) {
       typeof message === "object" &&
       (message as { method?: string }).method === "tools/call";
     let sent = init;
+    if (toolCall && mode === "escaped-key" && typeof init?.body === "string") {
+      const { id } = message as { id: number };
+      sent = { ...init, body: init.body.replace(`"id":${id}`, `"\\u0069d":${id}`) };
+    }
     if (toolCall && mode === "id-after-object") {
       const { id, params } = message as { id: number; params: unknown };
       const start = `{"params":${JSON.stringify(params)},"id":${id},"jsonrpc":"2.0","method":`;
@@ -1226,6 +1232,7 @@ describe("the session's refusal, as the MCP SDK client sees it", () => {
     "result-without-terminator",
     "unfinished-result",
     "id-after-object",
+    "escaped-key",
   ])(
     "a pending tool call whose event stream is under way ends in the refusal (%s)",
     async (mode) => {
@@ -1241,6 +1248,173 @@ describe("the session's refusal, as the MCP SDK client sees it", () => {
     },
     10_000,
   );
+});
+
+/** Error events (JSON-RPC messages) at the end of an event-stream answer. */
+function errorEvents(
+  text: string,
+): Array<{ id: unknown; error: { code: number; message: string } }> {
+  return text
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map(
+      (line) =>
+        JSON.parse(line.slice(6)) as { id: unknown; error: { code: number; message: string } },
+    )
+    .filter((message) => message.error !== undefined);
+}
+
+/** Sends `body` to an event-stream backend, refuses the agent once the stream is open, and reads the end. */
+async function refuseOpenStream(body: string) {
+  const requests = new McpGatewayRequests();
+  let refused: string | null = null;
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(": ready\n\n");
+  });
+  const backendUrl = await listen(server);
+  closers.push(closeServer(server));
+  const gateway = await startGateway({
+    backends: { cluster: backendUrl },
+    sessionIdentity: SESSION_IDENTITY,
+    agentRefusal: () => refused,
+    requests,
+  });
+  const request = http.request(`${gateway}/cluster`, {
+    method: "POST",
+    headers: { Authorization: "Bearer token-a", "content-type": "application/json" },
+  });
+  const answer = new Promise<{ status: number; text: string }>((resolve) => {
+    request.on("response", (response) => {
+      let text = "";
+      response.on("data", (chunk: Buffer) => {
+        text += chunk.toString("utf8");
+        if (text.startsWith(": ready") && refused === null) {
+          refused = "refused for the test";
+          requests.refuse("agent-a", refused);
+        }
+      });
+      response.on("end", () => resolve({ status: response.statusCode ?? 0, text }));
+    });
+  });
+  request.end(body);
+  return answer;
+}
+
+describe("the refusal names every valid request id", () => {
+  test.each([1025, 1024 * 1024])(
+    "a string id of %i characters is named in full",
+    async (length) => {
+      const id = "x".repeat(length);
+      const { status, text } = await refuseOpenStream(
+        JSON.stringify({ jsonrpc: "2.0", id, method: "x" }),
+      );
+      expect(status).toBe(200);
+      const events = errorEvents(text);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.id).toBe(id);
+      expect(events[0]?.error).toEqual({ code: -32003, message: "refused for the test" });
+    },
+    20_000,
+  );
+
+  test.each([
+    String.raw`{"\u0069d":7,"method":"x"}`,
+    String.raw`{"i\u0064":7,"method":"x"}`,
+    String.raw`{"\u0069\u0064":7,"method":"x"}`,
+    String.raw`{"\u0049d":8,"\u0069d":7,"method":"x"}`,
+  ])("an id whose member name is escaped is named: %s", async (body) => {
+    const { text } = await refuseOpenStream(body);
+    expect(errorEvents(text).map((event) => event.id)).toEqual([7]);
+  });
+
+  test("a complete body with a duplicate id names the one JSON.parse keeps, the last", async () => {
+    const { text } = await refuseOpenStream('{"id":999,"jsonrpc":"2.0","method":"x","id":1}');
+    expect(errorEvents(text).map((event) => event.id)).toEqual([1]);
+  });
+});
+
+describe("a held answer whose backend stops sending", () => {
+  test("a finite answer stalled after its head ends in a clean 504 once the backend's response timeout passes without a byte", async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"jsonrpc":"2.0","id":1,"result":');
+    });
+    const requests = new McpGatewayRequests();
+    const gateway = await startGateway({
+      backends: { cluster: { url: upstream.url, responseTimeoutMs: 200 } },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: () => null,
+      requests,
+    });
+    const started = Date.now();
+    const answer = await Promise.race([
+      fetch(`${gateway}/cluster`, {
+        method: "POST",
+        headers: { Authorization: "Bearer token-a" },
+        body: MCP_INIT,
+      }).then(async (response) => ({ status: response.status, body: await response.text() })),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
+    ]);
+
+    expect(answer).toEqual({
+      status: 504,
+      body: JSON.stringify({ error: "MCP backend cluster stopped sending its answer for 200 ms" }),
+    });
+    expect(Date.now() - started).toBeLessThan(2_000);
+  }, 10_000);
+});
+
+/** The most of one event the gateway holds back for an agent in session mode. */
+const HELD_EVENT_LIMIT = 16 * 1024 * 1024;
+
+describe("events held whole in session mode", () => {
+  async function eventOfSize(size: number, terminated: boolean) {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const data = "data: ";
+      res.write(`${data}${"x".repeat(size - data.length)}`);
+      if (terminated) res.end("\n\n");
+    });
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: () => null,
+      requests: new McpGatewayRequests(),
+    });
+    return Promise.race([
+      fetch(`${gateway}/cluster`, {
+        method: "POST",
+        headers: { Authorization: "Bearer token-a" },
+        body: '{"jsonrpc":"2.0","id":5,"method":"tools/call"}',
+      }).then(async (response) => ({ status: response.status, text: await response.text() })),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+    ]);
+  }
+
+  test("an event of at most 16 MiB is passed on whole", async () => {
+    const answer = await eventOfSize(HELD_EVENT_LIMIT, true);
+    expect(answer?.status).toBe(200);
+    expect(answer?.text.length).toBe(HELD_EVENT_LIMIT + 2);
+  }, 20_000);
+
+  test("an event over 16 MiB is dropped and the stream ends with an error for the request", async () => {
+    const answer = await eventOfSize(HELD_EVENT_LIMIT + 1, false);
+    expect(answer?.status).toBe(200);
+    expect(answer?.text.startsWith("data: x")).toBe(false);
+    expect(errorEvents(answer?.text ?? "")).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: 5,
+        error: {
+          code: -32603,
+          message:
+            "MCP backend cluster sent an event of more than 16 MiB; in session mode an event is held whole before it is passed on, up to 16 MiB",
+        },
+      },
+    ]);
+  }, 20_000);
 });
 
 /** The most of a finite answer the gateway holds for an agent in session mode. */
