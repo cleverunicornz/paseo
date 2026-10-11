@@ -3,6 +3,8 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import pino from "pino";
 import { afterEach, describe, expect, test } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 import {
   createMcpGatewayHandler,
@@ -1041,6 +1043,244 @@ describe("MCP gateway", () => {
     });
     expect(upstream.requests).toHaveLength(0);
   });
+});
+
+/** How the fake backend answers a tool call in the refusal cases an MCP client sees. */
+type SdkRefusalCase =
+  /** A 256 KiB argument: the SDK writes `id` last, past any kept prefix of the body. */
+  | "large-request"
+  /** A whole result event whose terminating blank line has not arrived. */
+  | "result-without-terminator"
+  /** A result event cut off inside its JSON. */
+  | "unfinished-result"
+  /** A body still arriving, whose `id` follows a nested object. */
+  | "id-after-object";
+
+const SDK_REFUSAL =
+  "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.";
+
+/** A backend speaking MCP Streamable HTTP that opens each tool call's event stream as `mode` says. */
+async function startSdkBackend(mode: SdkRefusalCase, answered: () => void): Promise<string> {
+  const server = http.createServer((req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(405).end();
+      return;
+    }
+    let body = "";
+    req.on("error", () => undefined);
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString("utf8");
+      // The streamed tool call never ends; its event stream opens on its first bytes.
+      if (mode === "id-after-object" && body.startsWith('{"params":') && !res.headersSent) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(": ready\n\n");
+        answered();
+      }
+    });
+    req.on("end", () => {
+      const message = JSON.parse(body) as {
+        id?: number;
+        method: string;
+        params?: { protocolVersion?: string };
+      };
+      if (message.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: message.params?.protocolVersion,
+              capabilities: { tools: {} },
+              serverInfo: { name: "fixture", version: "1" },
+            },
+          }),
+        );
+        return;
+      }
+      if (message.id === undefined) {
+        res.writeHead(202).end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const result = { jsonrpc: "2.0", id: message.id, result: { content: [] } };
+      if (mode === "result-without-terminator") {
+        res.write(`event: message\ndata: ${JSON.stringify(result)}`);
+      } else if (mode === "unfinished-result") {
+        res.write(`event: message\ndata: {"jsonrpc":"2.0","id":${message.id},"result":`);
+      } else {
+        res.write(": ready\n\n");
+      }
+      answered();
+    });
+  });
+  const url = await listen(server);
+  closers.push(closeServer(server));
+  return url;
+}
+
+type SdkOutcome = { outcome: "result" } | { outcome: "error"; code: unknown; message: string };
+
+/**
+ * Calls a tool through the gateway with the MCP SDK's own client, refuses the
+ * agent while the call is pending, and returns how the call ended and any
+ * message the transport could not handle.
+ */
+async function refuseSdkToolCall(mode: SdkRefusalCase) {
+  const refused = new Map<string, string>();
+  const requests = new McpGatewayRequests();
+  let backendAnswered = () => undefined as void;
+  const answered = new Promise<void>((resolve) => {
+    backendAnswered = resolve;
+  });
+  const backendUrl = await startSdkBackend(mode, backendAnswered);
+  const gateway = await startGateway({
+    backends: { cluster: backendUrl },
+    sessionIdentity: { member: "claude/claude-opus-5-5", role: "implementer" },
+    agentRefusal: (agentId) => refused.get(agentId) ?? null,
+    requests,
+  });
+  let toolResponse = () => undefined as void;
+  const responded = new Promise<void>((resolve) => {
+    toolResponse = resolve;
+  });
+  let streamedBody: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const toolFetch = async (url: string | URL, init?: RequestInit) => {
+    const message = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : null;
+    const toolCall =
+      message !== null &&
+      typeof message === "object" &&
+      (message as { method?: string }).method === "tools/call";
+    let sent = init;
+    if (toolCall && mode === "id-after-object") {
+      const { id, params } = message as { id: number; params: unknown };
+      const start = `{"params":${JSON.stringify(params)},"id":${id},"jsonrpc":"2.0","method":`;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamedBody = controller;
+          controller.enqueue(new TextEncoder().encode(start));
+        },
+      });
+      sent = { ...init, body, duplex: "half" } as RequestInit;
+    }
+    const response = await fetch(url, sent);
+    if (toolCall) toolResponse();
+    return response;
+  };
+  const client = new Client({ name: "refusal-check", version: "1" });
+  const transportErrors: string[] = [];
+  // eslint-disable-next-line unicorn/prefer-add-event-listener -- the SDK's Client takes its error handler as a property, not an EventTarget listener.
+  client.onerror = (error) => transportErrors.push(`${error.name}: ${error.message}`);
+  const transport = new StreamableHTTPClientTransport(new URL(`${gateway}/cluster`), {
+    requestInit: { headers: { Authorization: "Bearer token-a" } },
+    fetch: toolFetch,
+    reconnectionOptions: {
+      maxRetries: 0,
+      initialReconnectionDelay: 1,
+      maxReconnectionDelay: 1,
+      reconnectionDelayGrowFactor: 1,
+    },
+  });
+  try {
+    await client.connect(transport);
+    let settled = false;
+    const call = client
+      .callTool(
+        {
+          name: "read",
+          arguments: { text: mode === "large-request" ? "x".repeat(256 * 1024) : "small" },
+        },
+        undefined,
+        { timeout: 3_000 },
+      )
+      .then(
+        (): SdkOutcome => ({ outcome: "result" }),
+        (error: { code?: unknown; message: string }): SdkOutcome => ({
+          outcome: "error",
+          code: error.code,
+          message: error.message,
+        }),
+      )
+      .finally(() => {
+        settled = true;
+      });
+    await answered;
+    await responded;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const settledBeforeRefusal = settled;
+
+    refused.set("agent-a", SDK_REFUSAL);
+    requests.refuse("agent-a", SDK_REFUSAL);
+
+    const ending = await call;
+    // Errors from closing the client afterwards are not part of the refusal.
+    return { settledBeforeRefusal, ending, transportErrors: [...transportErrors] };
+  } finally {
+    (streamedBody as ReadableStreamDefaultController<Uint8Array> | null)?.close();
+    await client.close();
+  }
+}
+
+describe("the session's refusal, as the MCP SDK client sees it", () => {
+  test.each<SdkRefusalCase>([
+    "large-request",
+    "result-without-terminator",
+    "unfinished-result",
+    "id-after-object",
+  ])(
+    "a pending tool call whose event stream is under way ends in the refusal (%s)",
+    async (mode) => {
+      const { settledBeforeRefusal, ending, transportErrors } = await refuseSdkToolCall(mode);
+
+      expect(settledBeforeRefusal).toBe(false);
+      expect(ending).toEqual({
+        outcome: "error",
+        code: -32003,
+        message: `MCP error -32003: ${SDK_REFUSAL}`,
+      });
+      expect(transportErrors).toEqual([]);
+    },
+    10_000,
+  );
+});
+
+/** The most of a finite answer the gateway holds for an agent in session mode. */
+const HELD_ANSWER_LIMIT = 16 * 1024 * 1024;
+
+describe("finite answers held in session mode", () => {
+  async function answerOfSize(size: number) {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(Buffer.alloc(size, 0x20));
+    });
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: () => null,
+      requests: new McpGatewayRequests(),
+    });
+    const response = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: MCP_INIT,
+    });
+    return { status: response.status, body: Buffer.from(await response.arrayBuffer()) };
+  }
+
+  test("an answer of at most 16 MiB reaches the caller whole", async () => {
+    const { status, body } = await answerOfSize(HELD_ANSWER_LIMIT);
+    expect(status).toBe(200);
+    expect(body.length).toBe(HELD_ANSWER_LIMIT);
+  }, 20_000);
+
+  test("an answer over 16 MiB is refused with a clear error, and none of it is passed on", async () => {
+    const { status, body } = await answerOfSize(HELD_ANSWER_LIMIT + 1);
+    expect(status).toBe(502);
+    expect(JSON.parse(body.toString("utf8"))).toEqual({
+      error:
+        "MCP backend cluster answered more than 16 MiB; in session mode an answer is held whole before it is passed on, up to 16 MiB",
+    });
+  }, 20_000);
 });
 
 describe("resolveUpstreamUrl", () => {
