@@ -72,7 +72,7 @@ The `$schema` URL then needs a new home, or the configs drop it.
 
 **What breaks in v2:** nothing.
 
-**Left for later:** the app's platform splits: 33 `*.native.*` and 5 `*.ios.*`/`*.android.*` source files. TypeScript resolves several of them through `.d.ts` shims and base files that re-export the native implementation (for example `components/draggable-list.tsx`, `git/diff-document/surface.tsx`, `audio/audio-engine.d.ts`). Each split collapses to its web implementation, one module at a time. `packages/expo-two-way-audio` goes with the app side of voice.
+**Left for later:** the app's platform splits: 33 `*.native.*` and 4 `*.ios.*`/`*.android.*` source files (`components/markdown-text.{ios,android}.tsx`, `keyboard/shift/internal/translate.{ios,android}.tsx`; there were 5 before this step removed `src/native/ios-hardware-keyboard-submit.ios.ts`). TypeScript resolves several of them through `.d.ts` shims and base files that re-export the native implementation (for example `components/draggable-list.tsx`, `git/diff-document/surface.tsx`, `audio/audio-engine.d.ts`). Each split collapses to its web implementation, one module at a time. `packages/expo-two-way-audio` goes with the app side of voice.
 
 ## 4. Voice and speech, daemon side
 
@@ -99,7 +99,19 @@ The `$schema` URL then needs a new home, or the configs drop it.
 
 **Left for later:**
 
-- **The app's voice UI:** `src/voice/`, `src/dictation/`, `src/audio/`, `contexts/voice-context.tsx`, `components/realtime-voice-overlay.tsx`, `components/dictation-controls.tsx`, the `use-dictation*`, `use-audio-recorder*` and `use-is-dictation-ready` hooks, and `packages/expo-two-way-audio`. Its importers include the composer (`composer/index.tsx`, `composer/input/input.tsx`), which is the web UI session view; that change needs a visual before/after of the session view. The other importers are `app/_layout.tsx`, `contexts/session-context.tsx`, `plugins/catalog-sync.tsx` and `screens/settings-screen.tsx`.
+- **The app's voice UI:** `src/voice/`, `src/dictation/`, `contexts/voice-context.tsx`, `components/realtime-voice-overlay.tsx`, `components/dictation-controls.tsx`, the `use-dictation*`, `use-dictation-audio-source*`, `use-audio-recorder*` and `use-is-dictation-ready` hooks, the capture half of the audio engine (`startCapture`, `stopCapture`, mute, `onCaptureData`, `onVolumeLevel` in `src/audio/audio-engine-types.ts` and its `.web`/`.native` implementations), and `packages/expo-two-way-audio`. Its importers include the composer (`composer/index.tsx`, `composer/input/input.tsx`), which is the web UI session view; that change needs a visual before/after of the session view. The other importers are `app/_layout.tsx`, `contexts/session-context.tsx`, `plugins/catalog-sync.tsx` and `screens/settings-screen.tsx`.
+- **Audio playback stays: it is a public plugin API.** The client plugin contract has `playAudio(source: { base64, mimeType }): Promise<void>` (`packages/plugin/src/client/contracts.ts:135`, documented in `public-docs/plugins/reference.md`). The app implements it with the voice code's audio engine:
+  - `plugins/client-runtime.ts` builds each plugin's `playAudio` with `createPlayAudio` from `@/audio`, over `Pick<AudioEngine, "play">`;
+  - `plugins/registry.ts` requires that engine (`audio: Pick<AudioEngine, "play">`) to install a catalog;
+  - `plugins/catalog-sync.tsx` takes it from `useVoiceAudioEngineOptional()` and, **when there is no engine, installs no client plugins at all**. Removing `contexts/voice-context.tsx` as is would therefore turn off every client plugin, not only voice.
+
+  So the voice step keeps `src/audio/`'s playback (`createAudioEngine`'s `play`, `stop`, `clearQueue`, `isPlaying`; `play-audio.ts`, `playback.ts`, `file-playback.ts`, `pcm/`) and keeps `playAudio` in the plugin contract unchanged. It moves the engine's provider out of `voice-context.tsx` into a provider of its own that `catalog-sync.tsx` and `screens/settings-screen.tsx` (its "Test audio" row) read. Dropping or changing `playAudio` would be a breaking plugin API change and is not part of this plan. Proof for that step:
+  - the existing `plugins/registry-lifecycle.test.ts`, `plugins/registry-requirements.test.ts`, `audio/play-audio.test.ts` and `audio/playback.test.ts`;
+  - a new test that `catalog-sync` installs a host's client plugins, with a working `playAudio`, when no voice provider is mounted;
+  - the web UI build, and the session view's visual before/after above.
+
+  The first-batch proof below does not touch the app's voice code, so plugin playback is unchanged on every proven step.
+
 - **The CLI:** onboarding still asks about voice and writes the now-ignored keys.
 - **Config and protocol:** the persisted config keeps its `features.dictation`, `features.voiceMode` and `providers.local` keys, accepted and ignored. The protocol keeps the voice messages for old clients.
 
@@ -155,6 +167,14 @@ The `$schema` URL then needs a new home, or the configs drop it.
 - The relay config keys (`config.ts`, the CLI's `--relay`/`--no-relay`) still parse and do nothing.
 
 **Left for later**, with connections and multi-host: the client's relay transport, the app's relay connections in `runtime/host-runtime.ts` (a file v2 changed), connection offers (`packages/protocol/src/connection-offer.ts`, `packages/server/src/server/connection-offer.ts`), and then `packages/relay` itself.
+
+## Inherited from the v2 line
+
+v3 starts from this branch's head, so it carries session mode as `candidate/v2` has it. One known gap is being fixed on the v2 line and v3 inherits the fix.
+
+**G-1:** a refused agent can be resumed. A plugin's `agent.closed` hook, or any client, can resume a refused agent through the Paseo API. The refusal clears (`sessionMemberRefusals` in `agent-manager.ts`), and the gateway forwards for the resumed agent until its runtime next reports a model. The dedicated test in `plugin-tool-call.e2e.test.ts` covers only the gateway identity, not this.
+
+The v2 line fixes it in `d12accdd`, which was not yet on GitHub when this plan was written. v3 takes that commit once it lands on `candidate/v2`: by this branch's merge of `candidate/v2` before v3 is cut, or by a port into v3 afterwards.
 
 ## Proof
 
