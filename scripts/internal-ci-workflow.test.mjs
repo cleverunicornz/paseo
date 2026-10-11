@@ -111,6 +111,12 @@ test("the whole server unit suite runs on every run, with the CLIs its tests res
   assert.ok(run, "step Run the whole server unit suite");
   assert.match(run.text, /npm run test:unit --workspace=@getpaseo\/server/);
   assert.doesNotMatch(run.text, /\n {8}if:/);
+  // The file observer suites run on their own: their stress test hangs under the parallel run's load.
+  assert.match(run.text, /--exclude "src\/server\/file-observer\/\*\*"/);
+  const observer = unit.find((entry) => entry.name === "Run the file observer suites alone");
+  assert.ok(observer, "step Run the file observer suites alone");
+  assert.match(observer.text, /npx vitest run src\/server\/file-observer --maxWorkers=1 --retry=2/);
+  assert.doesNotMatch(observer.text, /\n {8}if:/);
   const tools = unit.find((entry) => entry.name === "Install the CLIs the unit tests resolve");
   assert.ok(tools, "step Install the CLIs the unit tests resolve");
   assert.match(tools.text, /@anthropic-ai\/claude-code@\d+\.\d+\.\d+/);
