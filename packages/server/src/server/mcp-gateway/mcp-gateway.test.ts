@@ -1464,6 +1464,8 @@ const OVERSIZED_EVENT_ERROR = {
   },
 };
 
+// These tests assert on small values: a failing matcher given a 16 MiB answer prints it whole,
+// some 100 MB of output that stalls the CI log.
 describe("events bounded by their full size, however they are chunked", () => {
   const BLANK_LINE = Buffer.from("\n\n");
 
@@ -1471,14 +1473,14 @@ describe("events bounded by their full size, however they are chunked", () => {
     const stream = Buffer.concat([resultEvent(HELD_EVENT_LIMIT + 1), BLANK_LINE]);
     const answer = await streamInWrites(stream, HELD_EVENT_LIMIT - 256);
     expect(answer.status).toBe(200);
-    expect(answer.text).not.toContain('"result"');
+    expect(answer.text.includes('"result"')).toBe(false);
     expect(errorEvents(answer.text)).toEqual([OVERSIZED_EVENT_ERROR]);
   }, 20_000);
 
   test("an event over 16 MiB split exactly at the bound is refused", async () => {
     const stream = Buffer.concat([resultEvent(HELD_EVENT_LIMIT + 1), BLANK_LINE]);
     const answer = await streamInWrites(stream, HELD_EVENT_LIMIT);
-    expect(answer.text).not.toContain('"result"');
+    expect(answer.text.includes('"result"')).toBe(false);
     expect(errorEvents(answer.text)).toEqual([OVERSIZED_EVENT_ERROR]);
   }, 20_000);
 
@@ -1492,7 +1494,7 @@ describe("events bounded by their full size, however they are chunked", () => {
     ]);
     const answer = await streamInWrites(stream, 0);
     expect(answer.text.startsWith(progress)).toBe(true);
-    expect(answer.text).not.toContain('"result"');
+    expect(answer.text.includes('"result"')).toBe(false);
     expect(errorEvents(answer.text)).toEqual([OVERSIZED_EVENT_ERROR]);
   }, 20_000);
 
@@ -1501,7 +1503,8 @@ describe("events bounded by their full size, however they are chunked", () => {
     for (const split of [HELD_EVENT_LIMIT - 256, HELD_EVENT_LIMIT]) {
       const answer = await streamInWrites(stream, split);
       expect(answer.status).toBe(200);
-      expect(answer.text).toBe(stream.toString("utf8"));
+      expect(answer.text.length).toBe(stream.length);
+      expect(answer.text === stream.toString("utf8")).toBe(true);
     }
   }, 30_000);
 });
