@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   createMcpGatewayHandler,
+  jsonRpcRequestId,
   McpGatewayRequests,
   resolveUpstreamUrl,
   type McpGatewayAgent,
@@ -1070,5 +1071,25 @@ describe("resolveUpstreamUrl", () => {
     ["a query that is only a fragment marker", "", "#"],
   ])("returns null for %s", (_name, suffix, search) => {
     expect(resolveUpstreamUrl(new URL("http://backend.example/mcp"), suffix, search)).toBeNull();
+  });
+});
+
+describe("jsonRpcRequestId", () => {
+  test("reads the id of a whole request, and of one whose body is still arriving", () => {
+    expect(jsonRpcRequestId('{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{}}')).toBe(7);
+    expect(jsonRpcRequestId('{"jsonrpc":"2.0","id":"req-1","method":"tools/call","par')).toBe(
+      "req-1",
+    );
+    expect(jsonRpcRequestId('{ "jsonrpc" : "2.0" , "id" : 12 }')).toBe(12);
+  });
+
+  test("never takes a nested id, and has none for a batch, a notification or no body", () => {
+    expect(jsonRpcRequestId('{"jsonrpc":"2.0","method":"tools/call","params":{"id":3},"id":')).toBe(
+      null,
+    );
+    expect(jsonRpcRequestId('{"jsonrpc":"2.0","params":{"id":3},"method":"x","id":4}')).toBe(4);
+    expect(jsonRpcRequestId('[{"jsonrpc":"2.0","id":1,"method":"a"}]')).toBe(null);
+    expect(jsonRpcRequestId('{"jsonrpc":"2.0","method":"notifications/initialized"}')).toBe(null);
+    expect(jsonRpcRequestId("")).toBe(null);
   });
 });

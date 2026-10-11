@@ -703,6 +703,11 @@ async function startReportingSession(provider: "claude" | "codex") {
     },
     /** Tool requests whose whole body reached the backend before the refusal. */
     completedBeforeRefusal: () => calls.filter((call) => call.ranAfterRefusal === false).length,
+    /** Waits until `count` whole tool requests reached the backend before the refusal. */
+    wholeBodiesArrived: (count: number) =>
+      vi.waitFor(() =>
+        expect(calls.filter((call) => call.ranAfterRefusal === false)).toHaveLength(count),
+      ),
     /** Tool requests whose whole body reached the backend after the refusal: their tool ran. */
     completedAfterRefusal: () => calls.filter((call) => call.ranAfterRefusal === true).length,
     holdResponses: () => {
@@ -2032,6 +2037,7 @@ describe("agent MCP end-to-end (offline)", () => {
         session.answerEarly("event-stream");
         const requests = [await session.openToolRequest(body), await session.openToolRequest(body)];
         await Promise.all(requests.map((request) => request.answer.head));
+        await session.wholeBodiesArrived(body === "complete" ? 2 : 0);
 
         session.report(kind);
         await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
@@ -2068,6 +2074,7 @@ describe("agent MCP end-to-end (offline)", () => {
         const turn = await session.startTurn();
         session.answerEarly("json");
         const requests = [await session.openToolRequest(body), await session.openToolRequest(body)];
+        await session.wholeBodiesArrived(body === "complete" ? 2 : 0);
 
         session.report(kind);
         await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());

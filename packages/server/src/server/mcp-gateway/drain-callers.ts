@@ -13,7 +13,7 @@ type Retention =
    * While plugins still hold timeline items of the agent that they have not
    * acknowledged, and at most until `deadline`.
    */
-  | { kind: "undelivered"; deadline: number };
+  | { kind: "undelivered"; deadline: number; expiry: NodeJS.Timeout };
 
 export interface DrainGatewayCallersOptions {
   hasUndeliveredTimeline: (agentId: string) => boolean;
@@ -36,8 +36,9 @@ export interface DrainGatewayCallersOptions {
  * separate token per agent that only the daemon ever holds: the agent's own
  * token, which its harness and the processes it ran received, is not revived,
  * and stays refused. An agent whose close failed stays live and calls with its
- * own token as before. An identity past its bound is dropped with its token;
- * `end` drops every identity and token once the shutdown's drain is over.
+ * own token as before. A refused identity is dropped with its token by a timer
+ * at its deadline, whether or not anything looks it up again; `end` drops every
+ * identity and token once the shutdown's drain is over.
  */
 export class DrainGatewayCallers {
   private readonly retained = new Map<string, { agent: McpGatewayAgent; until: Retention }>();
@@ -58,6 +59,7 @@ export class DrainGatewayCallers {
   retain(agents: readonly McpGatewayAgent[]): void {
     if (this.ended) return;
     for (const agent of agents) {
+      this.clearExpiry(agent.agentId);
       this.retained.set(agent.agentId, { agent, until: { kind: "shutdown" } });
     }
   }
@@ -69,10 +71,20 @@ export class DrainGatewayCallers {
   retainRefused(agent: McpGatewayAgent): void {
     if (this.ended || this.retained.get(agent.agentId)?.until.kind === "shutdown") return;
     this.drop(agent.agentId);
-    this.retained.set(agent.agentId, {
+    const expiry = setTimeout(() => {
+      // Only this window: a later refusal of the agent replaced the entry and its timer.
+      if (this.retained.get(agent.agentId) === entry) this.drop(agent.agentId);
+    }, this.refusedDrainMs);
+    expiry.unref();
+    const entry = {
       agent,
-      until: { kind: "undelivered", deadline: this.now() + this.refusedDrainMs },
-    });
+      until: {
+        kind: "undelivered" as const,
+        deadline: this.now() + this.refusedDrainMs,
+        expiry,
+      },
+    };
+    this.retained.set(agent.agentId, entry);
   }
 
   /** The daemon-only token for an admitted agent, or null for any other id or after `end`. */
@@ -98,6 +110,7 @@ export class DrainGatewayCallers {
   /** The shutdown's drain is over: nothing resolves or issues from here on. */
   end(): void {
     this.ended = true;
+    for (const agentId of this.retained.keys()) this.clearExpiry(agentId);
     this.retained.clear();
     this.agentByDigest.clear();
     this.tokenByAgent.clear();
@@ -115,7 +128,13 @@ export class DrainGatewayCallers {
     return this.hasUndeliveredTimeline(agentId);
   }
 
+  private clearExpiry(agentId: string): void {
+    const until = this.retained.get(agentId)?.until;
+    if (until?.kind === "undelivered") clearTimeout(until.expiry);
+  }
+
   private drop(agentId: string): void {
+    this.clearExpiry(agentId);
     this.retained.delete(agentId);
     const token = this.tokenByAgent.get(agentId);
     if (!token) return;

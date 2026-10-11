@@ -297,6 +297,101 @@ function sendError(res: express.Response, status: number, error: string): void {
   res.status(status).json({ error });
 }
 
+/**
+ * The JSON-RPC error code of the refusal that ends an event-stream answer a
+ * refused agent was already receiving: its 200 head was sent, so the status
+ * can no longer say 403.
+ */
+export const MCP_GATEWAY_REFUSAL_CODE = -32003;
+
+/** Enough of a request body to read its JSON-RPC id. */
+const BODY_START_LIMIT = 64 * 1024;
+
+const JSON_SCALAR = String.raw`"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null`;
+/** `id` among the object's leading scalar members, so a nested `id` is never taken for it. */
+const LEADING_ID = new RegExp(
+  String.raw`^\s*\{(?:\s*"(?:[^"\\]|\\.)*"\s*:\s*(?:${JSON_SCALAR})\s*,)*\s*"id"\s*:\s*(${JSON_SCALAR})\s*[,}]`,
+);
+
+/**
+ * The JSON-RPC id of the request whose body starts with `bodyStart`, which may
+ * be incomplete; null when there is none, as for a GET stream or a batch.
+ */
+export function jsonRpcRequestId(bodyStart: string): string | number | null {
+  try {
+    const message: unknown = JSON.parse(bodyStart);
+    if (message && typeof message === "object" && !Array.isArray(message) && "id" in message) {
+      const id = (message as { id: unknown }).id;
+      return typeof id === "string" || typeof id === "number" ? id : null;
+    }
+    return null;
+  } catch {
+    const match = LEADING_ID.exec(bodyStart);
+    if (!match?.[1]) return null;
+    const id: unknown = JSON.parse(match[1]);
+    return typeof id === "string" || typeof id === "number" ? id : null;
+  }
+}
+
+/** Keeps the start of a request body as it streams through, to read its JSON-RPC id. */
+function recordBodyStart(req: express.Request): () => string {
+  const chunks: Buffer[] = [];
+  let kept = 0;
+  req.on("data", (chunk: Buffer) => {
+    if (kept >= BODY_START_LIMIT) return;
+    chunks.push(chunk);
+    kept += chunk.length;
+  });
+  return () => Buffer.concat(chunks).toString("utf8");
+}
+
+function isEventStream(headers: IncomingHttpHeaders): boolean {
+  return (headers["content-type"] ?? "").toLowerCase().startsWith("text/event-stream");
+}
+
+/**
+ * Ends an event-stream answer already under way with the refusal as the
+ * JSON-RPC error of the request, so the caller fails the request rather than
+ * reading a stream that broke off. The blank lines first close any event the
+ * relay left partial.
+ */
+function endWithRefusalEvent(
+  res: express.Response,
+  id: string | number | null,
+  refusal: string,
+): void {
+  if (res.writableEnded || res.destroyed) return;
+  const error = { jsonrpc: "2.0", id, error: { code: MCP_GATEWAY_REFUSAL_CODE, message: refusal } };
+  res.end(`\n\nevent: message\ndata: ${JSON.stringify(error)}\n\n`);
+}
+
+/**
+ * Holds a finite answer until it is whole and sends it only if `isCut` is
+ * still false then, so a refusal before the answer is complete still decides
+ * the caller's status.
+ */
+function sendWholeAnswer(
+  upstreamResponse: http.IncomingMessage,
+  res: express.Response,
+  isCut: () => boolean,
+  unreachable: string,
+): void {
+  const chunks: Buffer[] = [];
+  upstreamResponse.on("data", (chunk: Buffer) => chunks.push(chunk));
+  upstreamResponse.on("end", () => {
+    if (isCut() || res.headersSent || res.destroyed) return;
+    res.writeHead(
+      upstreamResponse.statusCode ?? 502,
+      upstreamResponse.statusMessage,
+      buildResponseHeaders(upstreamResponse.headers),
+    );
+    res.end(Buffer.concat(chunks));
+  });
+  upstreamResponse.on("error", () => {
+    if (!isCut()) sendError(res, 502, unreachable);
+  });
+}
+
 /** Tracks an agent's own request; a plugin's drain call is never cut off by a refusal. */
 function trackForRefusal(
   requests: McpGatewayRequests | undefined,
@@ -312,7 +407,9 @@ function trackForRefusal(
  * configured backend by name through its own daemon; the daemon authenticates
  * the agent by its token, strips caller-supplied credentials and identity
  * headers, attaches the identity it knows plus any plugin-supplied upstream
- * credential, and proxies MCP Streamable HTTP both ways without buffering.
+ * credential, and proxies MCP Streamable HTTP both ways without buffering. In
+ * session mode an agent's own finite answers are the exception: each is held
+ * until whole, so the session's refusal of the agent still answers 403.
  */
 export function createMcpGatewayHandler(options: McpGatewayOptions): express.RequestHandler {
   const logger = options.logger.child({ module: "mcp-gateway" });
@@ -413,30 +510,49 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       upstreamRequest.destroy();
     }, responseTimeoutMs);
     // Tracked from the last refusal check on, with no await between: a refusal
-    // either stopped this request above or cuts it off here.
+    // either stopped this request above or cuts it off here. Before the answer's
+    // head is sent the caller gets 403; an event stream already under way ends
+    // with the refusal as the request's JSON-RPC error.
     let cutOff = false;
+    let relayed: http.IncomingMessage | null = null;
+    const bodyStart = recordBodyStart(req);
     const untrack = trackForRefusal(options.requests, agent, (reason) => {
       cutOff = true;
       clearTimeout(responseTimer);
       req.unpipe(upstreamRequest);
+      relayed?.unpipe(res);
       upstreamRequest.destroy();
-      sendError(res, 403, reason);
+      if (relayed) endWithRefusalEvent(res, jsonRpcRequestId(bodyStart()), reason);
+      else sendError(res, 403, reason);
       req.resume();
     });
+    const holdsFiniteAnswers = options.sessionIdentity !== null && !agent.drain;
 
     upstreamRequest.on("response", (upstreamResponse) => {
       clearTimeout(responseTimer);
-      if (res.headersSent || res.destroyed) {
+      if (cutOff || res.headersSent || res.destroyed) {
         upstreamResponse.destroy();
         return;
       }
+      if (holdsFiniteAnswers && !isEventStream(upstreamResponse.headers)) {
+        sendWholeAnswer(
+          upstreamResponse,
+          res,
+          () => cutOff,
+          `MCP backend ${backend} is unreachable`,
+        );
+        return;
+      }
+      relayed = upstreamResponse;
       res.writeHead(
         upstreamResponse.statusCode ?? 502,
         upstreamResponse.statusMessage,
         buildResponseHeaders(upstreamResponse.headers),
       );
       res.flushHeaders();
-      upstreamResponse.on("error", () => res.destroy());
+      upstreamResponse.on("error", () => {
+        if (!cutOff) res.destroy();
+      });
       upstreamResponse.pipe(res);
     });
     upstreamRequest.on("error", (error) => {
