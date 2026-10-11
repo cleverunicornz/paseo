@@ -584,10 +584,7 @@ describe("server config", () => {
   ];
 
   async function readPublishedGatewaySchema() {
-    const schemaPath = path.resolve(
-      import.meta.dirname,
-      "../../../website/public/schemas/paseo.config.v1.json",
-    );
+    const schemaPath = path.resolve(import.meta.dirname, "../../schemas/paseo.config.v1.json");
     const schema = JSON.parse(await readFile(schemaPath, "utf8"));
     return schema.definitions.PaseoConfigV1.properties.daemon.properties.mcp.properties.gateway
       .properties;
