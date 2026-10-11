@@ -10,9 +10,11 @@ export interface PluginGatewayToolCallerDeps {
   /**
    * The token to call with on behalf of `agentId`: a live agent's own token,
    * or, while the shutdown drain runs, the daemon-only token of an agent that
-   * shutdown closed. Null for any other agent.
+   * shutdown closed. An agent the session refused gets only a daemon-only
+   * token, after it closed and while the plugin is `delivering` one of its
+   * timeline items. Null for any other agent.
    */
-  issueCallerToken: (agentId: string) => string | null;
+  issueCallerToken: (agentId: string, options: { delivering: boolean }) => string | null;
 }
 
 /**
@@ -28,10 +30,10 @@ export function createPluginGatewayToolCaller(deps: PluginGatewayToolCallerDeps)
     }
     const baseUrl = deps.getGatewayBaseUrl();
     if (!baseUrl) throw new Error("Gateway tool calls need the daemon to listen on TCP");
-    const token = deps.issueCallerToken(call.onBehalfOf);
+    const token = deps.issueCallerToken(call.onBehalfOf, { delivering: call.delivering });
     if (!token) {
       throw new Error(
-        `No live agent ${call.onBehalfOf}; a plugin can call only for a live agent, or during the shutdown drain for an agent the shutdown closed`,
+        `No live agent ${call.onBehalfOf} the session admits; a plugin can call only for a live agent the session has not refused, for a closed agent the session refused only while delivering its timeline items, or during the shutdown drain for an agent the shutdown closed`,
       );
     }
     const transport = new StreamableHTTPClientTransport(

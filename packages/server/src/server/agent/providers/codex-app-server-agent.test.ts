@@ -2828,12 +2828,18 @@ describe("Codex app-server provider", () => {
     const reportedModels = () =>
       events.flatMap((event) => (event.type === "model_changed" ? [event.runtimeInfo.model] : []));
 
-    // Settings that keep the launched model report nothing new.
+    // Codex's first word on the model counts, though it is the launched one;
+    // settings that keep it after that report nothing new.
     asInternals(session).handleNotification("thread/settings/updated", {
       threadId: "test-thread",
       threadSettings: { model: "gpt-6-astra", modelProvider: "openai" },
     });
-    expect(reportedModels()).toEqual([]);
+    expect(reportedModels()).toEqual(["gpt-6-astra"]);
+    asInternals(session).handleNotification("thread/settings/updated", {
+      threadId: "test-thread",
+      threadSettings: { model: "gpt-6-astra", modelProvider: "openai" },
+    });
+    expect(reportedModels()).toEqual(["gpt-6-astra"]);
 
     // Codex moves the running turn to another model.
     asInternals(session).handleNotification("model/rerouted", {
@@ -2843,7 +2849,7 @@ describe("Codex app-server provider", () => {
       toModel: "gpt-5.4",
       reason: "highRiskCyberActivity",
     });
-    expect(reportedModels()).toEqual(["gpt-5.4"]);
+    expect(reportedModels()).toEqual(["gpt-6-astra", "gpt-5.4"]);
     expect((await session.getRuntimeInfo()).model).toBe("gpt-5.4");
 
     // Another client of the same app-server sets the thread's model.
@@ -2851,7 +2857,7 @@ describe("Codex app-server provider", () => {
       threadId: "test-thread",
       threadSettings: { model: "gpt-5.5", modelProvider: "openai" },
     });
-    expect(reportedModels()).toEqual(["gpt-5.4", "gpt-5.5"]);
+    expect(reportedModels()).toEqual(["gpt-6-astra", "gpt-5.4", "gpt-5.5"]);
     expect((await session.getRuntimeInfo()).model).toBe("gpt-5.5");
 
     // A sub-agent's thread runs its own model; the agent's model is unchanged.
@@ -2862,8 +2868,30 @@ describe("Codex app-server provider", () => {
       toModel: "gpt-5.4-mini",
       reason: "highRiskCyberActivity",
     });
-    expect(reportedModels()).toEqual(["gpt-5.4", "gpt-5.5"]);
+    expect(reportedModels()).toEqual(["gpt-6-astra", "gpt-5.4", "gpt-5.5"]);
     expect(events.find((event) => event.type === "turn_completed")).toBeUndefined();
+  });
+
+  test("a model report Codex made before a subscriber came still reaches it", () => {
+    const session = createSession({ model: "gpt-6-astra" });
+    asInternals(session).handleNotification("model/rerouted", {
+      threadId: "test-thread",
+      turnId: "test-turn",
+      fromModel: "gpt-6-astra",
+      toModel: "gpt-5.4",
+      reason: "highRiskCyberActivity",
+    });
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "model_changed",
+        reported: true,
+        runtimeInfo: expect.objectContaining({ model: "gpt-5.4" }),
+      }),
+    ]);
   });
 
   test("converts Codex collab agent notifications through the normal timeline path", () => {

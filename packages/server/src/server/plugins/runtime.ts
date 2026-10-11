@@ -58,6 +58,11 @@ export interface PluginGatewayToolCall {
   arguments: Record<string, unknown>;
   onBehalfOf: string;
   timeoutMs: number;
+  /**
+   * The call is made from the plugin's own handler of one of `onBehalfOf`'s
+   * timeline items, while that delivery is pending.
+   */
+  delivering: boolean;
 }
 
 export type PluginGatewayToolCaller = (call: PluginGatewayToolCall) => Promise<unknown>;
@@ -319,6 +324,8 @@ export class PluginRuntime {
   private sessionHost: PluginPaseoSessionHost | null;
   private readonly listeners = new Set<(pluginId: string, error?: string) => void>();
   private readonly timelineDeliveries = new TimelineDeliveryLedger();
+  /** The pending `agent.timeline_item` deliveries, by the request id of their hook. */
+  private readonly deliveringHooks = new Map<string, TimelineDelivery>();
   private gatewayToolCaller: PluginGatewayToolCaller | null = null;
 
   constructor(
@@ -529,12 +536,14 @@ export class PluginRuntime {
     event: PluginLifecycleEvents["agent.timeline_item"],
   ): void {
     let request: Promise<unknown>;
+    const requestId = randomUUID();
+    this.deliveringHooks.set(requestId, delivery);
     try {
       request = this.request(
         loaded,
         {
           type: "hook",
-          requestId: randomUUID(),
+          requestId,
           kind: "event",
           name: "agent.timeline_item",
           input: event,
@@ -544,6 +553,7 @@ export class PluginRuntime {
     } catch (error) {
       request = Promise.reject(error);
     }
+    request = request.finally(() => this.deliveringHooks.delete(requestId));
     request.then(
       () => this.timelineDeliveries.acknowledged(delivery),
       (error) => {
@@ -638,6 +648,9 @@ export class PluginRuntime {
     message: Extract<PluginProcessMessage, { type: "mcp.call_tool" }>,
   ): void {
     const caller = this.gatewayToolCaller;
+    const delivery = message.hookRequestId
+      ? this.deliveringHooks.get(message.hookRequestId)
+      : undefined;
     const call = caller
       ? caller({
           pluginId: loaded.id,
@@ -646,6 +659,7 @@ export class PluginRuntime {
           arguments: message.arguments,
           onBehalfOf: message.onBehalfOf,
           timeoutMs: message.timeoutMs,
+          delivering: delivery?.pluginId === loaded.id && delivery.agentId === message.onBehalfOf,
         })
       : Promise.reject(new Error("Gateway tool calls are unavailable"));
     void call

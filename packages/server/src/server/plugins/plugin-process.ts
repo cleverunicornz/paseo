@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { PluginHookHandlers } from "./lifecycle/index.js";
 import {
   PluginProcessRequestSchema,
@@ -191,6 +192,13 @@ function handleStopReadinessMessage(
     .finally(() => activeStopOperations.delete(message.requestId));
 }
 
+/**
+ * The lifecycle event hook a call is made from, by its request id, so the
+ * daemon can tell a call made while delivering one of an agent's timeline
+ * items from any other.
+ */
+const hookContext = new AsyncLocalStorage<string>();
+
 const pendingMcpCalls = new Map<
   string,
   { resolve: (result: unknown) => void; reject: (error: Error) => void }
@@ -212,6 +220,7 @@ const mcp: PluginMcpApi = {
         arguments: jsonTransportValue(call.arguments ?? {}),
         onBehalfOf: call.onBehalfOf,
         timeoutMs: call.timeoutMs ?? 60_000,
+        ...(hookContext.getStore() ? { hookRequestId: hookContext.getStore() } : {}),
       });
     }) as Promise<PluginMcpToolResult>;
   },
@@ -585,7 +594,10 @@ function handleHookMessage(
       });
       return;
     }
-    void hooks.invoke(message.requestId, message.kind, message.name, message.input, paseo).then(
+    const api = paseo;
+    const invoke = () =>
+      hooks.invoke(message.requestId, message.kind, message.name, message.input, api);
+    void (message.kind === "event" ? hookContext.run(message.requestId, invoke) : invoke()).then(
       (output) => {
         return send({ type: "result", requestId: message.requestId, output });
       },

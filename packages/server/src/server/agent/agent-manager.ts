@@ -1542,7 +1542,10 @@ export class AgentManager {
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
-    this.restoreSessionMemberRefusal(resolvedAgentId, record?.sessionMemberRefused);
+    this.restoreSessionMemberRefusal(
+      resolvedAgentId,
+      record?.sessionMemberRefused ?? (await this.refusedModelOfNativeSession(handle)),
+    );
     const currentResumeOptions = record
       ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
       : resumeOptions;
@@ -4275,6 +4278,19 @@ export class AgentManager {
       "Agent runtime reports the session's member again; admitting it",
     );
     this.emitState(agent);
+  }
+
+  /**
+   * The model the session refused any agent for that ran this native session.
+   * A resume under a new agent id (the explicit resume API) starts the same
+   * native session, so it keeps that refusal too.
+   */
+  private async refusedModelOfNativeSession(
+    handle: AgentPersistenceHandle,
+  ): Promise<string | undefined> {
+    if (!this.sessionMemberGate || !this.registry || !handle.sessionId) return undefined;
+    const records = await this.registry.listByProviderSession(handle.provider, handle.sessionId);
+    return records.find((record) => record.sessionMemberRefused)?.sessionMemberRefused;
   }
 
   /** Restores the refusal recorded for an agent before it is started again. */
