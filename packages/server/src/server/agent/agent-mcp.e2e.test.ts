@@ -2552,6 +2552,29 @@ describe("console daemon: an agent keeps the model it was created with (outside 
     30_000,
   );
 
+  test("a Claude agent created on a legacy alias keeps running when its runtime reports the canonical id", async () => {
+    // claude-fable-5[1m] is a retired spelling of claude-fable-5; Claude Code reports the canonical id.
+    const host = await startConsoleDaemon();
+    try {
+      const agent = await host.createAgent("claude", "claude-fable-5[1m]");
+      host.recorder.claudeReports.push("claude-fable-5", "claude-fable-5");
+      await host.manager.runAgent(agent.id, "hello");
+      await host.manager.runAgent(agent.id, "hello again");
+
+      expect(host.manager.getSessionMemberRefusal(agent.id)).toBeNull();
+      expect(host.manager.getAgent(agent.id)).toMatchObject({
+        lifecycle: "idle",
+        creationModel: "claude-fable-5[1m]",
+      });
+      // Another model is still refused.
+      await expect(host.manager.setAgentModel(agent.id, OTHER_MODEL.claude)).rejects.toThrow(
+        modelPinRefusal("claude-fable-5[1m]", OTHER_MODEL.claude),
+      );
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
+
   test("a pinned Claude session never calls query.setModel() for another model", async () => {
     const recorder = createHarnessModelRecorder();
     const client = recordingClaudeClient(recorder);
