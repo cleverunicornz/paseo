@@ -4069,6 +4069,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       const response = await this.client.request("thread/resume", params);
       this.rememberResolvedSandboxPolicy(response);
+      this.reportResumedThreadModel(response);
     } catch (error) {
       const threadId = this.currentThreadId;
       const message = error instanceof Error ? error.message : String(error);
@@ -4082,6 +4083,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         }
         const response = await this.client.request("thread/resume", params);
         this.rememberResolvedSandboxPolicy(response);
+        this.reportResumedThreadModel(response);
         this.logger.info({ threadId }, "Unarchived Codex thread to restore active Paseo agent");
         return;
       }
@@ -6328,13 +6330,25 @@ export class CodexAppServerAgentSession implements AgentSession {
     parsed: Extract<ParsedCodexNotification, { kind: "model_reported" }>,
   ): void {
     if (parsed.model === (this.reportedModel ?? this.config.model)) return;
-    this.reportedModel = parsed.model === this.config.model ? null : parsed.model;
+    this.reportModel(parsed.model);
+  }
+
+  /** Codex named the model the thread runs; it is announced as the runtime's own report. */
+  private reportModel(model: string): void {
+    this.reportedModel = model === this.config.model ? null : model;
     this.cachedRuntimeInfo = null;
     this.emitEvent({
       type: "model_changed",
       provider: CODEX_PROVIDER,
       runtimeInfo: this.currentRuntimeInfo(),
+      reported: true,
     });
+  }
+
+  /** A resumed thread's response names the model it runs: always reported, changed or not. */
+  private reportResumedThreadModel(response: unknown): void {
+    const model = toObjectRecord(response)?.model;
+    if (typeof model === "string" && model.length > 0) this.reportModel(model);
   }
 
   private handleContextCompactedNotification(

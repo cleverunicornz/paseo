@@ -475,6 +475,12 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  /**
+   * In session mode, the `<provider>/<model>` the session refused this agent
+   * for running. It stays refused, across closes, resumes and daemon restarts,
+   * until its runtime itself reports the session's member.
+   */
+  sessionMemberRefused?: string;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
@@ -1536,6 +1542,7 @@ export class AgentManager {
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
+    this.restoreSessionMemberRefusal(resolvedAgentId, record?.sessionMemberRefused);
     const currentResumeOptions = record
       ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
       : resumeOptions;
@@ -3738,6 +3745,13 @@ export class AgentManager {
         durableTimelineHasRows,
         options,
       });
+      // A refused agent stays refused in its new session: only its runtime's
+      // own report of the member admits it again.
+      const keptRefusal = this.sessionMemberRefusals.get(resolvedAgentId);
+      if (keptRefusal) {
+        managed.sessionMemberRefused = keptRefusal.attempted;
+        managed.lastError = keptRefusal.message;
+      }
 
       // Read history before publishing the agent: a provider failure must leave the
       // session unregistered so the registration catch closes it.
@@ -3787,8 +3801,6 @@ export class AgentManager {
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
       this.subscribeToSession(managed);
-      // A new session for this agent is judged on what its runtime reports now.
-      this.sessionMemberRefusals.delete(managed.id);
       this.enforceRuntimeSessionMember(managed);
       return { ...managed };
     } catch (error) {
@@ -3999,7 +4011,11 @@ export class AgentManager {
       // the event waits behind others: the gateway refuses the agent from here.
       if (event.type === "model_changed") {
         const current = this.agents.get(agentId);
-        if (current) this.enforceRuntimeSessionMember(current, event.runtimeInfo.model);
+        if (current) {
+          this.enforceRuntimeSessionMember(current, event.runtimeInfo.model, {
+            reported: event.reported === true,
+          });
+        }
       }
       this.enqueueSessionEvent(agentId, event);
     });
@@ -4197,26 +4213,43 @@ export class AgentManager {
   }
 
   /**
-   * Stops an agent whose runtime reports a model other than the session's
-   * member, however it came to run it: the gateway refuses the agent at once,
-   * the timeline records why, and closing it ends its turn. The member header
-   * itself never changes.
+   * Judges the model an agent runs against the session's member. An agent
+   * that runs another model is refused: the gateway refuses it at once, the
+   * timeline records why, and closing it ends its turn. A refused agent stays
+   * refused, whatever starts it again, until a model its runtime itself
+   * reports (`reported`) is the member; a configured model never admits it,
+   * and a reported model other than the member stops it again. The member
+   * header itself never changes.
    */
   private enforceRuntimeSessionMember(
     agent: ActiveManagedAgent,
     model: string | null | undefined = agent.runtimeInfo?.model,
+    options: { reported?: boolean } = {},
   ): void {
-    if (!this.sessionMemberGate || !model || this.sessionMemberRefusals.has(agent.id)) return;
+    if (!this.sessionMemberGate || !model) return;
     const refusal = this.sessionMemberGate.refusal(agent.provider, model);
+    const kept = this.sessionMemberRefusals.get(agent.id);
+    if (kept) {
+      if (!options.reported) return;
+      // A refused agent already closing is not stopped twice.
+      if (refusal && !this.inFlightAgentCloses.has(agent.id)) this.stopRefusedAgent(agent, refusal);
+      else if (!refusal) this.readmitSessionMember(agent, kept);
+      return;
+    }
     if (!refusal) return;
     this.sessionMemberRefusals.set(agent.id, refusal);
-    agent.lastError = refusal.message;
+    agent.sessionMemberRefused = refusal.attempted;
     this.onSessionMemberRefusal?.({
       agentId: agent.id,
       sessionId: agent.persistence?.sessionId ?? null,
       workspaceId: agent.workspaceId ?? null,
       refusal: refusal.message,
     });
+    this.stopRefusedAgent(agent, refusal);
+  }
+
+  private stopRefusedAgent(agent: ActiveManagedAgent, refusal: SessionMemberError): void {
+    agent.lastError = refusal.message;
     this.logger.warn(
       { agentId: agent.id, member: refusal.member, reported: refusal.attempted },
       "Agent runtime reported a model other than the session's member; stopping it",
@@ -4230,6 +4263,27 @@ export class AgentManager {
     void this.closeAgent(agent.id, { reason: refusal.message }).catch((error: unknown) => {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to stop agent after refusal");
     });
+  }
+
+  /** The agent's runtime reported the session's member: the session admits it again. */
+  private readmitSessionMember(agent: ActiveManagedAgent, kept: SessionMemberError): void {
+    this.sessionMemberRefusals.delete(agent.id);
+    agent.sessionMemberRefused = undefined;
+    if (agent.lastError === kept.message) agent.lastError = undefined;
+    this.logger.info(
+      { agentId: agent.id, member: kept.member, refused: kept.attempted },
+      "Agent runtime reports the session's member again; admitting it",
+    );
+    this.emitState(agent);
+  }
+
+  /** Restores the refusal recorded for an agent before it is started again. */
+  private restoreSessionMemberRefusal(agentId: string, refused: string | undefined): void {
+    if (!this.sessionMemberGate || !refused || this.sessionMemberRefusals.has(agentId)) return;
+    this.sessionMemberRefusals.set(
+      agentId,
+      new SessionMemberError(this.sessionMemberGate.member, refused),
+    );
   }
 
   private async refreshRuntimeInfo(
@@ -4622,8 +4676,8 @@ export class AgentManager {
         this.emitState(agent);
         return undefined;
       case "model_changed":
+        // The session subscription judged this report against the member already.
         agent.runtimeInfo = event.runtimeInfo;
-        this.enforceRuntimeSessionMember(agent);
         if (!agent.persistence && event.runtimeInfo.sessionId) {
           agent.persistence = attachPersistenceCwd(
             { provider: agent.provider, sessionId: event.runtimeInfo.sessionId },
