@@ -333,7 +333,6 @@ function createVoiceAssistantWebSocketServer(params: {
     undefined,
     undefined,
     undefined,
-    undefined,
     createProviderSnapshotManagerStub().manager,
     undefined,
     undefined,

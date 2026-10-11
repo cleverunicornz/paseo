@@ -2,7 +2,6 @@ import type pino from "pino";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
-import { generateLocalPairingOffer } from "../../pairing-offer.js";
 import {
   collectDaemonDiagnostics,
   type DaemonWebSocketRuntimeDiagnosticSnapshot,
@@ -57,9 +56,8 @@ export interface DaemonSessionOptions {
 
 /**
  * A client's read surface for the daemon process itself: its runtime status
- * (pid-lock start time, listen address, relay config, provider availability) and
- * a fresh local pairing offer for connecting a new client. Owns the `daemon.*`
- * RPCs. Reaches no state beyond the never-mutated runtime values injected at
+ * (pid-lock start time, listen address, relay config, provider availability).
+ * Owns the `daemon.*` RPCs. Reaches no state beyond the never-mutated runtime values injected at
  * construction and the outbound channel.
  */
 export class DaemonSession {
@@ -212,42 +210,18 @@ export class DaemonSession {
     }
   }
 
+  /** This daemon pairs no devices; old clients asking for an offer get an error. */
   async handleGetPairingOfferRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.get_pairing_offer.request" }>,
   ): Promise<void> {
-    try {
-      const relay = this.daemonRuntimeConfig?.getRelayConfig();
-      const pairing = await generateLocalPairingOffer({
-        paseoHome: this.paseoHome,
-        relayEnabled: relay?.enabled ?? false,
-        relayEndpoint: relay?.endpoint,
-        relayPublicEndpoint: relay?.publicEndpoint,
-        relayUseTls: relay?.useTls,
-        relayPublicUseTls: relay?.publicUseTls,
-        appBaseUrl: this.daemonRuntimeConfig?.appBaseUrl,
-        includeQr: true,
-        logger: this.logger,
-      });
-      this.host.emit({
-        type: "daemon.get_pairing_offer.response",
-        payload: {
-          requestId: msg.requestId,
-          url: pairing.url ?? "",
-          qr: pairing.qr ?? null,
-          relayEnabled: pairing.relayEnabled,
-        },
-      });
-    } catch (error) {
-      this.logger.error({ err: error }, "Failed to handle daemon pairing offer request");
-      this.host.emit({
-        type: "rpc_error",
-        payload: {
-          requestId: msg.requestId,
-          requestType: "daemon.get_pairing_offer.request",
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
-    }
+    this.host.emit({
+      type: "rpc_error",
+      payload: {
+        requestId: msg.requestId,
+        requestType: "daemon.get_pairing_offer.request",
+        error: "This daemon does not pair devices.",
+      },
+    });
   }
 
   handleConfigReloadRequest(

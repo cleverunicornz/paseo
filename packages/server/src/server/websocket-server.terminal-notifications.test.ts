@@ -16,7 +16,6 @@ import type {
 import type { PersistedWorkspaceRecord, WorkspaceRegistry } from "./workspace-registry.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
 import { createProviderSnapshotManagerStub } from "./test-utils/session-stubs.js";
-import type { PushNotificationSender, PushPayload } from "./push/index.js";
 import type { WorkspaceAutoName } from "./workspace-auto-name.js";
 
 const wsModuleMock = vi.hoisted(() => {
@@ -47,14 +46,6 @@ vi.mock("./session.js", () => ({
 }));
 
 import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
-
-class RecordingPushNotificationSender implements PushNotificationSender {
-  readonly sent: PushPayload[] = [];
-
-  async send(payload: PushPayload): Promise<void> {
-    this.sent.push(payload);
-  }
-}
 
 function createLogger() {
   const logger = {
@@ -115,7 +106,6 @@ function createWorkspaceRegistry(records: PersistedWorkspaceRecord[]): Workspace
 }
 
 function createServer(terminalManager: TerminalManager, workspaceRegistry?: WorkspaceRegistry) {
-  const pushNotifications = new RecordingPushNotificationSender();
   const agentManager = {
     setAgentAttentionCallback: vi.fn(),
     subscribe: vi.fn(() => () => {}),
@@ -174,11 +164,10 @@ function createServer(terminalManager: TerminalManager, workspaceRegistry?: Work
     undefined,
     undefined,
     undefined,
-    pushNotifications,
     createProviderSnapshotManagerStub().manager,
   );
 
-  return { server, pushNotifications };
+  return { server };
 }
 
 function createOpenSocket() {
@@ -280,7 +269,7 @@ describe("VoiceAssistantWebSocketServer terminal attention notifications", () =>
 
   it("does not emit attention without a matching terminal-directory subscription", async () => {
     const { manager, emit } = createTerminalManager();
-    const { server, pushNotifications } = createServer(manager);
+    const { server } = createServer(manager);
     const ws = connectClient(server, false);
 
     emit(
@@ -294,7 +283,6 @@ describe("VoiceAssistantWebSocketServer terminal attention notifications", () =>
     await flushAsync();
 
     expectNoTerminalAttentionMessage(ws);
-    expect(pushNotifications.sent).toHaveLength(1);
   });
 
   it("broadcasts terminal_attention_required after working -> idle", async () => {
@@ -469,33 +457,5 @@ describe("VoiceAssistantWebSocketServer terminal attention notifications", () =>
     const payload = readTerminalAttentionMessage(ws);
     expect(payload.reason).toBe("needs_input");
     expect(payload.title).toBe("Terminal needs input");
-  });
-
-  it("sends push notification when no clients are present", async () => {
-    const { manager, emit } = createTerminalManager();
-    const { pushNotifications } = createServer(
-      manager,
-      createWorkspaceRegistry([workspaceRecord()]),
-    );
-    // No connected clients
-
-    emit(
-      transition({
-        previousState: "working",
-        previousChangedAt: 0,
-        state: "idle",
-        changedAt: 15000,
-      }),
-    );
-
-    await flushAsync();
-
-    expect(pushNotifications.sent).toHaveLength(1);
-    expect(pushNotifications.sent[0]?.title).toBe("Terminal finished");
-    expect(pushNotifications.sent[0]?.data).toMatchObject({
-      serverId: "srv-test",
-      terminalId: "term-1",
-      workspaceId: "ws-1",
-    });
   });
 });

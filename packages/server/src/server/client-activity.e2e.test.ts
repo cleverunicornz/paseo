@@ -3,16 +3,7 @@ import { createTestPaseoDaemon, type TestPaseoDaemon } from "./test-utils/paseo-
 import { DaemonClient } from "./test-utils/daemon-client.js";
 import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
 import type { AgentSnapshotPayload } from "./messages.js";
-import type { PushNotificationSender, PushPayload } from "./push/index.js";
 import { PRESENCE_THRESHOLD_MS } from "./agent-attention-policy.js";
-
-class RecordingPushNotificationSender implements PushNotificationSender {
-  readonly sent: PushPayload[] = [];
-
-  async send(payload: PushPayload): Promise<void> {
-    this.sent.push(payload);
-  }
-}
 
 /**
  * Tests for client activity tracking and smart notifications.
@@ -38,11 +29,9 @@ describe("client activity tracking", () => {
   let daemon: TestPaseoDaemon;
   let client1: DaemonClient;
   let client2: DaemonClient;
-  let pushNotifications: RecordingPushNotificationSender;
 
   beforeEach(async () => {
-    pushNotifications = new RecordingPushNotificationSender();
-    daemon = await createTestPaseoDaemon({ pushNotificationSender: pushNotifications });
+    daemon = await createTestPaseoDaemon();
   });
 
   afterEach(async () => {
@@ -202,35 +191,6 @@ describe("client activity tracking", () => {
       expect(attention.shouldNotify).toBe(true);
     }, 120000);
 
-    test("push fallback when activity is stale beyond the presence threshold", async () => {
-      client1 = await createClient();
-
-      const agent = await createAgent({
-        client: client1,
-        title: "Stale Activity Test",
-      });
-
-      // User had agent focused but no activity beyond the presence threshold.
-      const staleTime = new Date(Date.now() - PRESENCE_THRESHOLD_MS - 5_000).toISOString();
-      client1.sendHeartbeat({
-        deviceType: "web",
-        focusedAgentId: agent.id,
-        lastActivityAt: staleTime,
-        appVisible: true,
-      });
-
-      await new Promise((r) => setTimeout(r, 100));
-
-      const attentionPromise = waitForAttentionRequired(client1, agent.id);
-      await client1.sendMessage(agent.id, "Say 'hello' and nothing else");
-
-      const attention = await attentionPromise;
-
-      expect(attention.reason).toBe("finished");
-      expect(attention.shouldNotify).toBe(false);
-      expect(pushNotifications.sent).toHaveLength(1);
-    }, 120000);
-
     test("notification when no heartbeat received (legacy/new client)", async () => {
       client1 = await createClient();
 
@@ -248,7 +208,6 @@ describe("client activity tracking", () => {
 
       expect(attention.reason).toBe("finished");
       expect(attention.shouldNotify).toBe(false);
-      expect(pushNotifications.sent).toHaveLength(1);
     }, 120000);
   });
 
@@ -295,46 +254,6 @@ describe("client activity tracking", () => {
       expect(attention2.shouldNotify).toBe(false);
     }, 120000);
 
-    test("pushes when both web clients are inactive", async () => {
-      client1 = await createClient();
-      client2 = await createClient();
-
-      const agent = await createAgent({
-        client: client1,
-        title: "Both Inactive Test",
-      });
-
-      const staleTime = new Date(Date.now() - PRESENCE_THRESHOLD_MS - 5_000).toISOString();
-
-      // Both clients stale
-      client1.sendHeartbeat({
-        deviceType: "web",
-        focusedAgentId: null,
-        lastActivityAt: staleTime,
-        appVisible: false,
-      });
-
-      client2.sendHeartbeat({
-        deviceType: "web",
-        focusedAgentId: null,
-        lastActivityAt: staleTime,
-        appVisible: false,
-      });
-
-      await new Promise((r) => setTimeout(r, 100));
-
-      const attention1Promise = waitForAttentionRequired(client1, agent.id);
-      const attention2Promise = waitForAttentionRequired(client2, agent.id);
-      await client1.sendMessage(agent.id, "Say 'hello' and nothing else");
-
-      const [attention1, attention2] = await Promise.all([attention1Promise, attention2Promise]);
-
-      // No stale client is selected for in-app; push handles the fallback.
-      expect(attention1.shouldNotify).toBe(false);
-      expect(attention2.shouldNotify).toBe(false);
-      expect(pushNotifications.sent).toHaveLength(1);
-    }, 120000);
-
     test("notifies only the present Electron-style web client when Firefox is stale", async () => {
       client1 = await createClient();
       client2 = await createClient();
@@ -368,7 +287,6 @@ describe("client activity tracking", () => {
 
       expect(attention1.shouldNotify).toBe(false);
       expect(attention2.shouldNotify).toBe(true);
-      expect(pushNotifications.sent).toEqual([]);
     }, 120000);
   });
 
@@ -513,7 +431,6 @@ describe("client activity tracking", () => {
 
       expect(attention1.shouldNotify).toBe(false);
       expect(attention2.shouldNotify).toBe(true);
-      expect(pushNotifications.sent).toEqual([]);
     }, 120000);
 
     test("notify web when user active on web but looking at different agent", async () => {
@@ -553,46 +470,6 @@ describe("client activity tracking", () => {
       // Don't also notify mobile - user is at the computer
       expect(attention2.shouldNotify).toBe(false);
     }, 120000);
-
-    test("pushes when both devices are inactive and no one is watching agent", async () => {
-      client1 = await createClient(); // web
-      client2 = await createClient(); // mobile
-
-      const agent = await createAgent({
-        client: client1,
-        title: "Both Inactive Test",
-      });
-
-      const staleTime = new Date(Date.now() - PRESENCE_THRESHOLD_MS - 5_000).toISOString();
-
-      // Web: stale
-      client1.sendHeartbeat({
-        deviceType: "web",
-        focusedAgentId: null,
-        lastActivityAt: staleTime,
-        appVisible: false,
-      });
-
-      // Mobile: also stale (but mobile should still notify as fallback)
-      client2.sendHeartbeat({
-        deviceType: "mobile",
-        focusedAgentId: null,
-        lastActivityAt: staleTime,
-        appVisible: false,
-      });
-
-      await new Promise((r) => setTimeout(r, 100));
-
-      const attention1Promise = waitForAttentionRequired(client1, agent.id);
-      const attention2Promise = waitForAttentionRequired(client2, agent.id);
-      await client1.sendMessage(agent.id, "Say 'hello' and nothing else");
-
-      const [attention1, attention2] = await Promise.all([attention1Promise, attention2Promise]);
-
-      expect(attention1.shouldNotify).toBe(false);
-      expect(attention2.shouldNotify).toBe(false);
-      expect(pushNotifications.sent).toHaveLength(1);
-    }, 120000);
   });
 
   // ===========================================================================
@@ -600,38 +477,6 @@ describe("client activity tracking", () => {
   // ===========================================================================
 
   describe("edge cases", () => {
-    test("pushes when web is stale and mobile has no heartbeat", async () => {
-      client1 = await createClient(); // web
-      client2 = await createClient(); // mobile - no heartbeat
-
-      const agent = await createAgent({
-        client: client1,
-        title: "Mobile No Heartbeat Test",
-      });
-
-      // Web: stale
-      client1.sendHeartbeat({
-        deviceType: "web",
-        focusedAgentId: agent.id,
-        lastActivityAt: new Date(Date.now() - PRESENCE_THRESHOLD_MS - 5_000).toISOString(),
-        appVisible: true,
-      });
-
-      // Mobile: never sent heartbeat (new connection)
-
-      await new Promise((r) => setTimeout(r, 100));
-
-      const attention1Promise = waitForAttentionRequired(client1, agent.id);
-      const attention2Promise = waitForAttentionRequired(client2, agent.id);
-      await client1.sendMessage(agent.id, "Say 'hello' and nothing else");
-
-      const [attention1, attention2] = await Promise.all([attention1Promise, attention2Promise]);
-
-      expect(attention1.shouldNotify).toBe(false);
-      expect(attention2.shouldNotify).toBe(false);
-      expect(pushNotifications.sent).toHaveLength(1);
-    }, 120000);
-
     test("notification when app not visible but activity is recent", async () => {
       client1 = await createClient();
 
@@ -695,7 +540,6 @@ describe("client activity tracking", () => {
 
       expect(attention1.shouldNotify).toBe(true);
       expect(attention2.shouldNotify).toBe(false);
-      expect(pushNotifications.sent).toEqual([]);
     }, 120000);
   });
 });

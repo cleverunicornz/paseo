@@ -1,4 +1,3 @@
-import { pairCommand } from "./commands/daemon/pair.js";
 import { Command, Option } from "commander";
 import { createAgentCommand } from "./commands/agent/index.js";
 import { createDaemonCommand } from "./commands/daemon/index.js";
@@ -122,7 +121,6 @@ export function createCli(): Command {
   program.addCommand(daemonStatusCommand());
   program.addCommand(daemonRestartCommand());
   program.addCommand(daemonReloadCommand());
-  program.addCommand(pairCommand());
 
   // Advanced agent commands (less common operations)
   program.addCommand(createAgentCommand());

@@ -107,14 +107,6 @@ vi.mock("./session.js", () => ({
   Session: sessionMock.MockSession,
 }));
 
-vi.mock("./push/index.js", () => ({
-  createPushNotifications: () => ({
-    renew: () => undefined,
-    revoke: () => undefined,
-    send: async () => undefined,
-  }),
-}));
-
 import { z } from "zod";
 import { VoiceAssistantWebSocketServer } from "./websocket-server";
 import { DAEMON_PERMISSIONS, parseServerInfoStatusPayload } from "./messages.js";
@@ -289,7 +281,6 @@ function createServer(options?: {
       })),
       dispose: vi.fn(),
     }),
-    undefined,
     undefined,
     undefined,
     undefined,

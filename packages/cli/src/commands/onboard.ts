@@ -12,12 +12,6 @@ import { withGlobalOptions } from "../utils/command-options.js";
 import type { CommandOptions } from "../output/index.js";
 import { launchLocalDaemon, parseTimeoutMs } from "./daemon/local-daemon.js";
 import { connectToDaemon } from "../utils/client.js";
-import { formatPairingInstructions } from "../output/pairing.js";
-import {
-  confirmRelayPairing,
-  printDirectConnectionGuidance,
-  resolveLocalPairingOffer,
-} from "./daemon/pair.js";
 
 interface OnboardOptions extends CommandOptions {
   port?: string;
@@ -111,12 +105,10 @@ async function resolveVoiceSelection(mode: OnboardOptions["voice"]): Promise<boo
   return answer;
 }
 
-function printNextSteps(pairingUrl: string | null, paseoHome: string, richUi: boolean): void {
+function printNextSteps(paseoHome: string, richUi: boolean): void {
   const daemonLogPath = path.join(paseoHome, "daemon.log");
   const nextStepsLines = [
-    pairingUrl
-      ? "1. Open Paseo and scan the QR code above, or paste the pairing link."
-      : "1. Open Paseo and connect to your daemon.",
+    "1. Open Paseo and connect to your daemon.",
     "2. Web app: https://app.paseo.sh",
     "3. Desktop app: https://github.com/getpaseo/paseo/releases/latest",
     "4. Docs: https://paseo.sh/docs",
@@ -272,48 +264,6 @@ export async function runOnboard(options: OnboardOptions): Promise<void> {
   const ready = await waitForDaemonReady(paseoHome, { timeoutMs });
   log.message(`Daemon ready on ${ready.listen}`);
 
-  if (options.relay === false) {
-    log.message("Relay pairing skipped because --no-relay was provided.");
-    printNextSteps(null, paseoHome, richUi);
-    if (richUi) outro("Paseo daemon is running.");
-    return;
-  }
-
-  let pairing = await resolveLocalPairingOffer({
-    paseoHome,
-    enableRelay: options.relay === true,
-  });
-
-  if (!pairing.relayEnabled) {
-    const shouldEnable = richUi ? await confirmRelayPairing() : false;
-    if (!shouldEnable) {
-      printDirectConnectionGuidance();
-      printNextSteps(null, paseoHome, richUi);
-      if (richUi) outro("Paseo daemon is running.");
-      return;
-    }
-    pairing = await resolveLocalPairingOffer({ paseoHome, enableRelay: true });
-    log.success("Relay enabled");
-  }
-
-  if (!pairing.url) {
-    log.warn("Relay pairing URL is unavailable for this daemon configuration.");
-    printNextSteps(null, paseoHome, richUi);
-    if (richUi) {
-      outro("Paseo daemon is running.");
-    }
-    return;
-  }
-
-  process.stdout.write(
-    formatPairingInstructions({
-      url: pairing.url,
-      qr: pairing.qr,
-      columns: process.stdout.columns,
-    }),
-  );
-  printNextSteps(pairing.url, paseoHome, richUi);
-  if (richUi) {
-    outro("Paseo is ready!");
-  }
+  printNextSteps(paseoHome, richUi);
+  if (richUi) outro("Paseo daemon is running.");
 }

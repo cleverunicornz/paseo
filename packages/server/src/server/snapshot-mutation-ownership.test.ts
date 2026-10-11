@@ -110,7 +110,6 @@ describe("snapshot mutation ownership boundary", () => {
         onMessage,
         logger: createStub<SessionOptions["logger"]>(logger),
         downloadTokenStore: createStub<SessionOptions["downloadTokenStore"]>({}),
-        pushNotifications: createStub<SessionOptions["pushNotifications"]>({}),
         paseoHome: "/tmp/paseo-test",
         agentManager: createStub<SessionOptions["agentManager"]>({
           subscribe: () => () => {},

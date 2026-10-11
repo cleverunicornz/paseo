@@ -182,7 +182,6 @@ import type { HubRelationshipManagement } from "./hub/relationship-controller.js
 import { HubExecutionController } from "./hub/execution-controller.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
-import type { PushNotifications } from "./push/index.js";
 import {
   archivePersistedWorkspaceRecord,
   archiveWorkspaceContents,
@@ -444,7 +443,6 @@ export interface SessionOptions {
   publishScriptStatusUpdate?: (message: ScriptStatusUpdateMessage) => void;
   logger: pino.Logger;
   downloadTokenStore: DownloadTokenStore;
-  pushNotifications: PushNotifications;
   paseoHome: string;
   worktreesRoot?: string;
   agentManager: AgentManager;
@@ -706,7 +704,6 @@ export class Session {
   private readonly workspaceProvisioning: WorkspaceProvisioningService;
   private readonly workspaceRecovery: WorkspaceRecoveryService;
   private readonly daemonConfigStore: DaemonConfigStore;
-  private readonly pushNotifications: PushNotifications;
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private unsubscribeAgentEvents: (() => void) | null = null;
@@ -726,7 +723,6 @@ export class Session {
       capabilities: ReadonlySet<ClientCapability>;
       appVersion: string | null;
       activity: ClientActivity | null;
-      pushToken: string | null;
     }
   >();
   private unsubscribeTerminalWorkspaceContributionEvents: (() => void) | null = null;
@@ -786,7 +782,6 @@ export class Session {
       publishScriptStatusUpdate,
       logger,
       downloadTokenStore,
-      pushNotifications,
       paseoHome,
       worktreesRoot,
       agentManager,
@@ -834,7 +829,6 @@ export class Session {
     this.getTransportBufferedAmount = getTransportBufferedAmount ?? (() => 0);
     this.onLifecycleIntent = onLifecycleIntent ?? null;
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
-    this.pushNotifications = pushNotifications;
     this.paseoHome = paseoHome;
     this.messageReceipts = options.messageReceipts;
     this.creationService = options.creationService;
@@ -1157,7 +1151,6 @@ export class Session {
         capabilities: this.clientCapabilities,
         appVersion,
         activity: this.clientSources.get(source)?.activity ?? null,
-        pushToken: this.clientSources.get(source)?.pushToken ?? null,
       });
       this.refreshObservationProducers();
       // COMPAT(ownedSubscriptions): added in v0.8.0, remove capability-driven legacy host registration after 2027-03-09.
@@ -1415,7 +1408,6 @@ export class Session {
         capabilities: this.clientCapabilities,
         appVersion: this.appVersion,
         activity: null,
-        pushToken: null,
       };
       this.clientSources.set(source, metadata);
     }
@@ -2954,14 +2946,10 @@ export class Session {
       case "list_commands_request":
         await this.handleListCommandsRequest(msg);
         return;
+      // This daemon sends no push notifications: a token is not kept, and unregistering succeeds.
       case "register_push_token":
-        this.handleRegisterPushToken(msg.token);
         return;
       case "push.unregister.request":
-        this.pushNotifications.revoke(msg.token);
-        if (this.currentClientMetadata().pushToken?.trim() === msg.token.trim()) {
-          this.currentClientMetadata().pushToken = null;
-        }
         this.emit({
           type: "push.unregister.response",
           payload: { requestId: msg.requestId },
@@ -4729,9 +4717,6 @@ export class Session {
     if (msg.appVisible && focusedTerminalId) {
       void this.clearFocusedTerminalAttention(focusedTerminalId);
     }
-    if (metadata.pushToken) {
-      this.pushNotifications.renew(metadata.pushToken);
-    }
   }
 
   private async clearFocusedTerminalAttention(terminalId: string): Promise<void> {
@@ -4744,15 +4729,6 @@ export class Session {
     } catch (error) {
       this.sessionLogger.warn({ err: error, terminalId }, "Failed to clear terminal attention");
     }
-  }
-
-  /**
-   * Handle push token registration
-   */
-  private handleRegisterPushToken(token: string): void {
-    this.currentClientMetadata().pushToken = token;
-    this.pushNotifications.renew(token);
-    this.sessionLogger.info("Registered push token");
   }
 
   /**

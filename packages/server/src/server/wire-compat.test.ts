@@ -220,7 +220,6 @@ function createSessionForWireCompatTest(options?: {
     onMessageToSource: options?.onMessageToSource ?? ((_source, message) => messages.push(message)),
     logger: pino({ level: "silent" }),
     downloadTokenStore: {} as SessionOptions["downloadTokenStore"],
-    pushNotifications: {} as SessionOptions["pushNotifications"],
     paseoHome: "/tmp/paseo-home",
     agentManager: new InMemoryAgentManager(
       options?.rows ?? rows,

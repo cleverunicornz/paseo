@@ -10,7 +10,6 @@ import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
 import { createProviderSnapshotManagerStub } from "./test-utils/session-stubs.js";
-import type { PushNotificationSender, PushPayload } from "./push/index.js";
 import type { WorkspaceAutoName } from "./workspace-auto-name.js";
 
 const WORKSPACE_ID = "workspace-1";
@@ -74,16 +73,7 @@ function createWorkspaceAutoNameStub(): WorkspaceAutoName {
   });
 }
 
-class RecordingPushNotificationSender implements PushNotificationSender {
-  readonly sent: PushPayload[] = [];
-
-  async send(payload: PushPayload): Promise<void> {
-    this.sent.push(payload);
-  }
-}
-
 function createServer(agentManagerOverrides?: Record<string, unknown>) {
-  const pushNotifications = new RecordingPushNotificationSender();
   const agentManager = {
     subscribe: vi.fn(() => () => {}),
     setAgentAttentionCallback: vi.fn(),
@@ -143,11 +133,10 @@ function createServer(agentManagerOverrides?: Record<string, unknown>) {
     undefined,
     undefined,
     undefined,
-    pushNotifications,
     createProviderSnapshotManagerStub().manager,
   );
 
-  return { server, agentManager, pushNotifications };
+  return { server, agentManager };
 }
 
 function createOpenSocket() {
@@ -225,7 +214,7 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
   });
 
   it("does not emit attention or include presence without an agent-directory subscription", async () => {
-    const { server, pushNotifications } = createServer();
+    const { server } = createServer();
     const now = new Date();
     const unsubscribed = connectClient(
       server,
@@ -245,69 +234,10 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
     });
 
     expect(unsubscribed.send).not.toHaveBeenCalled();
-    expect(pushNotifications.sent).toHaveLength(1);
-  });
-
-  it("uses assistant preview text for push notifications with markdown removed", async () => {
-    const getLastAssistantMessage = vi.fn(
-      async () => "**Done**. Updated `README.md` and [link](https://example.com).",
-    );
-    const { server, pushNotifications } = createServer({
-      getAgent: vi.fn(() => ({
-        config: { title: null },
-        cwd: "/tmp/worktree",
-        workspaceId: WORKSPACE_ID,
-        pendingPermissions: new Map(),
-      })),
-      getLastAssistantMessage,
-    });
-
-    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
-      agentId: "agent-1",
-      provider: "claude",
-      reason: "finished",
-    });
-
-    expect(pushNotifications.sent).toEqual([
-      {
-        title: "Agent finished",
-        body: "Done. Updated README.md and link.",
-        data: {
-          serverId: "srv-test",
-          workspaceId: WORKSPACE_ID,
-          agentId: "agent-1",
-          reason: "finished",
-        },
-      },
-    ]);
-    expect(getLastAssistantMessage).toHaveBeenCalledWith("agent-1");
-  });
-
-  it("sends push notifications regardless of UI label presence", async () => {
-    const getLastAssistantMessage = vi.fn(async () => "Done.");
-    const { server, pushNotifications } = createServer({
-      getAgent: vi.fn(() => ({
-        config: { title: null },
-        cwd: "/tmp/worktree",
-        workspaceId: WORKSPACE_ID,
-        labels: {},
-        pendingPermissions: new Map(),
-      })),
-      getLastAssistantMessage,
-    });
-
-    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
-      agentId: "agent-2",
-      provider: "claude",
-      reason: "finished",
-    });
-
-    expect(pushNotifications.sent).toHaveLength(1);
-    expect(getLastAssistantMessage).toHaveBeenCalledWith("agent-2");
   });
 
   it("routes a hidden stale focused browser tab's notification to the present Electron web client", async () => {
-    const { server, pushNotifications } = createServer();
+    const { server } = createServer();
     const nowMs = Date.now();
     const electronWs = connectClient(server, {
       deviceType: "web",
@@ -330,34 +260,5 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
 
     expect(readAttentionRequiredMessage(electronWs).shouldNotify).toBe(true);
     expect(readAttentionRequiredMessage(firefoxWs).shouldNotify).toBe(false);
-    expect(pushNotifications.sent).toEqual([]);
-  });
-
-  it("pushes non-error attention when the only connected client has never sent a heartbeat", async () => {
-    const { server, pushNotifications } = createServer();
-    const ws = connectClient(server, null);
-
-    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
-      agentId: "agent-no-heartbeat",
-      provider: "claude",
-      reason: "finished",
-    });
-
-    expect(readAttentionRequiredMessage(ws).shouldNotify).toBe(false);
-    expect(pushNotifications.sent).toHaveLength(1);
-  });
-
-  it("does not push error attention when the only connected client has never sent a heartbeat", async () => {
-    const { server, pushNotifications } = createServer();
-    const ws = connectClient(server, null);
-
-    await asInternals<WebSocketServerInternals>(server).broadcastAgentAttention({
-      agentId: "agent-no-heartbeat",
-      provider: "claude",
-      reason: "error",
-    });
-
-    expect(readAttentionRequiredMessage(ws).shouldNotify).toBe(false);
-    expect(pushNotifications.sent).toEqual([]);
   });
 });
