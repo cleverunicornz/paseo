@@ -395,9 +395,9 @@ function endWithError(input: {
 
 /**
  * Relays an event-stream answer in whole events, so a refusal never completes
- * or breaks an event the caller has only part of. An event that grows past
- * `MAX_HELD_EVENT_BYTES` before its blank line is dropped and `onOversized`
- * ends the stream.
+ * or breaks an event the caller has only part of. An event larger than
+ * `MAX_HELD_EVENT_BYTES`, however it is chunked, is dropped: the events before
+ * it are passed on and `onOversized` ends the stream.
  */
 function relayWholeEvents(input: {
   upstreamResponse: http.IncomingMessage;
@@ -406,15 +406,14 @@ function relayWholeEvents(input: {
   onOversized: () => void;
 }): EventStreamRelay {
   const { upstreamResponse, res, isCut } = input;
-  const events = new EventStreamRelay();
+  const events = new EventStreamRelay(MAX_HELD_EVENT_BYTES);
   let oversized = false;
   const stopped = () => oversized || isCut();
   upstreamResponse.on("data", (chunk: Buffer) => {
     if (stopped()) return;
     const whole = events.take(chunk);
-    if (events.heldBytes > MAX_HELD_EVENT_BYTES) {
+    if (events.oversized) {
       oversized = true;
-      events.drop();
       if (whole.length > 0) res.write(whole);
       input.onOversized();
       return;

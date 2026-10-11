@@ -1417,6 +1417,95 @@ describe("events held whole in session mode", () => {
   }, 20_000);
 });
 
+/** A result event of `size` bytes before its blank line, as a tool call's answer. */
+function resultEvent(size: number): Buffer {
+  const prefix =
+    'event: message\ndata: {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"';
+  const suffix = '"}]}}';
+  return Buffer.from(`${prefix}${"x".repeat(size - prefix.length - suffix.length)}${suffix}`);
+}
+
+/**
+ * Streams `stream` from an event-stream backend: its first `split` bytes in
+ * 64 KiB writes, then the rest in one last write, and reads the answer.
+ */
+async function streamInWrites(stream: Buffer, split: number) {
+  const upstream = await startUpstream((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    void (async () => {
+      for (let offset = 0; offset < split; offset += 64 * 1024) {
+        const ready = res.write(stream.subarray(offset, Math.min(split, offset + 64 * 1024)));
+        if (!ready) await new Promise((resolve) => res.once("drain", resolve));
+      }
+      res.end(stream.subarray(split));
+    })();
+  });
+  const gateway = await startGateway({
+    backends: { cluster: upstream.url },
+    sessionIdentity: SESSION_IDENTITY,
+    agentRefusal: () => null,
+    requests: new McpGatewayRequests(),
+  });
+  const response = await fetch(`${gateway}/cluster`, {
+    method: "POST",
+    headers: { Authorization: "Bearer token-a" },
+    body: '{"jsonrpc":"2.0","id":5,"method":"tools/call"}',
+  });
+  return { status: response.status, text: await response.text() };
+}
+
+const OVERSIZED_EVENT_ERROR = {
+  jsonrpc: "2.0",
+  id: 5,
+  error: {
+    code: -32603,
+    message:
+      "MCP backend cluster sent an event of more than 16 MiB; in session mode an event is held whole before it is passed on, up to 16 MiB",
+  },
+};
+
+describe("events bounded by their full size, however they are chunked", () => {
+  const BLANK_LINE = Buffer.from("\n\n");
+
+  test("an event over 16 MiB whose last bytes come with its blank line is refused", async () => {
+    const stream = Buffer.concat([resultEvent(HELD_EVENT_LIMIT + 1), BLANK_LINE]);
+    const answer = await streamInWrites(stream, HELD_EVENT_LIMIT - 256);
+    expect(answer.status).toBe(200);
+    expect(answer.text).not.toContain('"result"');
+    expect(errorEvents(answer.text)).toEqual([OVERSIZED_EVENT_ERROR]);
+  }, 20_000);
+
+  test("an event over 16 MiB split exactly at the bound is refused", async () => {
+    const stream = Buffer.concat([resultEvent(HELD_EVENT_LIMIT + 1), BLANK_LINE]);
+    const answer = await streamInWrites(stream, HELD_EVENT_LIMIT);
+    expect(answer.text).not.toContain('"result"');
+    expect(errorEvents(answer.text)).toEqual([OVERSIZED_EVENT_ERROR]);
+  }, 20_000);
+
+  test("an event over 16 MiB in one chunk after a smaller event is refused, the smaller one passed on", async () => {
+    const progress =
+      'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n';
+    const stream = Buffer.concat([
+      Buffer.from(progress),
+      resultEvent(HELD_EVENT_LIMIT + 1),
+      BLANK_LINE,
+    ]);
+    const answer = await streamInWrites(stream, 0);
+    expect(answer.text.startsWith(progress)).toBe(true);
+    expect(answer.text).not.toContain('"result"');
+    expect(errorEvents(answer.text)).toEqual([OVERSIZED_EVENT_ERROR]);
+  }, 20_000);
+
+  test("an event of exactly 16 MiB passes whole, its blank line with its last bytes or after them", async () => {
+    const stream = Buffer.concat([resultEvent(HELD_EVENT_LIMIT), BLANK_LINE]);
+    for (const split of [HELD_EVENT_LIMIT - 256, HELD_EVENT_LIMIT]) {
+      const answer = await streamInWrites(stream, split);
+      expect(answer.status).toBe(200);
+      expect(answer.text).toBe(stream.toString("utf8"));
+    }
+  }, 30_000);
+});
+
 /** The most of a finite answer the gateway holds for an agent in session mode. */
 const HELD_ANSWER_LIMIT = 16 * 1024 * 1024;
 

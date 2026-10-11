@@ -112,10 +112,10 @@ describe("JsonRpcIdScanner", () => {
 });
 
 /** Feeds `chunks` to a relay and returns what it passed on after each, and what it held. */
-function relay(chunks: string[]) {
-  const events = new EventStreamRelay();
+function relay(chunks: string[], maxEventBytes = 1024) {
+  const events = new EventStreamRelay(maxEventBytes);
   const passed = chunks.map((chunk) => events.take(Buffer.from(chunk)).toString("utf8"));
-  return { passed, held: events.rest().toString("utf8") };
+  return { passed, held: events.rest().toString("utf8"), oversized: events.oversized };
 }
 
 describe("EventStreamRelay", () => {
@@ -135,6 +135,7 @@ describe("EventStreamRelay", () => {
         'event: message\ndata: {"b":2}\n\n',
       ],
       held: "",
+      oversized: false,
     });
   });
 
@@ -142,6 +143,7 @@ describe("EventStreamRelay", () => {
     expect(relay(['event: message\ndata: {"result":{}}', "\n"])).toEqual({
       passed: ["", ""],
       held: 'event: message\ndata: {"result":{}}\n',
+      oversized: false,
     });
   });
 
@@ -149,11 +151,61 @@ describe("EventStreamRelay", () => {
     expect(relay(["data: 1\r\n\r", "\ndata: 2\r\r", "data: 3\r\n"])).toEqual({
       passed: ["data: 1\r\n\r", "\ndata: 2\r\r", ""],
       held: "data: 3\r\n",
+      oversized: false,
+    });
+  });
+
+  test("bounds an event by its full size, its last bytes and blank line in one chunk included", () => {
+    // "data: " and 4 bytes: 10 bytes before the blank line.
+    expect(relay(["data: 1234\n\n"], 10)).toEqual({
+      passed: ["data: 1234\n\n"],
+      held: "",
+      oversized: false,
+    });
+    expect(relay(["data: 12345\n\n"], 10)).toEqual({ passed: [""], held: "", oversized: true });
+    expect(relay(["data: 123", "45\n\n"], 10)).toEqual({
+      passed: ["", ""],
+      held: "",
+      oversized: true,
+    });
+  });
+
+  test("bounds an event split exactly at the bound, whatever line endings end it", () => {
+    expect(relay(["data: 1234", "\r\n\r\n"], 10)).toEqual({
+      passed: ["", "data: 1234\r\n\r\n"],
+      held: "",
+      oversized: false,
+    });
+    expect(relay(["data: 1234", "5\r\r"], 10)).toEqual({
+      passed: ["", ""],
+      held: "",
+      oversized: true,
+    });
+  });
+
+  test("counts each event of a chunk on its own and passes on those before an oversized one", () => {
+    expect(relay(["data: 1\n\ndata: 2\n\ndata: 12345\n\ndata: 3\n\n", "data: 4\n\n"], 10)).toEqual({
+      passed: ["data: 1\n\ndata: 2\n\n", ""],
+      held: "",
+      oversized: true,
+    });
+  });
+
+  test("counts the line endings inside an event but not the blank line that ends it", () => {
+    expect(relay(["data: 1\ndata: 2\n\n"], 15)).toEqual({
+      passed: ["data: 1\ndata: 2\n\n"],
+      held: "",
+      oversized: false,
+    });
+    expect(relay(["data: 1\ndata: 2\n\n"], 14)).toEqual({
+      passed: [""],
+      held: "",
+      oversized: true,
     });
   });
 
   test("drops the unfinished event at a refusal", () => {
-    const events = new EventStreamRelay();
+    const events = new EventStreamRelay(1024);
     expect(events.take(Buffer.from('data: {"a":1}\n\ndata: {"b"')).toString()).toBe(
       'data: {"a":1}\n\n',
     );
