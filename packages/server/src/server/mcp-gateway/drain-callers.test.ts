@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { DrainGatewayCallers } from "./drain-callers.js";
 
 const closing = { agentId: "agent-1", sessionId: "session-1", workspaceId: "workspace-1" };
@@ -12,7 +12,24 @@ function callersWithUndelivered(undelivered: Set<string>) {
   });
 }
 
+/** What the table still holds: identities, tokens and token digests. */
+function held(callers: DrainGatewayCallers) {
+  const maps = callers as unknown as Record<
+    "retained" | "tokenByAgent" | "agentByDigest",
+    Map<string, unknown>
+  >;
+  return {
+    retained: maps.retained.size,
+    tokens: maps.tokenByAgent.size,
+    digests: maps.agentByDigest.size,
+  };
+}
+
 describe("DrainGatewayCallers", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   test("a retained agent's token resolves to the identity it had when the shutdown began", () => {
     const callers = callersWithUndelivered(new Set());
     callers.retain([closing]);
@@ -106,5 +123,56 @@ describe("DrainGatewayCallers", () => {
     expect(callers.resolve(token)).toBeNull();
     now += 300;
     expect(callers.resolve(next)).toBeNull();
+  });
+
+  test("a refused identity and its token are freed at the deadline, without any further lookup", () => {
+    vi.useFakeTimers();
+    const callers = new DrainGatewayCallers({
+      hasUndeliveredTimeline: () => true,
+      refusedDrainMs: 40,
+    });
+    callers.retainRefused(refused);
+    callers.issue("agent-2");
+    expect(held(callers)).toEqual({ retained: 1, tokens: 1, digests: 1 });
+
+    vi.advanceTimersByTime(39);
+    expect(held(callers)).toEqual({ retained: 1, tokens: 1, digests: 1 });
+    vi.advanceTimersByTime(1);
+    expect(held(callers)).toEqual({ retained: 0, tokens: 0, digests: 0 });
+  });
+
+  test("the expiry of a replaced window does not free the fresh refusal's window", () => {
+    vi.useFakeTimers();
+    const callers = new DrainGatewayCallers({
+      hasUndeliveredTimeline: () => true,
+      refusedDrainMs: 40,
+    });
+    callers.retainRefused(refused);
+    callers.issue("agent-2");
+    vi.advanceTimersByTime(20);
+    callers.retainRefused(refused);
+    const fresh = callers.issue("agent-2");
+
+    vi.advanceTimersByTime(20);
+    expect(held(callers)).toEqual({ retained: 1, tokens: 1, digests: 1 });
+    expect(callers.resolve(fresh)).toEqual({ ...refused, drain: true });
+    vi.advanceTimersByTime(20);
+    expect(held(callers)).toEqual({ retained: 0, tokens: 0, digests: 0 });
+  });
+
+  test("a shutdown's retention and end leave no expiry timer behind", () => {
+    vi.useFakeTimers();
+    const callers = new DrainGatewayCallers({
+      hasUndeliveredTimeline: () => true,
+      refusedDrainMs: 40,
+    });
+    callers.retainRefused(refused);
+    callers.retain([refused]);
+    vi.advanceTimersByTime(40);
+    expect(held(callers).retained).toBe(1);
+
+    callers.retainRefused({ ...closing, agentId: "agent-3" });
+    callers.end();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

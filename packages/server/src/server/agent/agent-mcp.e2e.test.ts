@@ -510,6 +510,52 @@ interface BackendCall {
   ranAfterRefusal: boolean | null;
 }
 
+/** The JSON-RPC error code of the gateway's refusal, on the wire. */
+const MCP_GATEWAY_REFUSAL_CODE = -32003;
+
+interface ToolAnswer {
+  status: number;
+  body: string;
+  /** The answer's stream broke off instead of ending. */
+  aborted: boolean;
+}
+
+/**
+ * What the harness receives for one tool request, and `head`, which resolves
+ * when the answer's head arrives. A request cut off with no answer has status 0.
+ */
+function readToolAnswer(
+  request: http.ClientRequest,
+): Promise<ToolAnswer> & { head: Promise<void> } {
+  let headArrived = () => undefined as void;
+  const head = new Promise<void>((resolve) => {
+    headArrived = resolve;
+  });
+  const answer = new Promise<ToolAnswer>((resolve) => {
+    request.on("response", (response) => {
+      headArrived();
+      const chunks: Buffer[] = [];
+      let aborted = false;
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("aborted", () => {
+        aborted = true;
+      });
+      response.on("error", () => {
+        aborted = true;
+      });
+      response.on("close", () =>
+        resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+          aborted: aborted || !response.complete,
+        }),
+      );
+    });
+    request.on("error", () => resolve({ status: 0, body: "", aborted: true }));
+  });
+  return Object.assign(answer, { head });
+}
+
 /**
  * A daemon in session mode whose one agent runs the real Claude or Codex
  * adapter on its member, with a `fixture` gateway backend that records when
@@ -555,15 +601,30 @@ async function startReportingSession(provider: "claude" | "codex") {
   const arrived: Array<() => void> = [];
   const held: Array<() => void> = [];
   let holdResponses = false;
+  // With an early answer, the backend sends its 200 head before the body has arrived.
+  let early: "event-stream" | "json" | null = null;
   let refused = () => false;
   const backend = http.createServer((req, res) => {
     const call: BackendCall = { ranAfterRefusal: null };
     calls.push(call);
+    const answerType = early;
+    if (answerType) {
+      res.writeHead(200, {
+        "content-type": answerType === "event-stream" ? "text/event-stream" : "application/json",
+      });
+      if (answerType === "event-stream") res.write(": stream open\n\n");
+      else res.flushHeaders();
+    }
     req.once("data", () => arrived.shift()?.());
     req.resume();
     req.on("end", () => {
       call.ranAfterRefusal = refused();
-      const answer = () => res.end('{"jsonrpc":"2.0","id":1,"result":{}}');
+      const answer = () =>
+        res.end(
+          answerType === "event-stream"
+            ? 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+            : '{"jsonrpc":"2.0","id":1,"result":{}}',
+        );
       if (holdResponses) held.push(answer);
       else answer();
     });
@@ -650,7 +711,19 @@ async function startReportingSession(provider: "claude" | "codex") {
     },
     /** Tool requests whose whole body reached the backend before the refusal. */
     completedBeforeRefusal: () => calls.filter((call) => call.ranAfterRefusal === false).length,
+    /** Waits until `count` whole tool requests reached the backend before the refusal. */
+    wholeBodiesArrived: (count: number) =>
+      vi.waitFor(() =>
+        expect(calls.filter((call) => call.ranAfterRefusal === false)).toHaveLength(count),
+      ),
+    /** Tool requests whose whole body reached the backend after the refusal: their tool ran. */
+    completedAfterRefusal: () => calls.filter((call) => call.ranAfterRefusal === true).length,
     holdResponses: () => {
+      holdResponses = true;
+    },
+    /** The backend sends its 200 head at once, then holds its answer until released. */
+    answerEarly: (answerType: "event-stream" | "json") => {
+      early = answerType;
       holdResponses = true;
     },
     releaseResponses: () => {
@@ -661,24 +734,21 @@ async function startReportingSession(provider: "claude" | "codex") {
      * received its first bytes: the body's first half, or all of it.
      */
     openToolRequest: async (body: "streamed" | "complete") => {
-      const payload = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pr_read"}}';
+      const payload = '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"pr_read"}}';
       const reachedBackend = new Promise<void>((resolve) => arrived.push(resolve));
       const request = http.request(url, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
       });
-      const status = new Promise<number>((resolve) => {
-        request.on("response", (response) => {
-          response.resume();
-          resolve(response.statusCode ?? 0);
-        });
-        // A request cut off with no answer has no status.
-        request.on("error", () => resolve(0));
-      });
+      const answer = readToolAnswer(request);
       if (body === "complete") request.end(payload);
       else request.write(payload.slice(0, 40));
       await reachedBackend;
-      return { status, finish: () => request.end(payload.slice(40)) };
+      return {
+        answer,
+        status: answer.then((received) => received.status),
+        finish: () => request.end(payload.slice(40)),
+      };
     },
     close: async () => {
       queue.close();
@@ -1895,6 +1965,18 @@ describe("agent MCP end-to-end (offline)", () => {
     { provider: "codex", kind: "thread/settings/updated" },
   ];
 
+  const MODEL_REPORTS_BY_BODY: Array<ModelReportKind & { body: "streamed" | "complete" }> = [];
+  for (const report of MODEL_REPORT_KINDS) {
+    MODEL_REPORTS_BY_BODY.push(
+      { provider: report.provider, kind: report.kind, body: "streamed" } as ModelReportKind & {
+        body: "streamed";
+      },
+      { provider: report.provider, kind: report.kind, body: "complete" } as ModelReportKind & {
+        body: "complete";
+      },
+    );
+  }
+
   test.each(MODEL_REPORT_KINDS)(
     "in session mode tool requests a $provider agent streamed before its $kind report are cut off at the refusal",
     async ({ provider, kind }) => {
@@ -1945,6 +2027,77 @@ describe("agent MCP end-to-end (offline)", () => {
         expect(await Promise.all(requests.map((request) => request.status))).toEqual([403, 403]);
         expect(await turn.ended).toBe(session.refusal);
         expect(session.calls).toEqual([{ ranAfterRefusal: false }, { ranAfterRefusal: false }]);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(MODEL_REPORTS_BY_BODY)(
+    "in session mode a $provider agent's streamed tool answer already begun at its $kind report ends with the refusal as a JSON-RPC error ($body body)",
+    async ({ provider, kind, body }) => {
+      // The backend sent the 200 head of an event stream before the report, so
+      // the status is out; the stream must end with the refusal, not break off.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        session.answerEarly("event-stream");
+        const requests = [await session.openToolRequest(body), await session.openToolRequest(body)];
+        await Promise.all(requests.map((request) => request.answer.head));
+        await session.wholeBodiesArrived(body === "complete" ? 2 : 0);
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        if (body === "streamed") for (const request of requests) request.finish();
+        session.releaseResponses();
+
+        const refusalEvent = `event: message\ndata: ${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 7,
+          error: { code: MCP_GATEWAY_REFUSAL_CODE, message: session.refusal },
+        })}\n\n`;
+        for (const answer of await Promise.all(requests.map((request) => request.answer))) {
+          expect(answer).toMatchObject({ status: 200, aborted: false });
+          expect(answer.body.startsWith(": stream open\n\n")).toBe(true);
+          expect(answer.body.endsWith(refusalEvent)).toBe(true);
+          expect(answer.body).not.toContain('"result"');
+        }
+        expect(await turn.ended).toBe(session.refusal);
+        expect(session.completedAfterRefusal()).toBe(0);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(MODEL_REPORTS_BY_BODY)(
+    "in session mode a $provider agent's JSON tool answer whose head the backend sent before its $kind report is answered 403 ($body body)",
+    async ({ provider, kind, body }) => {
+      // The backend flushed a 200 JSON head early; the gateway holds a finite
+      // answer until it is whole, so the refusal still decides the status.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        session.answerEarly("json");
+        const requests = [await session.openToolRequest(body), await session.openToolRequest(body)];
+        await session.wholeBodiesArrived(body === "complete" ? 2 : 0);
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        if (body === "streamed") for (const request of requests) request.finish();
+        session.releaseResponses();
+
+        for (const answer of await Promise.all(requests.map((request) => request.answer))) {
+          expect(answer).toMatchObject({
+            status: 403,
+            body: JSON.stringify({ error: session.refusal }),
+            aborted: false,
+          });
+        }
+        expect(await turn.ended).toBe(session.refusal);
+        expect(session.completedAfterRefusal()).toBe(0);
       } finally {
         await session.close();
       }
