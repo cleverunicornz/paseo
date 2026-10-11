@@ -4,12 +4,7 @@ import path from "node:path";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 
 import pino from "pino";
-import {
-  createPaseoDaemon,
-  type PaseoDaemonConfig,
-  type PaseoOpenAIConfig,
-  type PaseoSpeechConfig,
-} from "../bootstrap.js";
+import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import type { AgentClient, AgentProvider } from "../agent/agent-sdk-types.js";
 import { createTestAgentClients } from "./fake-agent-client.js";
 import type { PushNotificationSender } from "../push/index.js";
@@ -37,12 +32,6 @@ interface TestPaseoDaemonOptions {
   paseoHomeRoot?: string;
   staticDir?: string;
   cleanup?: boolean;
-  openai?: PaseoOpenAIConfig;
-  speech?: PaseoSpeechConfig;
-  voiceLlmProvider?: PaseoDaemonConfig["voiceLlmProvider"];
-  voiceLlmProviderExplicit?: boolean;
-  voiceLlmModel?: string | null;
-  dictationFinalTimeoutMs?: number;
   auth?: PaseoDaemonConfig["auth"];
   pushNotificationSender?: PushNotificationSender;
   serviceProxy?: PaseoDaemonConfig["serviceProxy"];
@@ -210,12 +199,6 @@ async function prepareTestDaemonConfig(
     serviceProxy: options.serviceProxy,
     webUi: options.webUi,
     trustedProxies: options.trustedProxies,
-    openai: options.openai,
-    speech: options.speech,
-    voiceLlmProvider: options.voiceLlmProvider ?? null,
-    voiceLlmProviderExplicit: options.voiceLlmProviderExplicit ?? false,
-    voiceLlmModel: options.voiceLlmModel ?? null,
-    dictationFinalTimeoutMs: options.dictationFinalTimeoutMs,
     downloadTokenTtlMs: options.downloadTokenTtlMs,
     agentProfiles: options.agentProfiles,
     autoArchiveAfterMerge: options.autoArchiveAfterMerge,
