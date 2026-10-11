@@ -2740,6 +2740,45 @@ describe("console daemon: an agent keeps the model it was created with (outside 
     }
   }, 30_000);
 
+  test.each(PINNED_PROVIDERS)(
+    "a %s agent stopped for another model reopens pinned and runs its creation model",
+    async (provider) => {
+      // Outside session mode a creation-model refusal ends with the session it stopped;
+      // session mode's refusals stay with the native session instead (#17).
+      const host = await startConsoleDaemon();
+      try {
+        const agent = await host.createAgent(provider, CREATION_MODEL[provider]);
+        host.recorder.claudeReports.push(undefined, OTHER_MODEL.claude);
+        host.recorder.codexReroutes.push(undefined, OTHER_MODEL.codex);
+        await host.manager.runAgent(agent.id, "hello");
+        const refusal = modelPinRefusal(CREATION_MODEL[provider], OTHER_MODEL[provider]);
+        await expect(host.manager.runAgent(agent.id, "hello again")).rejects.toThrow(refusal);
+        await vi.waitFor(async () =>
+          expect(await host.daemon.agentStorage.get(agent.id)).toMatchObject({
+            lastStatus: "closed",
+          }),
+        );
+        const before = modelsSentToHarness(host.recorder, provider).length;
+
+        await host.load(agent.id);
+        expect(host.manager.getSessionMemberRefusal(agent.id)).toBeNull();
+        await host.manager.runAgent(agent.id, "after reopening");
+        const sent = modelsSentToHarness(host.recorder, provider).slice(before);
+        expect(sent.length).toBeGreaterThan(0);
+        expect(sent.every((model) => model === CREATION_MODEL[provider])).toBe(true);
+
+        // Another model in the new session stops it again.
+        host.recorder.claudeReports.push(OTHER_MODEL.claude);
+        host.recorder.codexReroutes.push(OTHER_MODEL.codex);
+        await expect(host.manager.runAgent(agent.id, "once more")).rejects.toThrow(refusal);
+        await vi.waitFor(() => expect(host.manager.getAgent(agent.id)).toBeNull());
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
   test("a pinned Claude session never calls query.setModel() for another model", async () => {
     const recorder = createHarnessModelRecorder();
     const client = recordingClaudeClient(recorder);
