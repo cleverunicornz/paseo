@@ -4693,13 +4693,27 @@ class ClaudeAgentSession implements AgentSession {
    * rather than at turn completion. Placeholders such as `<synthetic>` report nothing.
    */
   private observeRuntimeModel(reported: unknown, events: AgentStreamEvent[]): void {
-    const normalized =
-      typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null;
+    const normalized = this.inPinnedSpelling(
+      typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null,
+    );
     if (!normalized || normalized === this.lastOptionsModel) return;
     this.lastOptionsModel = normalized;
     this.lastRuntimeModel = reported as string;
     this.cachedRuntimeInfo = null;
     this.pushModelChanged(events);
+  }
+
+  /**
+   * A runtime model that names the same manifest model as the pinned one, such
+   * as `claude-fable-5` for the retired `claude-fable-5[1m]`, in the pinned
+   * spelling: the daemon holds the agent to the model it was created with and
+   * must not read a respelling as a switch. Unpinned sessions, session mode's
+   * among them, report the normalized model as before.
+   */
+  private inPinnedSpelling(normalized: string | null): string | null {
+    const pin = this.modelPin;
+    if (!normalized || !pin) return normalized;
+    return normalizeClaudeRuntimeModelId(pin) === normalized ? pin : normalized;
   }
 
   private pushModelChanged(events: AgentStreamEvent[]): void {
@@ -4758,7 +4772,9 @@ class ClaudeAgentSession implements AgentSession {
     }
     this.persistence = null;
     if (message.model) {
-      const normalizedRuntimeModel = normalizeClaudeRuntimeModelId(message.model);
+      const normalizedRuntimeModel = this.inPinnedSpelling(
+        normalizeClaudeRuntimeModelId(message.model),
+      );
       this.logger.debug(
         { runtimeModel: message.model, normalizedRuntimeModel },
         "Captured runtime model from SDK init",
