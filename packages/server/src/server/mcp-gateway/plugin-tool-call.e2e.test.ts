@@ -669,3 +669,325 @@ test("a plugin's calls for an agent the session stopped end timelineDrainMs afte
   }
   await shutDown(running);
 }, 60_000);
+
+/**
+ * A Claude Code query whose turns report the models of `turnModels` in turn,
+ * across every query the daemon starts (a resumed session starts a new one):
+ * each turn's init and answer carry that model. The last model repeats.
+ */
+function claudeQueryReportingTurns(turnModels: string[]) {
+  let turn = 0;
+  return ({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const prompts = prompt[Symbol.asyncIterator]();
+    const frames: Array<Record<string, unknown>> = [];
+    const state = { closed: false };
+    return {
+      next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+        while (!state.closed) {
+          const frame = frames.shift();
+          if (frame) return { done: false, value: frame };
+          const next = await prompts.next();
+          if (next.done) break;
+          const model = turnModels[Math.min(turn, turnModels.length - 1)] ?? "claude-opus-5-5";
+          turn += 1;
+          frames.push(
+            {
+              type: "system",
+              subtype: "init",
+              session_id: "fixture-claude",
+              permissionMode: "default",
+              model,
+            },
+            {
+              type: "assistant",
+              parent_tool_use_id: null,
+              session_id: "fixture-claude",
+              message: { id: `msg-${turn}`, model, content: [{ type: "text", text: "OK" }] },
+            },
+            {
+              type: "result",
+              subtype: "success",
+              session_id: "fixture-claude",
+              usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+              total_cost_usd: 0,
+            },
+          );
+        }
+        return { done: true, value: undefined };
+      },
+      return: async () => {
+        state.closed = true;
+        return { done: true, value: undefined };
+      },
+      interrupt: async () => {
+        state.closed = true;
+      },
+      close: () => {
+        state.closed = true;
+      },
+      applyFlagSettings: async () => undefined,
+      setPermissionMode: async () => undefined,
+      setModel: async () => undefined,
+      supportedModels: async () => [],
+      supportedCommands: async () => [],
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  };
+}
+
+/** Agent clients whose Claude sessions, created and resumed, run the real adapter over `query`. */
+function claudeClientsReporting(turnModels: string[]) {
+  const claude = new ClaudeAgentClient({
+    logger: pino({ level: "silent" }),
+    resolveBinary: async () => "/fixture/claude",
+    queryFactory: claudeQueryReportingTurns(turnModels) as never,
+  });
+  const agentClients = createTestAgentClients();
+  agentClients.claude!.createSession = claude.createSession.bind(claude);
+  agentClients.claude!.resumeSession = claude.resumeSession.bind(claude);
+  return agentClients;
+}
+
+const OPUS_SESSION = {
+  ...DEFAULT_SESSION_RUNTIME_CONFIG,
+  identity: { member: "claude/claude-opus-5-5", role: "implementer" as const },
+};
+
+/** Creates an Opus agent whose first turn reports Sonnet, so the session refuses and closes it. */
+async function createRefusedAgent(running: TestPaseoDaemon): Promise<string> {
+  const manager = running.daemon.agentManager;
+  const agent = await manager.createAgent(
+    { provider: "claude", cwd: directory, model: "claude-opus-5-5" },
+    undefined,
+    { workspaceId: undefined },
+  );
+  await expect(manager.runAgent(agent.id, "/model claude-sonnet-5-5")).rejects.toThrow(
+    SONNET_REFUSAL,
+  );
+  await expect.poll(() => manager.getAgent(agent.id)).toBeNull();
+  expect(manager.getSessionMemberRefusal(agent.id)).toBe(SONNET_REFUSAL);
+  return agent.id;
+}
+
+/** The agent's own MCP request to the `memory` backend through the gateway. */
+async function callAsAgent(running: TestPaseoDaemon, agentId: string): Promise<number> {
+  const token = running.daemon.agentManager.issueAgentToken(agentId);
+  const response = await fetch(`http://127.0.0.1:${running.port}/mcp/backends/memory`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+    },
+    body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}',
+  });
+  await response.body?.cancel();
+  return response.status;
+}
+
+/** Every refusal the agent's state changes showed, from now on. */
+function watchRefusals(running: TestPaseoDaemon, agentId: string): Array<string | null> {
+  const manager = running.daemon.agentManager;
+  const seen: Array<string | null> = [];
+  manager.subscribe(
+    (event) => {
+      if (event.type === "agent_state" && event.agent.id === agentId) {
+        seen.push(manager.getSessionMemberRefusal(agentId));
+      }
+    },
+    { agentId, replayState: false },
+  );
+  return seen;
+}
+
+test("a plugin hook that resumes a refused agent does not re-admit it: the gateway forwards nothing for it", async () => {
+  // The validator's G-1 probe: a real plugin, the real Claude adapter, a runtime reporting Sonnet.
+  // The probe hooked agent.closed, which this line does not have yet; the refused turn's
+  // agent.turn_ended reaches the plugin the same way, and its barrier holds until the agent closed.
+  const file = (name: string) => JSON.stringify(path.join(directory, name));
+  await writeFile(
+    path.join(directory, "paseo-plugin.json"),
+    JSON.stringify({ id: "refetch-after-refusal", requirements: { paseo: ">=0.8.0" } }),
+  );
+  await writeFile(
+    path.join(directory, "index.server.ts"),
+    `
+import { appendFileSync, existsSync } from "node:fs";
+const log = (value) => appendFileSync(${file("events.log")}, JSON.stringify(value) + "\\n");
+const handled = new Set();
+export default function contribute(server) {
+  server.on("agent.turn_ended", async (event, context) => {
+    if (handled.has(event.agent.id)) return;
+    handled.add(event.agent.id);
+    log({ paused: event.agent.id });
+    try {
+      const deadline = Date.now() + 15000;
+      while (!existsSync(${file("allow-resume")})) {
+        if (Date.now() > deadline || context.signal.aborted) throw new Error("barrier expired");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await context.paseo.agents.ref(event.agent.id).timeline.refetch();
+      log({ refetched: event.agent.id });
+      const result = await server.mcp.callTool({ backend: "memory", tool: "whoami", onBehalfOf: event.agent.id });
+      log({ called: event.agent.id, result });
+    } catch (error) {
+      log({ refused: String(error) });
+    }
+  });
+  return () => {};
+}
+`,
+  );
+  const running = await startDaemon({
+    agentClients: claudeClientsReporting(["claude-sonnet-5-5"]),
+    sessionRuntime: OPUS_SESSION,
+  });
+  const client = await connectClient(running);
+  const manager = running.daemon.agentManager;
+  try {
+    await client.patchDaemonConfig({ pluginsEnabled: true });
+    await client.installDirectoryPlugin(directory);
+    const agentId = await createRefusedAgent(running);
+    await expect
+      .poll(async () => (await readLogged()).some((entry) => entry.paused === agentId))
+      .toBe(true);
+    expect(manager.getAgent(agentId)).toBeNull();
+    expect(backend.recorded).toHaveLength(0);
+
+    await writeFile(path.join(directory, "allow-resume"), "go");
+    await expect
+      .poll(
+        async () =>
+          (await readLogged()).find((entry) => "called" in entry || "refused" in entry) ?? null,
+        { timeout: 20_000 },
+      )
+      .toEqual({ refused: expect.stringContaining(`No live agent ${agentId}`) });
+
+    // Resumed, and still refused: neither the plugin nor the agent reaches a backend.
+    expect((await readLogged()).some((entry) => entry.refetched === agentId)).toBe(true);
+    expect(manager.getAgent(agentId)).not.toBeNull();
+    expect(manager.getSessionMemberRefusal(agentId)).toBe(SONNET_REFUSAL);
+    expect(await callAsAgent(running, agentId)).toBe(403);
+    expect(backend.recorded).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+}, 60_000);
+
+test("an agent resumed through the API stays refused until its runtime reports the member, and is closed again when it reports another model", async () => {
+  const running = await startDaemon({
+    agentClients: claudeClientsReporting(["claude-sonnet-5-5"]),
+    sessionRuntime: OPUS_SESSION,
+  });
+  const client = await connectClient(running);
+  const manager = running.daemon.agentManager;
+  try {
+    const agentId = await createRefusedAgent(running);
+    const refusals = watchRefusals(running, agentId);
+
+    await client.refreshAgent(agentId);
+    expect(manager.getAgent(agentId)).not.toBeNull();
+    expect(manager.getSessionMemberRefusal(agentId)).toBe(SONNET_REFUSAL);
+    expect(await callAsAgent(running, agentId)).toBe(403);
+
+    // The resumed runtime reports Sonnet again: the agent is closed again, still refused.
+    await expect(manager.runAgent(agentId, "go on")).rejects.toThrow(SONNET_REFUSAL);
+    await expect.poll(() => manager.getAgent(agentId)).toBeNull();
+    expect(manager.getSessionMemberRefusal(agentId)).toBe(SONNET_REFUSAL);
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(refusals.every((refusal) => refusal === SONNET_REFUSAL)).toBe(true);
+    expect(backend.recorded).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+}, 60_000);
+
+test("an agent resumed through the API is admitted again once its runtime reports the member", async () => {
+  const running = await startDaemon({
+    agentClients: claudeClientsReporting(["claude-sonnet-5-5", "claude-opus-5-5"]),
+    sessionRuntime: OPUS_SESSION,
+  });
+  const client = await connectClient(running);
+  const manager = running.daemon.agentManager;
+  try {
+    const agentId = await createRefusedAgent(running);
+
+    await client.refreshAgent(agentId);
+    // Resuming alone proves nothing about the model the runtime runs.
+    expect(manager.getSessionMemberRefusal(agentId)).toBe(SONNET_REFUSAL);
+    expect(await callAsAgent(running, agentId)).toBe(403);
+    expect(backend.recorded).toHaveLength(0);
+
+    // Its first turn reports Opus, the member: the session admits it again.
+    await manager.runAgent(agentId, "go on");
+    expect(manager.getSessionMemberRefusal(agentId)).toBeNull();
+    expect(manager.getAgent(agentId)).not.toBeNull();
+    expect(await callAsAgent(running, agentId)).toBe(200);
+    expect(backend.recorded.map((request) => request.headers["x-paseo-member"])).toEqual([
+      "claude/claude-opus-5-5",
+    ]);
+  } finally {
+    await client.close();
+  }
+}, 60_000);
+
+test("a schedule that runs a refused agent never re-admits it", async () => {
+  const running = await startDaemon({
+    agentClients: claudeClientsReporting(["claude-sonnet-5-5"]),
+    sessionRuntime: OPUS_SESSION,
+  });
+  const client = await connectClient(running);
+  const manager = running.daemon.agentManager;
+  try {
+    const agentId = await createRefusedAgent(running);
+    const refusals = watchRefusals(running, agentId);
+    const created = await client.scheduleCreate({
+      prompt: "scheduled check",
+      cadence: { type: "cron", expression: "0 0 1 1 *" },
+      target: { type: "agent", agentId },
+    });
+    if (!created.schedule) throw new Error(created.error ?? "schedule/create returned nothing");
+
+    await client.scheduleRunOnce({ id: created.schedule.id });
+
+    await expect.poll(() => manager.getAgent(agentId)).toBeNull();
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(refusals.every((refusal) => refusal === SONNET_REFUSAL)).toBe(true);
+    expect(manager.getSessionMemberRefusal(agentId)).toBe(SONNET_REFUSAL);
+    expect(backend.recorded).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+}, 60_000);
+
+test("a refused agent stays refused after the daemon restarts and a client reconnects to resume it", async () => {
+  const paseoHomeRoot = await mkdtemp(path.join(tmpdir(), "paseo-refusal-restart-"));
+  const first = await startDaemon({
+    agentClients: claudeClientsReporting(["claude-sonnet-5-5"]),
+    sessionRuntime: OPUS_SESSION,
+    paseoHomeRoot,
+    cleanup: false,
+  });
+  const agentId = await createRefusedAgent(first);
+  await first.daemon.stop();
+  daemon = null;
+
+  const running = await startDaemon({
+    agentClients: claudeClientsReporting(["claude-sonnet-5-5"]),
+    sessionRuntime: OPUS_SESSION,
+    paseoHomeRoot,
+  });
+  const client = await connectClient(running);
+  const manager = running.daemon.agentManager;
+  try {
+    await client.refreshAgent(agentId);
+    expect(manager.getAgent(agentId)).not.toBeNull();
+    expect(manager.getSessionMemberRefusal(agentId)).toBe(SONNET_REFUSAL);
+    expect(await callAsAgent(running, agentId)).toBe(403);
+    expect(backend.recorded).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+}, 60_000);
