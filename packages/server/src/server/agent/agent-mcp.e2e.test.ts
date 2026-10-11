@@ -3,7 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
 import { experimental_createMCPClient } from "ai";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -14,10 +14,18 @@ import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { DEFAULT_SESSION_RUNTIME_CONFIG } from "../session-runtime-config.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { asInternals } from "../test-utils/class-mocks.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
+import { ensureAgentLoaded } from "./agent-loading.js";
 import { ClaudeAgentClient } from "./providers/claude/agent.js";
-import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
-import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
+import {
+  CodexAppServerAgentClient,
+  CodexAppServerAgentSession,
+} from "./providers/codex-app-server-agent.js";
+import {
+  createFakeCodexAppServer,
+  type FakeCodexAppServer,
+} from "./providers/codex/test-utils/fake-app-server.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -1960,6 +1968,519 @@ describe("agent MCP end-to-end (offline)", () => {
       ]);
     } finally {
       await session.close();
+    }
+  }, 30_000);
+});
+
+/** The models each provider's agents are created with, and the one they are asked to switch to. */
+const CREATION_MODEL = { claude: "claude-opus-5-5", codex: "gpt-6-astra" } as const;
+const OTHER_MODEL = { claude: "claude-sonnet-5-5", codex: "gpt-5.4" } as const;
+type PinnedProvider = keyof typeof CREATION_MODEL;
+const PINNED_PROVIDERS: PinnedProvider[] = ["claude", "codex"];
+
+function modelPinRefusal(pinned: string, attempted: string): string {
+  return `This agent's model is ${pinned}. This agent would run ${attempted}. A different model needs a new session.`;
+}
+
+/** What the scripted harnesses were asked to run, in order. */
+interface HarnessModelRecorder {
+  /** Each Claude query's launch model. */
+  claudeLaunches: string[];
+  /** Each `query.setModel()` call. */
+  claudeSetModels: Array<string | undefined>;
+  /** The model a Claude turn reports, by turn across all queries; the launch model otherwise. */
+  claudeReports: Array<string | undefined>;
+  /** Every fake Codex app-server spawned, in order. */
+  codexServers: FakeCodexAppServer[];
+  /** Codex turns, by turn, that `model/rerouted` moves to another model. */
+  codexReroutes: Array<string | undefined>;
+}
+
+/**
+ * A scripted Claude Code query that answers each prompt as one turn whose init
+ * reports the model it runs: its launch model, or the one `claudeReports`
+ * names for the turn.
+ */
+function claudeQueryRecordingModels(recorder: HarnessModelRecorder) {
+  return ({
+    prompt,
+    options: launch,
+  }: {
+    prompt: AsyncIterable<unknown>;
+    options: { model?: string };
+  }) => {
+    recorder.claudeLaunches.push(String(launch.model));
+    let model = String(launch.model);
+    const prompts = prompt[Symbol.asyncIterator]();
+    const frames: Array<Record<string, unknown>> = [];
+    const state = { closed: false };
+    return {
+      next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+        while (!state.closed) {
+          const frame = frames.shift();
+          if (frame) return { done: false, value: frame };
+          const next = await prompts.next();
+          if (next.done) break;
+          const reported = recorder.claudeReports.shift() ?? model;
+          frames.push(
+            {
+              type: "system",
+              subtype: "init",
+              session_id: "fixture-claude",
+              permissionMode: "default",
+              model: reported,
+            },
+            { type: "assistant", message: { content: "OK" } },
+            {
+              type: "result",
+              subtype: "success",
+              session_id: "fixture-claude",
+              usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+              total_cost_usd: 0,
+            },
+          );
+        }
+        return { done: true, value: undefined };
+      },
+      return: async () => {
+        state.closed = true;
+        return { done: true, value: undefined };
+      },
+      interrupt: async () => {
+        state.closed = true;
+      },
+      close: () => {
+        state.closed = true;
+      },
+      applyFlagSettings: async () => undefined,
+      setPermissionMode: async () => undefined,
+      setModel: async (next?: string) => {
+        recorder.claudeSetModels.push(next);
+        if (next) model = next;
+      },
+      supportedModels: async () => [],
+      supportedCommands: async () => [],
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  };
+}
+
+/** The real Claude adapter over `claudeQueryRecordingModels`. */
+function recordingClaudeClient(recorder: HarnessModelRecorder): ClaudeAgentClient {
+  return new ClaudeAgentClient({
+    logger: pino({ level: "silent" }),
+    resolveBinary: async () => "/fixture/claude",
+    queryFactory: claudeQueryRecordingModels(recorder) as never,
+  });
+}
+
+/**
+ * The real Codex adapter, each app-server a fake that runs every turn to
+ * completion, rerouting it to another model first where `codexReroutes` says so.
+ */
+function recordingCodexClient(recorder: HarnessModelRecorder): CodexAppServerAgentClient {
+  const client = new CodexAppServerAgentClient(pino({ level: "silent" }));
+  const internals = asInternals<{
+    goalsEnabledPromise: Promise<boolean> | null;
+    autoReviewEnabledPromise: Promise<boolean> | null;
+    spawnAppServer: () => Promise<FakeCodexAppServer["child"]>;
+  }>(client);
+  internals.goalsEnabledPromise = Promise.resolve(false);
+  internals.autoReviewEnabledPromise = Promise.resolve(false);
+  internals.spawnAppServer = async () => {
+    const server: FakeCodexAppServer = createFakeCodexAppServer({
+      "thread/unsubscribe": () => ({}),
+      "turn/interrupt": () => ({}),
+      "turn/start": (params) => {
+        const sent = params as { threadId?: string; model?: string };
+        const threadId = sent.threadId ?? "thread-1";
+        const reroute = recorder.codexReroutes.shift();
+        setTimeout(() => {
+          server.startsTurn({ threadId, turnId: "turn-1" });
+          if (reroute) {
+            const rerouted = {
+              threadId,
+              turnId: "turn-1",
+              fromModel: sent.model,
+              toModel: reroute,
+            };
+            server.child.stdout.write(
+              `${JSON.stringify({ method: "model/rerouted", params: rerouted })}\n`,
+            );
+          }
+          server.completeTurn({ threadId });
+        }, 10);
+        return {};
+      },
+    });
+    recorder.codexServers.push(server);
+    return server.child;
+  };
+  return client;
+}
+
+function codexRequestModels(recorder: HarnessModelRecorder, method: string): unknown[] {
+  return recorder.codexServers.flatMap((server) =>
+    server
+      .requests()
+      .filter((message) => message.method === method)
+      .map((message) => (message.params as { model?: unknown }).model),
+  );
+}
+
+/** Every model the provider's harness was asked to run: launches and switches, or thread and turn starts. */
+function modelsSentToHarness(recorder: HarnessModelRecorder, provider: PinnedProvider): unknown[] {
+  return provider === "claude"
+    ? [...recorder.claudeLaunches, ...recorder.claudeSetModels]
+    : [
+        ...codexRequestModels(recorder, "thread/start"),
+        ...codexRequestModels(recorder, "turn/start"),
+      ];
+}
+
+function createHarnessModelRecorder(): HarnessModelRecorder {
+  return {
+    claudeLaunches: [],
+    claudeSetModels: [],
+    claudeReports: [],
+    codexServers: [],
+    codexReroutes: [],
+  };
+}
+
+/**
+ * A daemon outside session mode, like the console's, whose Claude and Codex
+ * agents run the real adapters over scripted harnesses. `paseoHome` lets a
+ * second daemon start on the first one's state.
+ */
+async function startConsoleDaemon(paseoHome?: string) {
+  const home = paseoHome ?? (await mkdtemp(path.join(os.tmpdir(), "paseo-home-")));
+  const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+  const agentCwd = path.join(home, "agent-cwd");
+  await mkdir(agentCwd, { recursive: true });
+  const port = await getAvailablePort();
+  const recorder = createHarnessModelRecorder();
+  const claude = recordingClaudeClient(recorder);
+  const codex = recordingCodexClient(recorder);
+  const clients = createTestAgentClients();
+  clients.claude!.createSession = claude.createSession.bind(claude);
+  clients.claude!.resumeSession = claude.resumeSession.bind(claude);
+  clients.codex!.createSession = codex.createSession.bind(codex);
+  clients.codex!.resumeSession = codex.resumeSession.bind(codex);
+
+  const daemon = await createPaseoDaemon(
+    {
+      listen: `127.0.0.1:${port}`,
+      paseoHome: home,
+      corsAllowedOrigins: [],
+      hostnames: true,
+      mcpEnabled: true,
+      staticDir,
+      mcpDebug: false,
+      agentClients: clients,
+      agentStoragePath: path.join(home, "agents"),
+    },
+    pino({ level: "silent" }),
+  );
+  await daemon.start();
+  const manager = daemon.agentManager;
+  return {
+    daemon,
+    manager,
+    recorder,
+    home,
+    agentCwd,
+    createAgent: (provider: PinnedProvider, model: string) =>
+      manager.createAgent(
+        {
+          provider,
+          cwd: agentCwd,
+          model,
+          ...(provider === "codex" ? { modeId: "full-access" } : {}),
+        },
+        undefined,
+        { workspaceId: undefined },
+      ),
+    load: (agentId: string) =>
+      ensureAgentLoaded(agentId, {
+        agentManager: manager,
+        agentStorage: daemon.agentStorage,
+        logger: pino({ level: "silent" }),
+      }),
+    /** Stops the daemon and keeps its state for another. */
+    stop: async () => {
+      await daemon.stop();
+      await rm(staticDir, { recursive: true, force: true });
+    },
+    close: async () => {
+      await daemon.stop();
+      await rm(staticDir, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    },
+  };
+}
+
+describe("console daemon: an agent keeps the model it was created with (outside session mode)", () => {
+  test.each(PINNED_PROVIDERS)(
+    "a model switch is refused and the %s agent keeps running on its creation model",
+    async (provider) => {
+      const host = await startConsoleDaemon();
+      try {
+        const agent = await host.createAgent(provider, CREATION_MODEL[provider]);
+        await host.manager.runAgent(agent.id, "hello");
+
+        await expect(host.manager.setAgentModel(agent.id, OTHER_MODEL[provider])).rejects.toThrow(
+          modelPinRefusal(CREATION_MODEL[provider], OTHER_MODEL[provider]),
+        );
+
+        // Nothing changed: the agent, its configuration and its runtime are as they were.
+        const after = host.manager.getAgent(agent.id);
+        expect(after?.lifecycle).toBe("idle");
+        expect(after?.lastError).toBeUndefined();
+        expect(after?.config.model).toBe(CREATION_MODEL[provider]);
+        expect(after?.runtimeInfo?.model).toBe(CREATION_MODEL[provider]);
+        expect(host.manager.getSessionMemberRefusal(agent.id)).toBeNull();
+
+        await host.manager.runAgent(agent.id, "hello again");
+        // The harness was never asked to run the other model.
+        const sent = modelsSentToHarness(host.recorder, provider);
+        expect(sent.length).toBeGreaterThan(0);
+        expect(sent.every((model) => model === CREATION_MODEL[provider])).toBe(true);
+        if (provider === "claude") expect(host.recorder.claudeSetModels).toEqual([]);
+        if (provider === "codex") {
+          expect(codexRequestModels(host.recorder, "turn/start")).toEqual([
+            CREATION_MODEL.codex,
+            CREATION_MODEL.codex,
+          ]);
+        }
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(PINNED_PROVIDERS)(
+    "switching a %s agent to the model it already runs is allowed",
+    async (provider) => {
+      const host = await startConsoleDaemon();
+      try {
+        const agent = await host.createAgent(provider, CREATION_MODEL[provider]);
+        await host.manager.runAgent(agent.id, "hello");
+
+        await host.manager.setAgentModel(agent.id, CREATION_MODEL[provider]);
+        await host.manager.runAgent(agent.id, "hello again");
+
+        expect(host.manager.getAgent(agent.id)?.config.model).toBe(CREATION_MODEL[provider]);
+        const sent = modelsSentToHarness(host.recorder, provider);
+        expect(sent.every((model) => model === CREATION_MODEL[provider])).toBe(true);
+        if (provider === "claude") {
+          expect(host.recorder.claudeSetModels).toEqual([CREATION_MODEL.claude]);
+        }
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(PINNED_PROVIDERS)(
+    "a new %s agent may start on any model",
+    async (provider) => {
+      const host = await startConsoleDaemon();
+      try {
+        const first = await host.createAgent(provider, CREATION_MODEL[provider]);
+        await host.manager.runAgent(first.id, "hello");
+        const second = await host.createAgent(provider, OTHER_MODEL[provider]);
+        await host.manager.runAgent(second.id, "hello");
+
+        expect(host.manager.getAgent(second.id)?.runtimeInfo?.model).toBe(OTHER_MODEL[provider]);
+        // Each agent is held to its own creation model.
+        await expect(
+          host.manager.setAgentModel(second.id, CREATION_MODEL[provider]),
+        ).rejects.toThrow(modelPinRefusal(OTHER_MODEL[provider], CREATION_MODEL[provider]));
+        await expect(host.manager.setAgentModel(first.id, OTHER_MODEL[provider])).rejects.toThrow(
+          modelPinRefusal(CREATION_MODEL[provider], OTHER_MODEL[provider]),
+        );
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(PINNED_PROVIDERS)(
+    "a %s agent's creation model holds across a reload",
+    async (provider) => {
+      const host = await startConsoleDaemon();
+      try {
+        const agent = await host.createAgent(provider, CREATION_MODEL[provider]);
+        await host.manager.runAgent(agent.id, "hello");
+        await host.manager.reloadAgentSession(agent.id);
+
+        const refusal = modelPinRefusal(CREATION_MODEL[provider], OTHER_MODEL[provider]);
+        await expect(host.manager.setAgentModel(agent.id, OTHER_MODEL[provider])).rejects.toThrow(
+          refusal,
+        );
+        // A reload onto another model is refused before it replaces the session.
+        await expect(
+          host.manager.reloadAgentSession(agent.id, { model: OTHER_MODEL[provider] }),
+        ).rejects.toThrow(refusal);
+        expect(host.manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+
+        await host.manager.runAgent(agent.id, "hello again");
+        const sent = modelsSentToHarness(host.recorder, provider);
+        expect(sent.every((model) => model === CREATION_MODEL[provider])).toBe(true);
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(PINNED_PROVIDERS)(
+    "a %s agent's creation model is recorded and holds after a daemon restart",
+    async (provider) => {
+      const first = await startConsoleDaemon();
+      const agent = await first.createAgent(provider, CREATION_MODEL[provider]);
+      await first.manager.runAgent(agent.id, "hello");
+      await first.stop();
+
+      const second = await startConsoleDaemon(first.home);
+      try {
+        expect(await second.daemon.agentStorage.get(agent.id)).toMatchObject({
+          creationModel: CREATION_MODEL[provider],
+        });
+        await second.load(agent.id);
+
+        await expect(second.manager.setAgentModel(agent.id, OTHER_MODEL[provider])).rejects.toThrow(
+          modelPinRefusal(CREATION_MODEL[provider], OTHER_MODEL[provider]),
+        );
+        await second.manager.runAgent(agent.id, "hello again");
+        const sent = modelsSentToHarness(second.recorder, provider);
+        expect(sent.length).toBeGreaterThan(0);
+        expect(sent.every((model) => model === CREATION_MODEL[provider])).toBe(true);
+      } finally {
+        await second.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(PINNED_PROVIDERS)(
+    "a %s agent whose harness reports another model is stopped",
+    async (provider) => {
+      const host = await startConsoleDaemon();
+      try {
+        const agent = await host.createAgent(provider, CREATION_MODEL[provider]);
+        // The second turn runs another model: `/model` inside Claude Code, a Codex reroute.
+        host.recorder.claudeReports.push(undefined, OTHER_MODEL.claude);
+        host.recorder.codexReroutes.push(undefined, OTHER_MODEL.codex);
+        await host.manager.runAgent(agent.id, "hello");
+
+        const refusal = modelPinRefusal(CREATION_MODEL[provider], OTHER_MODEL[provider]);
+        await expect(host.manager.runAgent(agent.id, "hello again")).rejects.toThrow(refusal);
+
+        await vi.waitFor(() => expect(host.manager.getAgent(agent.id)).toBeNull());
+        expect(host.manager.getSessionMemberRefusal(agent.id)).toBe(refusal);
+        expect(await host.daemon.agentStorage.get(agent.id)).toMatchObject({
+          lastError: refusal,
+        });
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
+  test("a pinned Claude session never calls query.setModel() for another model", async () => {
+    const recorder = createHarnessModelRecorder();
+    const client = recordingClaudeClient(recorder);
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const session = await client.createSession(
+      { provider: "claude", cwd, model: CREATION_MODEL.claude },
+      { agentId: "agent-1", modelPin: CREATION_MODEL.claude },
+    );
+    try {
+      await expect(session.setModel?.(OTHER_MODEL.claude)).rejects.toThrow(
+        modelPinRefusal(CREATION_MODEL.claude, OTHER_MODEL.claude),
+      );
+      // Refused before the query starts or is told anything.
+      expect(recorder.claudeLaunches).toEqual([]);
+      expect(recorder.claudeSetModels).toEqual([]);
+
+      await session.setModel?.(CREATION_MODEL.claude);
+      expect(recorder.claudeSetModels).toEqual([CREATION_MODEL.claude]);
+    } finally {
+      await session.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a pinned Codex session refuses a model switch and its next turn/start runs the pin", async () => {
+    const recorder = createHarnessModelRecorder();
+    const client = recordingCodexClient(recorder);
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const session = await client.createSession(
+      { provider: "codex", cwd, model: CREATION_MODEL.codex, modeId: "full-access" },
+      { agentId: "agent-1", modelPin: CREATION_MODEL.codex },
+    );
+    try {
+      await expect(session.setModel?.(OTHER_MODEL.codex)).rejects.toThrow(
+        modelPinRefusal(CREATION_MODEL.codex, OTHER_MODEL.codex),
+      );
+      await session.run("hello");
+      expect(codexRequestModels(recorder, "turn/start")).toEqual([CREATION_MODEL.codex]);
+    } finally {
+      await session.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a pinned Codex session sends no turn/start for another model", async () => {
+    // A resumed thread whose recorded configuration names another model than the pin.
+    const recorder = createHarnessModelRecorder();
+    const client = recordingCodexClient(recorder);
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const session = await client.resumeSession(
+      {
+        provider: "codex",
+        sessionId: "thread-1",
+        metadata: { provider: "codex", cwd, model: OTHER_MODEL.codex, modeId: "full-access" },
+      },
+      { cwd },
+      { agentId: "agent-1", modelPin: CREATION_MODEL.codex },
+    );
+    try {
+      await expect(session.startTurn("hello")).rejects.toThrow(
+        modelPinRefusal(CREATION_MODEL.codex, OTHER_MODEL.codex),
+      );
+      expect(codexRequestModels(recorder, "turn/start")).toEqual([]);
+    } finally {
+      await session.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a pinned Codex session starts no thread on another model", async () => {
+    const recorder = createHarnessModelRecorder();
+    const client = recordingCodexClient(recorder);
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const session = await client.createSession(
+      { provider: "codex", cwd, model: OTHER_MODEL.codex, modeId: "full-access" },
+      { agentId: "agent-1", modelPin: CREATION_MODEL.codex },
+    );
+    try {
+      await expect(session.startTurn("hello")).rejects.toThrow(
+        modelPinRefusal(CREATION_MODEL.codex, OTHER_MODEL.codex),
+      );
+      expect(codexRequestModels(recorder, "thread/start")).toEqual([]);
+      expect(codexRequestModels(recorder, "turn/start")).toEqual([]);
+    } finally {
+      await session.close();
+      await rm(cwd, { recursive: true, force: true });
     }
   }, 30_000);
 });
