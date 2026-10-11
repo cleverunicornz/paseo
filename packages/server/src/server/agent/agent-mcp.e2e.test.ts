@@ -2143,6 +2143,8 @@ interface HarnessModelRecorder {
   claudeSetModels: Array<string | undefined>;
   /** The model a Claude turn reports, by turn across all queries; the launch model otherwise. */
   claudeReports: Array<string | undefined>;
+  /** The frame that carries a Claude turn's model: its init (the default), a `message_start` or its assistant message. */
+  claudeReportFrame: ClaudeModelReport;
   /** Every fake Codex app-server spawned, in order. */
   codexServers: FakeCodexAppServer[];
   /** Codex turns, by turn, that `model/rerouted` moves to another model. */
@@ -2175,15 +2177,39 @@ function claudeQueryRecordingModels(recorder: HarnessModelRecorder) {
           const next = await prompts.next();
           if (next.done) break;
           const reported = recorder.claudeReports.shift() ?? model;
-          frames.push(
-            {
-              type: "system",
-              subtype: "init",
+          const reportFrame = recorder.claudeReportFrame;
+          frames.push({
+            type: "system",
+            subtype: "init",
+            session_id: "fixture-claude",
+            permissionMode: "default",
+            ...(reportFrame === "init" ? { model: reported } : {}),
+          });
+          if (reportFrame === "message_start") {
+            frames.push({
+              type: "stream_event",
+              parent_tool_use_id: null,
               session_id: "fixture-claude",
-              permissionMode: "default",
-              model: reported,
-            },
-            { type: "assistant", message: { content: "OK" } },
+              event: {
+                type: "message_start",
+                message: { id: "msg-1", type: "message", role: "assistant", model: reported },
+              },
+            });
+          }
+          frames.push(
+            reportFrame === "assistant"
+              ? {
+                  type: "assistant",
+                  parent_tool_use_id: null,
+                  session_id: "fixture-claude",
+                  message: {
+                    id: "msg-1",
+                    role: "assistant",
+                    model: reported,
+                    content: [{ type: "text", text: "OK" }],
+                  },
+                }
+              : { type: "assistant", message: { content: "OK" } },
             {
               type: "result",
               subtype: "success",
@@ -2298,6 +2324,7 @@ function createHarnessModelRecorder(): HarnessModelRecorder {
     claudeLaunches: [],
     claudeSetModels: [],
     claudeReports: [],
+    claudeReportFrame: "init",
     codexServers: [],
     codexReroutes: [],
   };
@@ -2570,6 +2597,144 @@ describe("console daemon: an agent keeps the model it was created with (outside 
       await expect(host.manager.setAgentModel(agent.id, OTHER_MODEL.claude)).rejects.toThrow(
         modelPinRefusal("claude-fable-5[1m]", OTHER_MODEL.claude),
       );
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
+
+  /**
+   * Validator a218's probes (#16 round 1, F1): a runtime report is the pinned
+   * model only when it is the pinned id or a listed spelling of it. Anything
+   * else, a model the manifest does not know included, is a switch.
+   */
+  const CLAUDE_RUNTIME_REPORTS: Array<{ pin: string; reported: string; stops: boolean }> = [
+    { pin: "claude-fable-5[1m]", reported: "claude-fable-5", stops: false },
+    { pin: "claude-fable-5", reported: "claude-fable-5[1m]", stops: false },
+    { pin: "claude-opus-4-6[1m]", reported: "claude-opus-4-6", stops: true },
+    { pin: "claude-opus-5-5", reported: "claude-sonnet-5-5", stops: true },
+    { pin: "claude-fable-5", reported: "claude-fable-5-1", stops: true },
+    { pin: "claude-fable-5[1m]", reported: "claude-fable-5-2", stops: true },
+    { pin: "claude-opus-5-5", reported: "custom-provider-model-b", stops: true },
+    {
+      pin: "custom-claude-opus-5-5-model-a",
+      reported: "custom-claude-opus-5-5-model-b",
+      stops: true,
+    },
+    {
+      pin: "custom-claude-opus-5-5-model-a",
+      reported: "custom-claude-opus-5-5-model-a",
+      stops: false,
+    },
+    { pin: "opus", reported: "claude-opus-5-5", stops: true },
+    { pin: "claude-opus-5-5", reported: "<synthetic>", stops: false },
+  ];
+
+  test.each(
+    (["init", "message_start", "assistant"] as const).flatMap((frame) =>
+      CLAUDE_RUNTIME_REPORTS.map(({ pin, reported, stops }) => ({ frame, pin, reported, stops })),
+    ),
+  )(
+    "a Claude agent on $pin whose $frame reports $reported: stopped $stops",
+    async ({ frame, pin, reported, stops }) => {
+      const host = await startConsoleDaemon();
+      try {
+        const agent = await host.createAgent("claude", pin);
+        host.recorder.claudeReportFrame = frame;
+        host.recorder.claudeReports.push(reported);
+        const turn = await host.manager.runAgent(agent.id, "hello").then(
+          () => null,
+          (error: Error) => error.message,
+        );
+
+        if (stops) {
+          const refusal = modelPinRefusal(pin, reported);
+          expect(turn).toBe(refusal);
+          await vi.waitFor(() => expect(host.manager.getAgent(agent.id)).toBeNull());
+          expect(host.manager.getSessionMemberRefusal(agent.id)).toBe(refusal);
+        } else {
+          expect(turn).toBeNull();
+          expect(host.manager.getSessionMemberRefusal(agent.id)).toBeNull();
+          expect(host.manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+        }
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
+  /** Models Claude Code always runs with the 1M window, so `[1m]` names the same model. */
+  const ALWAYS_1M_CLAUDE_MODELS = [
+    "claude-fable-5",
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-sonnet-5-5",
+  ];
+
+  test.each(
+    ALWAYS_1M_CLAUDE_MODELS.flatMap((model) => [
+      { pin: model, reported: `${model}[1m]` },
+      { pin: `${model}[1m]`, reported: model },
+    ]),
+  )(
+    "a Claude agent on $pin keeps running when its runtime reports $reported",
+    async ({ pin, reported }) => {
+      const host = await startConsoleDaemon();
+      try {
+        const agent = await host.createAgent("claude", pin);
+        host.recorder.claudeReports.push(reported, reported);
+        await host.manager.runAgent(agent.id, "hello");
+        await host.manager.runAgent(agent.id, "hello again");
+
+        expect(host.manager.getSessionMemberRefusal(agent.id)).toBeNull();
+        expect(host.manager.getAgent(agent.id)).toMatchObject({
+          lifecycle: "idle",
+          creationModel: pin,
+        });
+      } finally {
+        await host.close();
+      }
+    },
+    30_000,
+  );
+
+  test("selecting the provider default that names a Codex agent's own model is allowed", async () => {
+    // Validator a218, F2: the fake catalogue's default is the agent's model.
+    const host = await startConsoleDaemon();
+    try {
+      const agent = await host.createAgent("codex", "gpt-5.4-mini");
+      await host.manager.runAgent(agent.id, "hello");
+
+      await host.manager.setAgentModel(agent.id, null);
+      await host.manager.runAgent(agent.id, "hello again");
+
+      expect(host.manager.getAgent(agent.id)?.config.model).toBe("gpt-5.4-mini");
+      expect(codexRequestModels(host.recorder, "turn/start")).toEqual([
+        "gpt-5.4-mini",
+        "gpt-5.4-mini",
+      ]);
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
+
+  test("a reload whose model override is undefined keeps the Codex agent on its creation model", async () => {
+    // Validator a218, F3: the fake catalogue's default is another model.
+    const host = await startConsoleDaemon();
+    try {
+      const agent = await host.createAgent("codex", CREATION_MODEL.codex);
+      await host.manager.runAgent(agent.id, "hello");
+
+      await host.manager.reloadAgentSession(agent.id, { model: undefined });
+      await host.manager.runAgent(agent.id, "hello again");
+
+      expect(host.manager.getSessionMemberRefusal(agent.id)).toBeNull();
+      expect(host.manager.getAgent(agent.id)).toMatchObject({
+        lifecycle: "idle",
+        config: { model: CREATION_MODEL.codex },
+      });
+      const sent = modelsSentToHarness(host.recorder, "codex");
+      expect(sent.every((model) => model === CREATION_MODEL.codex)).toBe(true);
     } finally {
       await host.close();
     }
