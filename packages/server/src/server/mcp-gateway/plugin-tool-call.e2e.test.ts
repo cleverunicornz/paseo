@@ -7,8 +7,15 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import pino from "pino";
+import { ClaudeAgentClient } from "../agent/providers/claude/agent.js";
+import { DEFAULT_SESSION_RUNTIME_CONFIG } from "../session-runtime-config.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
+import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
+
+const SONNET_REFUSAL =
+  "This session's member is claude/claude-opus-5-5. This agent would run claude/claude-sonnet-5-5. A different model needs a new session.";
 
 interface RecordedRequest {
   method: string | undefined;
@@ -396,4 +403,205 @@ test("items whose send failed are offered again at the shutdown drain and reach 
       .sort((a, b) => a - b),
   ).toEqual([...seqs].sort((a, b) => a - b));
   await expectDrainSentEverythingAsTheAgent({ agentId, closedEarlyId, seqs, logged });
+}, 60_000);
+
+/**
+ * A Claude Code query launched on Opus: its first turn runs Opus and answers
+ * `OK`; its second turn reports `claude-sonnet-5-5`, as after `/model
+ * claude-sonnet-5-5`, answers `OK` again and completes.
+ */
+function claudeQueryOpusThenSonnet() {
+  return ({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const prompts = prompt[Symbol.asyncIterator]();
+    const frames: Array<Record<string, unknown>> = [];
+    let turn = 0;
+    const state = { closed: false };
+    const waiters: Array<() => void> = [];
+    const end = () => {
+      state.closed = true;
+      for (const wake of waiters.splice(0)) wake();
+    };
+    const init = (model: string) => ({
+      type: "system",
+      subtype: "init",
+      session_id: "fixture-claude",
+      permissionMode: "default",
+      model,
+    });
+    return {
+      next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+        const frame = frames.shift();
+        if (frame) return { done: false, value: frame };
+        if (turn < 2) {
+          await prompts.next();
+          turn += 1;
+          const model = turn === 1 ? "claude-opus-5-5" : "claude-sonnet-5-5";
+          frames.push(
+            {
+              type: "assistant",
+              parent_tool_use_id: null,
+              session_id: "fixture-claude",
+              message: { id: `msg-${turn}`, model, content: [{ type: "text", text: "OK" }] },
+            },
+            {
+              type: "result",
+              subtype: "success",
+              session_id: "fixture-claude",
+              usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+              total_cost_usd: 0,
+            },
+          );
+          return { done: false, value: init(model) };
+        }
+        while (!state.closed) await new Promise<void>((resolve) => waiters.push(resolve));
+        return { done: true, value: undefined };
+      },
+      return: async () => {
+        end();
+        return { done: true, value: undefined };
+      },
+      interrupt: async () => end(),
+      close: () => end(),
+      applyFlagSettings: async () => undefined,
+      setPermissionMode: async () => undefined,
+      setModel: async () => undefined,
+      supportedModels: async () => [],
+      supportedCommands: async () => [],
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  };
+}
+
+/**
+ * A recorder that sends every timeline item to the `memory` backend on behalf
+ * of its agent and throws when a send fails, so the daemon offers the item
+ * again. Its readiness leaves the verdict to the daemon's own record of what
+ * was acknowledged.
+ */
+async function writeRetryingRecorder(): Promise<void> {
+  const file = (name: string) => JSON.stringify(path.join(directory, name));
+  await writeFile(
+    path.join(directory, "paseo-plugin.json"),
+    JSON.stringify({ id: "recorder", requirements: { paseo: ">=0.8.0" } }),
+  );
+  await writeFile(
+    path.join(directory, "index.server.ts"),
+    `
+import { appendFileSync } from "node:fs";
+const log = (value) => appendFileSync(${file("events.log")}, JSON.stringify(value) + "\\n");
+export default function contribute(server) {
+  server.on("agent.timeline_item", async (event) => {
+    try {
+      await server.mcp.callTool({
+        backend: "memory",
+        tool: "record",
+        arguments: { seq: event.seq },
+        onBehalfOf: event.agent.id,
+      });
+      log({ sent: event.seq });
+    } catch (error) {
+      log({ failed: event.seq, error: String(error) });
+      throw error;
+    }
+  });
+  server.registerStopReadiness({
+    readiness: () => ({
+      ready: true,
+      timeline: { ready: true, epoch: null, emitted_through: null, acknowledged_through: null },
+      wip: { ready: true },
+    }),
+  });
+  return () => {};
+}
+`,
+  );
+}
+
+test("an agent the session stopped for running another model still has its timeline recorded, so the session can stop", async () => {
+  await writeRetryingRecorder();
+  const claude = new ClaudeAgentClient({
+    logger: pino({ level: "silent" }),
+    resolveBinary: async () => "/fixture/claude",
+    queryFactory: claudeQueryOpusThenSonnet() as never,
+  });
+  const agentClients = createTestAgentClients();
+  agentClients.claude!.createSession = claude.createSession.bind(claude);
+  const running = await startDaemon({
+    agentClients,
+    sessionRuntime: {
+      ...DEFAULT_SESSION_RUNTIME_CONFIG,
+      timelineDrainMs: 30_000,
+      identity: { member: "claude/claude-opus-5-5", role: "implementer" },
+    },
+  });
+  const client = await connectClient(running);
+  const manager = running.daemon.agentManager;
+  const readiness = async () =>
+    (await (await fetch(`http://127.0.0.1:${running.port}/api/stop-readiness`)).json()) as {
+      ready: boolean;
+    };
+  try {
+    await client.patchDaemonConfig({ pluginsEnabled: true });
+    await client.installDirectoryPlugin(directory);
+    const agent = await manager.createAgent(
+      { provider: "claude", cwd: directory, model: "claude-opus-5-5" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const agentToken = manager.issueAgentToken(agent.id);
+
+    // The recorder cannot reach its backend while the agent works, so every item waits.
+    backend.down = true;
+    await manager.runAgent(agent.id, "reply OK");
+    await expect(manager.runAgent(agent.id, "reply OK again")).rejects.toThrow(SONNET_REFUSAL);
+    await expect.poll(() => manager.getAgent(agent.id)).toBeNull();
+    const failedSeqs = async () =>
+      new Set(
+        (await readLogged()).flatMap((entry) =>
+          typeof entry.failed === "number" ? [entry.failed] : [],
+        ),
+      );
+    await expect.poll(async () => (await failedSeqs()).size).toBeGreaterThan(1);
+    backend.down = false;
+
+    // The dashboard's stop: begin stopping, then poll readiness until it holds.
+    const beginStopping = await fetch(`http://127.0.0.1:${running.port}/api/begin-stopping`, {
+      method: "POST",
+    });
+    expect(beginStopping.status).toBe(202);
+    await expect.poll(async () => (await readiness()).ready, { timeout: 20_000 }).toBe(true);
+
+    // Every item the agent emitted before it closed reached the backend, as that agent.
+    const emitted = await failedSeqs();
+    expect(new Set(backend.received.map((entry) => entry.seq))).toEqual(emitted);
+    expect(new Set(backend.received.map((entry) => entry.agentId))).toEqual(new Set([agent.id]));
+    const recordCalls = backend.recorded.filter(
+      (request) => !request.down && request.method === "tools/call",
+    );
+    expect(recordCalls.length).toBeGreaterThanOrEqual(emitted.size);
+    for (const call of recordCalls) {
+      expect(call.headers).toMatchObject({
+        "x-paseo-agent-id": agent.id,
+        "x-paseo-member": "claude/claude-opus-5-5",
+        "x-paseo-role": "implementer",
+      });
+      expect(call.headers.authorization).toBeUndefined();
+    }
+
+    // The agent itself stays refused, and nothing it sends is forwarded.
+    const forwarded = backend.recorded.length;
+    const ownCall = await fetch(`http://127.0.0.1:${running.port}/mcp/backends/memory`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${agentToken}`, "content-type": "application/json" },
+      body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+    });
+    expect([401, 403]).toContain(ownCall.status);
+    expect(backend.recorded).toHaveLength(forwarded);
+  } finally {
+    await client.close();
+  }
+
+  expect(await shutDown(running)).toMatchObject({ timelineDrain: { status: "drained" } });
 }, 60_000);

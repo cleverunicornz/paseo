@@ -304,6 +304,151 @@ function claudeQueryReportingModel(
   };
 }
 
+/** Where Claude Code first reports the model of a turn's model request. */
+type ClaudeModelReport = "init" | "message_start" | "assistant";
+
+interface ScriptedClaudeTurn {
+  /** The model the turn's frames carry. */
+  model: string;
+  /** The first frame carrying it; earlier frames of the turn carry no model. */
+  reportedBy: ClaudeModelReport;
+}
+
+interface HarnessGatewayCall {
+  turn: number;
+  status: number;
+}
+
+/**
+ * A scripted Claude Code query that answers each prompt as a turn of
+ * `turns[index]`: it replies, calls the `cluster` MCP server once the way
+ * Claude Code runs a tool (an HTTP request to the configured URL, with the
+ * configured headers, made by the harness while the turn runs), then replies
+ * again and completes. `calls` records the gateway's answer to every call.
+ */
+function claudeQueryAnsweringTurns(
+  turns: ScriptedClaudeTurn[],
+  launches: string[],
+  calls: HarnessGatewayCall[],
+) {
+  return ({
+    prompt,
+    options: launch,
+  }: {
+    prompt: AsyncIterable<unknown>;
+    options: {
+      model?: string;
+      mcpServers?: Record<string, { url?: string; headers?: Record<string, string> }>;
+    };
+  }) => {
+    launches.push(String(launch.model));
+    const prompts = prompt[Symbol.asyncIterator]();
+    const frames: Array<Record<string, unknown> | (() => Promise<void>)> = [];
+    let turnIndex = 0;
+    const state = { closed: false };
+    const callCluster = (turn: number) => async () => {
+      const cluster = launch.mcpServers?.cluster;
+      if (!cluster?.url) throw new Error("The cluster MCP server was not launched");
+      const response = await fetch(cluster.url, {
+        method: "POST",
+        headers: { ...cluster.headers, "content-type": "application/json" },
+        body: '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pr_read"}}',
+      });
+      calls.push({ turn, status: response.status });
+    };
+    const scriptTurn = (turn: number) => {
+      const { model, reportedBy } = turns[turn] ?? { model: "", reportedBy: "init" };
+      const modelFrom = (report: ClaudeModelReport) =>
+        reportedBy === "init" ||
+        (reportedBy === "message_start" && report !== "init") ||
+        report === "assistant"
+          ? { model }
+          : {};
+      const assistant = (id: string, content: unknown[]) => ({
+        type: "assistant",
+        parent_tool_use_id: null,
+        session_id: "fixture-claude",
+        message: { id, role: "assistant", ...modelFrom("assistant"), content },
+      });
+      frames.push(
+        {
+          type: "system",
+          subtype: "init",
+          session_id: "fixture-claude",
+          permissionMode: "default",
+          ...modelFrom("init"),
+        },
+        {
+          type: "stream_event",
+          parent_tool_use_id: null,
+          session_id: "fixture-claude",
+          event: {
+            type: "message_start",
+            message: { id: `msg-${turn}`, ...modelFrom("message_start") },
+          },
+        },
+        assistant(`msg-${turn}`, [{ type: "text", text: "OK" }]),
+        assistant(`msg-${turn}`, [
+          { type: "tool_use", id: `toolu-${turn}`, name: "mcp__cluster__pr_read", input: {} },
+        ]),
+        // Claude Code runs the tool once its tool_use block is complete.
+        callCluster(turn),
+        {
+          type: "user",
+          parent_tool_use_id: null,
+          session_id: "fixture-claude",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: `toolu-${turn}`, content: "[]" }],
+          },
+        },
+        assistant(`msg-${turn}-after`, [{ type: "text", text: "The call succeeded." }]),
+        {
+          type: "result",
+          subtype: "success",
+          session_id: "fixture-claude",
+          usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+          total_cost_usd: 0,
+        },
+      );
+    };
+    return {
+      next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+        while (!state.closed) {
+          const frame = frames.shift();
+          if (typeof frame === "function") {
+            await frame();
+            continue;
+          }
+          if (frame) return { done: false, value: frame };
+          const next = await prompts.next();
+          if (next.done) break;
+          scriptTurn(turnIndex++);
+        }
+        return { done: true, value: undefined };
+      },
+      return: async () => {
+        state.closed = true;
+        return { done: true, value: undefined };
+      },
+      interrupt: async () => {
+        state.closed = true;
+      },
+      close: () => {
+        state.closed = true;
+      },
+      applyFlagSettings: async () => undefined,
+      setPermissionMode: async () => undefined,
+      setModel: async () => undefined,
+      supportedModels: async () => [],
+      supportedCommands: async () => [],
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  };
+}
+
 function recordHeadersAndAnswer(seen: http.IncomingHttpHeaders[]): http.RequestListener {
   return (req, res) => {
     seen.push(req.headers);
@@ -1358,6 +1503,147 @@ describe("agent MCP end-to-end (offline)", () => {
       await session.close();
     }
   }, 30_000);
+
+  /**
+   * A daemon in session mode as claude/claude-opus-5-5 with one Claude agent,
+   * launched on Opus with the `cluster` gateway backend, whose harness answers
+   * each prompt as the next of `turns`.
+   */
+  async function startScriptedClaudeSession(turns: ScriptedClaudeTurn[]) {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const seen: http.IncomingHttpHeaders[] = [];
+    const backend = http.createServer(recordHeadersAndAnswer(seen));
+    await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+    const backendPort = (backend.address() as net.AddressInfo).port;
+
+    const launches: string[] = [];
+    const calls: HarnessGatewayCall[] = [];
+    const claude = new ClaudeAgentClient({
+      logger: pino({ level: "silent" }),
+      resolveBinary: async () => "/fixture/claude",
+      queryFactory: claudeQueryAnsweringTurns(turns, launches, calls) as never,
+    });
+    const clients = createTestAgentClients({ supportsMcpServers: true });
+    clients.claude!.createSession = claude.createSession.bind(claude);
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: clients,
+        agentStoragePath: path.join(paseoHome, "agents"),
+        mcpGatewayBackends: { cluster: { url: `http://127.0.0.1:${backendPort}/mcp` } },
+        sessionRuntime: {
+          ...DEFAULT_SESSION_RUNTIME_CONFIG,
+          identity: { member: "claude/claude-opus-5-5", role: "implementer" },
+        },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const manager = daemon.agentManager;
+    const agent = await manager.createAgent(
+      {
+        provider: "claude",
+        cwd: agentCwd,
+        model: "claude-opus-5-5",
+        mcpServers: {
+          cluster: {
+            type: "http",
+            url: "{paseoMcpGatewayUrl}/cluster",
+            headers: { Authorization: "Bearer {paseoAgentToken}" },
+          },
+        },
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const token = manager.issueAgentToken(agent.id);
+    const timeline: AgentStreamEvent[] = [];
+    manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream" && event.event.type === "timeline") {
+          timeline.push(event.event);
+        }
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    return {
+      manager,
+      agent,
+      launches,
+      calls,
+      seen,
+      timelineTexts: () =>
+        timeline.flatMap((event) =>
+          event.type === "timeline" && "text" in event.item ? [event.item.text] : [],
+        ),
+      callGatewayAsAgent: () =>
+        fetch(`http://127.0.0.1:${port}/mcp/backends/cluster`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+        }),
+      close: async () => {
+        await daemon.stop();
+        backend.closeAllConnections();
+        await new Promise<void>((resolve) => backend.close(() => resolve()));
+        await rm(paseoHome, { recursive: true, force: true });
+        await rm(staticDir, { recursive: true, force: true });
+        await rm(agentCwd, { recursive: true, force: true });
+      },
+    };
+  }
+
+  test.each<ClaudeModelReport>(["init", "message_start", "assistant"])(
+    "in session mode a turn whose harness reports another model by %s is stopped before its tool call reaches a backend",
+    async (reportedBy) => {
+      // The live G-15 sequence: an Opus turn, then `/model claude-sonnet-5-5` took
+      // effect inside Claude Code, and the next turn runs Sonnet and calls a tool.
+      const session = await startScriptedClaudeSession([
+        { model: "claude-opus-5-5", reportedBy: "init" },
+        { model: "claude-sonnet-5-5", reportedBy },
+      ]);
+      try {
+        await session.manager.runAgent(session.agent.id, "read the open PRs");
+        expect(session.calls).toEqual([{ turn: 0, status: 200 }]);
+        expect(session.seen).toHaveLength(1);
+
+        await expect(
+          session.manager.runAgent(session.agent.id, "reply OK, then read the open PRs"),
+        ).rejects.toThrow(SONNET_REFUSAL);
+
+        // The Sonnet turn's tool call was refused at the gateway and never reached the backend.
+        await vi.waitFor(() => expect(session.calls).toHaveLength(2));
+        expect([401, 403]).toContain(session.calls[1]?.status);
+        expect(session.seen).toHaveLength(1);
+        expect(session.seen.map((headers) => headers["x-paseo-member"])).toEqual([
+          "claude/claude-opus-5-5",
+        ]);
+        // The agent is stopped, the turn ended before its last reply, and the timeline says why.
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        expect(session.manager.getSessionMemberRefusal(session.agent.id)).toBe(SONNET_REFUSAL);
+        expect(session.timelineTexts()).toContainEqual(expect.stringContaining(SONNET_REFUSAL));
+        expect(session.timelineTexts().filter((text) => text === "The call succeeded.")).toEqual([
+          "The call succeeded.",
+        ]);
+        expect([401, 403]).toContain((await session.callGatewayAsAgent()).status);
+        expect(session.seen).toHaveLength(1);
+        expect(session.launches).toEqual(["claude-opus-5-5"]);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
 
   test("in session mode the member's [1m] context variant is the same member", async () => {
     // Claude Code reports the 1M-context variant of the member; the adapter reads it as the member.

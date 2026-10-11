@@ -723,6 +723,53 @@ export default function contribute(plugin: unknown) {
     }
   });
 
+  test("a daemon started with CVU_MEMBER and CVU_ROLE says once at startup that it runs in session mode, as whom", async () => {
+    const startLogged = async (env: NodeJS.ProcessEnv) => {
+      const configHome = await mkdtemp(path.join(os.tmpdir(), "paseo-session-mode-config-"));
+      const lines: Array<Record<string, unknown>> = [];
+      const logger = pino(
+        { level: "info" },
+        { write: (line: string) => lines.push(JSON.parse(line)) },
+      );
+      try {
+        const daemonHandle = await createTestPaseoDaemon({
+          logger,
+          auth: { password: hashDaemonPassword("daemon-secret") },
+          sessionRuntime: loadConfig(configHome, { env }).sessionRuntime,
+        });
+        await daemonHandle.close();
+        return lines;
+      } finally {
+        await rm(configHome, { recursive: true, force: true });
+      }
+    };
+    const mentionsSessionMode = (line: Record<string, unknown>) =>
+      /session mode/i.test(String(line.msg));
+
+    const sessionLines = await startLogged({
+      CVU_MEMBER: "claude/claude-opus-5-5",
+      CVU_ROLE: "implementer",
+    });
+    const announced = sessionLines.filter(mentionsSessionMode);
+    expect(announced).toHaveLength(1);
+    expect(announced[0]).toMatchObject({
+      level: 30,
+      member: "claude/claude-opus-5-5",
+      role: "implementer",
+      msg: expect.stringContaining("claude/claude-opus-5-5"),
+    });
+    expect(String(announced[0]?.msg)).toContain("implementer");
+    // The line names who the session runs as and nothing else: no credential.
+    expect(Object.keys(announced[0] ?? {}).sort()).toEqual(
+      ["hostname", "level", "member", "msg", "pid", "role", "time"].sort(),
+    );
+    expect(JSON.stringify(announced[0])).not.toMatch(/daemon-secret|\$2[aby]\$|token|password/i);
+
+    const plainLines = await startLogged({});
+    expect(plainLines.length).toBeGreaterThan(0);
+    expect(plainLines.filter(mentionsSessionMode)).toEqual([]);
+  });
+
   test("redacts Agent MCP debug request credentials and bodies", async () => {
     const logLines: string[] = [];
     const logger = pino(
