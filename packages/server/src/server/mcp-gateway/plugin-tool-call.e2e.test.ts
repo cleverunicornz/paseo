@@ -1049,6 +1049,227 @@ test("an agent resumed through the explicit resume API keeps its refusal: its to
   }
 }, 60_000);
 
+/** A model backend that answers every request and keeps the paths it was sent. */
+async function startModelBackend() {
+  const requests: string[] = [];
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      requests.push(String(req.url));
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    url: `http://127.0.0.1:${(server.address() as net.AddressInfo).port}/v1`,
+    requests,
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+/** The agent's own model request naming Sonnet, through the `models` gateway backend. */
+async function modelCallAsAgent(running: TestPaseoDaemon, agentId: string): Promise<number> {
+  const response = await fetch(`http://127.0.0.1:${running.port}/mcp/backends/models/messages`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${running.daemon.agentManager.issueAgentToken(agentId)}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ model: "claude-sonnet-5-5", messages: [], max_tokens: 1 }),
+  });
+  await response.body?.cancel();
+  return response.status;
+}
+
+/** Claude clients over `query`; a resume calls `onResume`, then waits for `barrier` once the session is open. */
+function claudeClientsResumingAt(
+  turnModels: Array<string | null>,
+  onResume: () => void,
+  barrier: Promise<void>,
+) {
+  const claude = new ClaudeAgentClient({
+    logger: pino({ level: "silent" }),
+    resolveBinary: async () => "/fixture/claude",
+    queryFactory: claudeQueryReportingTurns(turnModels) as never,
+  });
+  const agentClients = createTestAgentClients();
+  agentClients.claude!.createSession = claude.createSession.bind(claude);
+  agentClients.claude!.resumeSession = async (...args) => {
+    onResume();
+    const session = await claude.resumeSession(...args);
+    await barrier;
+    return session;
+  };
+  agentClients.claude!.importSession = claude.importSession.bind(claude);
+  return agentClients;
+}
+
+test("a refusal recorded while an explicit resume of the same native session is under way reaches the resumed agent", async () => {
+  // a218/W-13 F1-R2, the validator's R2-RACE probe: the older agent is refused after the
+  // resume read the native session's refusals and before the resumed agent registered.
+  const models = await startModelBackend();
+  let resumeStarted!: () => void;
+  const resuming = new Promise<void>((resolve) => {
+    resumeStarted = resolve;
+  });
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let client: DaemonClient | undefined;
+  try {
+    const running = await startDaemon({
+      agentClients: claudeClientsResumingAt(
+        ["claude-opus-5-5", "claude-sonnet-5-5"],
+        () => resumeStarted(),
+        barrier,
+      ),
+      sessionRuntime: OPUS_SESSION,
+      mcpGatewayBackends: {
+        memory: {
+          url: `http://127.0.0.1:${(backend.server.address() as net.AddressInfo).port}/mcp`,
+        },
+        models: { url: models.url },
+      },
+    });
+    const manager = running.daemon.agentManager;
+    const older = await manager.createAgent(
+      { provider: "claude", cwd: directory, model: "claude-opus-5-5" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.runAgent(older.id, "a member turn");
+    await manager.flush();
+    const record = await running.daemon.agentStorage.get(older.id);
+    expect(record?.sessionMemberRefused).toBeUndefined();
+    client = await connectClient(running);
+
+    const resume = client.resumeAgent(record!.persistence!, {
+      cwd: directory,
+      model: "claude-opus-5-5",
+    });
+    await resuming;
+    await expect(manager.runAgent(older.id, "/model claude-sonnet-5-5")).rejects.toThrow(
+      SONNET_REFUSAL,
+    );
+    await expect.poll(() => manager.getAgent(older.id)).toBeNull();
+    await manager.flush();
+    expect((await running.daemon.agentStorage.get(older.id))?.sessionMemberRefused).toBe(
+      "claude/claude-sonnet-5-5",
+    );
+    release();
+    const resumed = await resume;
+
+    expect(manager.getSessionMemberRefusal(resumed.id)).toBe(SONNET_REFUSAL);
+    expect(await callAsAgent(running, resumed.id)).toBe(403);
+    expect(await modelCallAsAgent(running, resumed.id)).toBe(403);
+    expect(backend.recorded).toHaveLength(0);
+    expect(models.requests).toHaveLength(0);
+  } finally {
+    release();
+    await client?.close();
+    await models.close();
+  }
+}, 60_000);
+
+test("a live agent on a native session is refused at once when another agent on it is refused", async () => {
+  // a218/W-13: the refusal belongs to the native session, so it reaches every agent running it.
+  const models = await startModelBackend();
+  let client: DaemonClient | undefined;
+  try {
+    const running = await startDaemon({
+      agentClients: claudeClientsResumingAt(
+        ["claude-opus-5-5", "claude-sonnet-5-5"],
+        () => {},
+        Promise.resolve(),
+      ),
+      sessionRuntime: OPUS_SESSION,
+      mcpGatewayBackends: {
+        memory: {
+          url: `http://127.0.0.1:${(backend.server.address() as net.AddressInfo).port}/mcp`,
+        },
+        models: { url: models.url },
+      },
+    });
+    const manager = running.daemon.agentManager;
+    const older = await manager.createAgent(
+      { provider: "claude", cwd: directory, model: "claude-opus-5-5" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.runAgent(older.id, "a member turn");
+    await manager.flush();
+    const record = await running.daemon.agentStorage.get(older.id);
+    client = await connectClient(running);
+    const alias = await client.resumeAgent(record!.persistence!, {
+      cwd: directory,
+      model: "claude-opus-5-5",
+    });
+    expect(manager.getSessionMemberRefusal(alias.id)).toBeNull();
+
+    await expect(manager.runAgent(older.id, "/model claude-sonnet-5-5")).rejects.toThrow(
+      SONNET_REFUSAL,
+    );
+
+    expect(manager.getSessionMemberRefusal(alias.id)).toBe(SONNET_REFUSAL);
+    expect(await callAsAgent(running, alias.id)).toBe(403);
+    expect(await modelCallAsAgent(running, alias.id)).toBe(403);
+    expect(backend.recorded).toHaveLength(0);
+    expect(models.requests).toHaveLength(0);
+  } finally {
+    await client?.close();
+    await models.close();
+  }
+}, 60_000);
+
+test("importing a native session an agent was refused on keeps the refusal: the imported agent's calls are refused", async () => {
+  // Operator decision on the declared gap: import is a resume path (D-000400 item 1, fail-closed).
+  const models = await startModelBackend();
+  const agentClients = claudeClientsResumingAt(["claude-sonnet-5-5"], () => {}, Promise.resolve());
+  // An import opens the provider's default model: here the member, which the gate admits.
+  const claude = agentClients.claude!;
+  const catalog = claude.fetchCatalog.bind(claude);
+  claude.fetchCatalog = async (options) => ({
+    ...(await catalog(options)),
+    models: [{ provider: "claude", id: "claude-opus-5-5", label: "Opus", isDefault: true }],
+  });
+  try {
+    const running = await startDaemon({
+      agentClients,
+      sessionRuntime: OPUS_SESSION,
+      mcpGatewayBackends: {
+        memory: {
+          url: `http://127.0.0.1:${(backend.server.address() as net.AddressInfo).port}/mcp`,
+        },
+        models: { url: models.url },
+      },
+    });
+    const manager = running.daemon.agentManager;
+    const refusedId = await createRefusedAgent(running);
+    await manager.flush();
+    const record = await running.daemon.agentStorage.get(refusedId);
+    expect(record?.persistence?.sessionId).toBe("fixture-claude");
+
+    const imported = await manager.importProviderSession({
+      provider: "claude",
+      providerHandleId: "fixture-claude",
+      cwd: directory,
+      workspaceId: record!.workspaceId!,
+    });
+
+    expect(manager.getSessionMemberRefusal(imported.id)).toBe(SONNET_REFUSAL);
+    expect(await callAsAgent(running, imported.id)).toBe(403);
+    expect(await modelCallAsAgent(running, imported.id)).toBe(403);
+    expect(backend.recorded).toHaveLength(0);
+    expect(models.requests).toHaveLength(0);
+  } finally {
+    await models.close();
+  }
+}, 60_000);
+
 test("a plugin gets no token for a refused agent from another hook, though one of its timeline items is unacknowledged", async () => {
   // a254 F2: the drain serves a refused agent's own timeline delivery, not other calls.
   const file = (name: string) => JSON.stringify(path.join(directory, name));
