@@ -59,6 +59,40 @@ describe("JsonRpcIdScanner", () => {
     expect(scan('{"id":"zwölf-✓","method":"x"}', { size: 1 }).ids).toEqual(["zwölf-✓"]);
   });
 
+  test("compares member names decoded, so any escaped spelling of `id` is the id", () => {
+    for (const name of [String.raw`\u0069d`, String.raw`i\u0064`, String.raw`\u0069\u0064`]) {
+      expect(scan(`{"${name}":7,"method":"x"}`, { size: 3 })).toEqual({ ids: [7], settled: true });
+    }
+    // Other names that merely look alike are not the id.
+    expect(scan(String.raw`{"\u0049d":8,"i\u0064 ":9,"method":"x"}`).ids).toEqual([]);
+  });
+
+  test("keeps a string or number id of any length in full", () => {
+    for (const id of ["x".repeat(1025), "y".repeat(1024 * 1024)]) {
+      expect(scan(JSON.stringify({ jsonrpc: "2.0", id, method: "x" }), { size: 4096 }).ids).toEqual(
+        [id],
+      );
+    }
+    expect(scan(`{"id":${"9".repeat(1100)},"method":"x"}`).ids).toEqual([Number("9".repeat(1100))]);
+  });
+
+  test("names an id longer than 16 MiB, which the gateway does not keep, as null", () => {
+    const id = "z".repeat(16 * 1024 * 1024 + 1);
+    expect(scan(`{"jsonrpc":"2.0","id":"${id}","method":"x"}`, { size: 1024 * 1024 }).ids).toEqual([
+      null,
+    ]);
+  }, 60_000);
+
+  test("of duplicate ids takes the last, as JSON.parse does, once the body is complete", () => {
+    expect(scan('{"id":7,"method":"x","id":8}').ids).toEqual([8]);
+    expect(scan('[{"id":1,"id":2},{"id":3}]').ids).toEqual([2, 3]);
+    // While the body still arrives, the first id read stands for the request.
+    expect(scan('{"id":7,"method":"x","id":', { complete: false })).toEqual({
+      ids: [7],
+      settled: true,
+    });
+  });
+
   test("reads every id of a batch once the batch is complete", () => {
     const batch =
       '[{"jsonrpc":"2.0","id":12,"method":"x"},{"jsonrpc":"2.0","method":"n"},{"id":13}]';
