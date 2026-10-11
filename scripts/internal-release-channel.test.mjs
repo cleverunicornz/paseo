@@ -67,7 +67,6 @@ test("the command line prints the channel, and refuses with the reason and a non
   assert.equal(run("refs/heads/internal/main", "v0.10.3-cvu.7", version), "release\n");
   assert.throws(
     () => run("refs/heads/candidate/v2", "v0.10.3-cvu.7", version),
-    (error) =>
-      error.status === 1 && /candidate prerelease tag must be/.test(String(error.stderr)),
+    (error) => error.status === 1 && /candidate prerelease tag must be/.test(String(error.stderr)),
   );
 });

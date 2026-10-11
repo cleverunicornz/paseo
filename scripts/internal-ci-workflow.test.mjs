@@ -32,7 +32,10 @@ const step = (name) => {
 };
 
 test("pull requests into internal/main and every candidate lane run; pushes only on internal/main", () => {
-  assert.match(workflow, /pull_request:\n(?: {4}#.*\n)* {4}branches: \[internal\/main, "candidate\/\*\*"\]/);
+  assert.match(
+    workflow,
+    /pull_request:\n(?: {4}#.*\n)* {4}branches: \[internal\/main, "candidate\/\*\*"\]/,
+  );
   assert.match(workflow, /push:\n {4}branches: \[internal\/main\]\n/);
 });
 
@@ -47,8 +50,14 @@ test("the release scripts are tested on every run", () => {
 
 test("a dispatched tag is checked against the release rule before anything is built", () => {
   const check = step("Check the release tag");
-  assert.match(check.text, /if: github\.event_name == 'workflow_dispatch' && inputs\.release_tag != ''/);
-  assert.match(check.text, /node scripts\/internal-release-channel\.mjs "\$GITHUB_REF" "\$RELEASE_TAG"/);
+  assert.match(
+    check.text,
+    /if: github\.event_name == 'workflow_dispatch' && inputs\.release_tag != ''/,
+  );
+  assert.match(
+    check.text,
+    /node scripts\/internal-release-channel\.mjs "\$GITHUB_REF" "\$RELEASE_TAG"/,
+  );
   assert.ok(stepIndex("Check the release tag") < stepIndex("Install dependencies"));
 });
 
@@ -62,13 +71,19 @@ test("the same seven packages and checksum files are packed for every release", 
 
 test("a candidate lane publishes a prerelease; internal/main publishes as before", () => {
   const publish = step("Publish source-qualified release");
-  assert.match(publish.text, /if: github\.event_name == 'workflow_dispatch' && inputs\.release_tag != ''/);
+  assert.match(
+    publish.text,
+    /if: github\.event_name == 'workflow_dispatch' && inputs\.release_tag != ''/,
+  );
   assert.doesNotMatch(publish.text, /test "\$GITHUB_REF" = refs\/heads\/internal\/main/);
   assert.match(
     publish.text,
     /channel="\$\(node scripts\/internal-release-channel\.mjs "\$GITHUB_REF" "\$RELEASE_TAG" "\$version"\)"/,
   );
-  assert.match(publish.text, /if \[ "\$channel" = prerelease \]; then prerelease=\(--prerelease\); fi/);
+  assert.match(
+    publish.text,
+    /if \[ "\$channel" = prerelease \]; then prerelease=\(--prerelease\); fi/,
+  );
   assert.match(
     publish.text,
     /gh release create "\$RELEASE_TAG" "\$RUNNER_TEMP\/paseo-release\/"\* --repo "\$GITHUB_REPOSITORY" --target "\$GITHUB_SHA" --title "\$RELEASE_TAG" "\$\{prerelease\[@\]\}"/,
