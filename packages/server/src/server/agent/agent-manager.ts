@@ -95,6 +95,7 @@ import { withTimeout } from "../../utils/promise-timeout.js";
 import { extractAttention } from "../persistence-hooks.js";
 import { AgentAdmission } from "./agent-admission.js";
 import type { SessionIdentity } from "../session-runtime-config.js";
+import { ModelPinError, modelPinRefusal } from "./model-pin.js";
 import { SessionMemberError, SessionMemberGate } from "./session-member-gate.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
@@ -188,6 +189,26 @@ interface TimeoutOptions {
 
 function formatProviderList(providers: readonly string[]): string {
   return providers.length > 0 ? providers.join(", ") : "none";
+}
+
+/**
+ * The model a stored agent was created with. A record written before agents
+ * recorded it gives the model the agent runs now.
+ */
+function storedCreationModel(record: StoredAgentRecord): string | null {
+  return record.creationModel ?? record.config?.model ?? null;
+}
+
+/**
+ * The model a resumed session was created with: its agent's record's, else the
+ * model its persistence handle recorded, or null when neither says.
+ */
+function resumedCreationModel(
+  record: StoredAgentRecord | null,
+  metadata: Partial<AgentSessionConfig>,
+): string | null {
+  if (record) return storedCreationModel(record);
+  return typeof metadata.model === "string" && metadata.model.trim() ? metadata.model : null;
 }
 
 function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
@@ -455,6 +476,12 @@ interface ManagedAgentBase {
   owner?: AgentOwner;
   capabilities: AgentCapabilityFlags;
   config: AgentSessionConfig;
+  /**
+   * The model the agent was created with, or null until a provider default it
+   * started on is known. Outside session mode the agent runs no other model;
+   * in session mode the session's member holds every agent instead.
+   */
+  creationModel: string | null;
   runtimeInfo?: AgentRuntimeInfo;
   createdAt: Date;
   updatedAt: Date;
@@ -821,8 +848,12 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
   private readonly admission: AgentAdmission;
   private readonly sessionMemberGate: SessionMemberGate | null;
-  /** Agents stopped for running another member, with the refusal; the gateway forwards nothing for them. */
-  private readonly sessionMemberRefusals = new Map<string, SessionMemberError>();
+  /**
+   * Agents stopped for running another model than the session's member, or
+   * outside session mode than their creation model, with the refusal; the
+   * gateway forwards nothing for them.
+   */
+  private readonly sessionMemberRefusals = new Map<string, SessionMemberError | ModelPinError>();
   private readonly onSessionMemberRefusal: AgentManagerOptions["onSessionMemberRefusal"];
 
   constructor(options: AgentManagerOptions) {
@@ -892,12 +923,29 @@ export class AgentManager {
     this.sessionMemberGate?.assert(provider, model);
   }
 
+  /**
+   * Outside session mode, refuses running `model` on an agent created with
+   * another, before an operation changes anything. Session mode holds agents
+   * to its member instead.
+   */
+  private assertKeepsCreationModel(creationModel: string | null, model: string | null | undefined): void {
+    if (this.sessionMemberGate) return;
+    const refusal = modelPinRefusal(creationModel, model);
+    if (refusal) throw refusal;
+  }
+
+  /** Outside session mode, a launch of an agent with a known creation model runs only that model. */
+  private pinLaunchModel(context: AgentLaunchContext, creationModel: string | null | undefined): void {
+    if (this.sessionMemberGate || !creationModel) return;
+    context.modelPin = creationModel;
+  }
+
   /** Clears an agent's error, except the refusal of an agent the session stopped. */
   private clearLastError(agent: ManagedAgent): void {
     agent.lastError = this.sessionMemberRefusals.get(agent.id)?.message;
   }
 
-  /** Why the session stopped this agent for running another member, or null. */
+  /** Why the daemon stopped this agent for running another member or creation model, or null. */
   getSessionMemberRefusal(agentId: string): string | null {
     return this.sessionMemberRefusals.get(agentId)?.message ?? null;
   }
@@ -1441,6 +1489,7 @@ export class AgentManager {
       options?.env,
       { reason: "create", purpose: "interactive", workspaceId: options.workspaceId ?? null },
     );
+    this.pinLaunchModel(launchContext, storedConfig.model);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
       agentId: resolvedAgentId,
       paseoToolPolicy,
@@ -1526,16 +1575,22 @@ export class AgentManager {
       "resumeAgentFromPersistence",
     );
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
-    const mergedConfig = {
-      ...metadata,
-      ...overrides,
-      provider: handle.provider,
-    } as AgentSessionConfig;
     // Decide residency from durable state inside the lifecycle lane. A loader may
     // have read the record before a queued archive or restore completed. Residency is
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
+    const creationModel = resumedCreationModel(record, metadata);
+    const mergedConfig = {
+      ...metadata,
+      ...overrides,
+      provider: handle.provider,
+    } as AgentSessionConfig;
+    // A session resumed without a model runs the one it was created with, never a
+    // provider default that has changed since.
+    if (!this.sessionMemberGate && creationModel && !mergedConfig.model?.trim()) {
+      mergedConfig.model = creationModel;
+    }
     const currentResumeOptions = record
       ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
       : resumeOptions;
@@ -1548,6 +1603,7 @@ export class AgentManager {
       return await this.resumeAdmittedAgent({
         handle,
         mergedConfig,
+        creationModel,
         resolvedAgentId,
         options,
         currentResumeOptions,
@@ -1561,6 +1617,8 @@ export class AgentManager {
   private async resumeAdmittedAgent(input: {
     handle: AgentPersistenceHandle;
     mergedConfig: AgentSessionConfig;
+    /** The model the resumed session was created with, when its record or handle says. */
+    creationModel: string | null;
     resolvedAgentId: string;
     options: Parameters<AgentManager["resumeAgentFromPersistence"]>[3];
     currentResumeOptions: AgentResumeSessionOptions | undefined;
@@ -1572,6 +1630,11 @@ export class AgentManager {
       { purpose },
     );
     this.assertRunsSessionMember(storedConfig.provider, storedConfig.model);
+    // Reading an archived agent's history runs nothing, so only a live resume is held to it.
+    const creationModel = input.creationModel ?? storedConfig.model ?? null;
+    if (input.creationModel && purpose !== "history") {
+      this.assertKeepsCreationModel(input.creationModel, storedConfig.model);
+    }
     const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
     if (!available) {
@@ -1592,6 +1655,7 @@ export class AgentManager {
         workspaceId: options?.workspaceId ?? null,
       },
     );
+    this.pinLaunchModel(launchContext, creationModel);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
       agentId: resolvedAgentId,
       paseoToolPolicy,
@@ -1605,6 +1669,7 @@ export class AgentManager {
     await this.requireExternalMcpSupport(session, storedConfig);
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
+      creationModel,
       persistence: handle,
       restoring: true,
     });
@@ -1751,6 +1816,10 @@ export class AgentManager {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
     const checkedOverrides = await this.checkReloadSessionMember(existing, overrides);
+    // Nor may a reload onto another model than the agent was created with.
+    if (checkedOverrides?.model !== undefined) {
+      this.assertKeepsCreationModel(existing.creationModel, checkedOverrides.model);
+    }
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
@@ -1780,6 +1849,7 @@ export class AgentManager {
       undefined,
       { reason: "refresh", purpose: "interactive", workspaceId: existing.workspaceId },
     );
+    this.pinLaunchModel(launchContext, existing.creationModel);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext, {
       agentId: agentId,
       paseoToolPolicy,
@@ -1825,6 +1895,7 @@ export class AgentManager {
         labels: existing.labels,
         workspaceId: existing.workspaceId,
         owner: existing.owner,
+        creationModel: existing.creationModel,
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
         lastUserMessageAt: existing.lastUserMessageAt,
@@ -2125,6 +2196,7 @@ export class AgentManager {
         session: null,
         capabilities: STORED_AGENT_CAPABILITIES,
         config: buildStoredAgentConfig(record),
+        creationModel: storedCreationModel(record),
         runtimeInfo: undefined,
         lifecycle: "closed",
         createdAt: new Date(record.createdAt),
@@ -2175,6 +2247,13 @@ export class AgentManager {
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
     this.assertRunsSessionMember(agent.provider, normalizedModelId);
+    // Switching to the default is a switch to the model the default names now.
+    const requestedModel =
+      normalizedModelId ??
+      (agent.creationModel
+        ? ((await this.resolveDefaultModelId({ ...agent.config, model: undefined })) ?? null)
+        : null);
+    this.assertKeepsCreationModel(agent.creationModel, requestedModel);
 
     if (agent.session.setModel) {
       await agent.session.setModel(normalizedModelId);
@@ -3708,6 +3787,8 @@ export class AgentManager {
       publishWhenReady?: boolean;
       workspaceId?: string;
       owner?: AgentOwner;
+      /** The model a known agent was created with; a new agent's is the one it starts on. */
+      creationModel?: string | null;
     },
   ): Promise<ManagedAgent> {
     let registered = false;
@@ -3887,6 +3968,7 @@ export class AgentManager {
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
           owner?: AgentOwner;
+          creationModel?: string | null;
         }
       | undefined;
   }): ActiveManagedAgent {
@@ -3900,6 +3982,7 @@ export class AgentManager {
       session,
       capabilities: session.capabilities,
       config,
+      creationModel: options?.creationModel ?? config.model ?? null,
       runtimeInfo: undefined,
       lifecycle: "initializing",
       createdAt: options?.createdAt ?? now,
@@ -4198,16 +4281,17 @@ export class AgentManager {
 
   /**
    * Stops an agent whose runtime reports a model other than the session's
-   * member, however it came to run it: the gateway refuses the agent at once,
-   * the timeline records why, and closing it ends its turn. The member header
-   * itself never changes.
+   * member, or outside session mode than the agent's creation model, however
+   * it came to run it: the gateway refuses the agent at once, the timeline
+   * records why, and closing it ends its turn. The member header itself never
+   * changes.
    */
   private enforceRuntimeSessionMember(
     agent: ActiveManagedAgent,
     model: string | null | undefined = agent.runtimeInfo?.model,
   ): void {
-    if (!this.sessionMemberGate || !model || this.sessionMemberRefusals.has(agent.id)) return;
-    const refusal = this.sessionMemberGate.refusal(agent.provider, model);
+    if (!model || this.sessionMemberRefusals.has(agent.id)) return;
+    const refusal = this.runtimeModelRefusal(agent, model);
     if (!refusal) return;
     this.sessionMemberRefusals.set(agent.id, refusal);
     agent.lastError = refusal.message;
@@ -4217,10 +4301,17 @@ export class AgentManager {
       workspaceId: agent.workspaceId ?? null,
       refusal: refusal.message,
     });
-    this.logger.warn(
-      { agentId: agent.id, member: refusal.member, reported: refusal.attempted },
-      "Agent runtime reported a model other than the session's member; stopping it",
-    );
+    if (refusal instanceof SessionMemberError) {
+      this.logger.warn(
+        { agentId: agent.id, member: refusal.member, reported: refusal.attempted },
+        "Agent runtime reported a model other than the session's member; stopping it",
+      );
+    } else {
+      this.logger.warn(
+        { agentId: agent.id, creationModel: refusal.pinned, reported: refusal.attempted },
+        "Agent runtime reported a model other than its creation model; stopping it",
+      );
+    }
     this.recordAndDispatchTimelineItem(
       agent.id,
       { type: "assistant_message", text: `${SYSTEM_ERROR_PREFIX} ${refusal.message}` },
@@ -4230,6 +4321,24 @@ export class AgentManager {
     void this.closeAgent(agent.id, { reason: refusal.message }).catch((error: unknown) => {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to stop agent after refusal");
     });
+  }
+
+  /**
+   * The refusal for an agent whose runtime reports `model`: against the
+   * session's member, or outside session mode against the agent's creation
+   * model. An agent created on a provider default it did not name takes the
+   * first model its runtime reports as its creation model.
+   */
+  private runtimeModelRefusal(
+    agent: ActiveManagedAgent,
+    model: string,
+  ): SessionMemberError | ModelPinError | null {
+    if (this.sessionMemberGate) return this.sessionMemberGate.refusal(agent.provider, model);
+    if (agent.creationModel === null) {
+      agent.creationModel = model;
+      return null;
+    }
+    return modelPinRefusal(agent.creationModel, model);
   }
 
   private async refreshRuntimeInfo(

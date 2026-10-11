@@ -59,6 +59,7 @@ import path from "node:path";
 import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
 import { composeSystemPromptParts } from "../system-prompt.js";
+import { assertModelPin } from "../model-pin.js";
 import { curateAgentActivity } from "../activity-curator.js";
 import { CodexAsyncQuestions, codexAsyncQuestionToTimeline } from "./codex/async-questions.js";
 import {
@@ -268,6 +269,8 @@ interface CodexAppServerAgentDeps {
   customCodexConfig?: CodexCustomProviderConfig | null;
   // The CODEX_HOME the session's app-server runs with; prompts and skills are read from it.
   codexHome?: string;
+  /** The one model the session may run, when the daemon pins the agent's creation model. */
+  modelPin?: string;
   /** How every process started from the Codex binary gets its environment. */
   harnessEnvironment?: HarnessEnvironment;
   _createCodexClient?: (
@@ -4228,6 +4231,19 @@ export class CodexAppServerAgentSession implements AgentSession {
     };
   }
 
+  /**
+   * A turn/start names its model twice, at the top level and in its
+   * collaboration mode's settings; the harness is told neither if either is
+   * another model than the pin. A turn that names none runs the thread's model.
+   */
+  private assertTurnRunsModelPin(params: Record<string, unknown>): void {
+    const collaborationMode = toObjectRecord(params.collaborationMode);
+    const settings = toObjectRecord(collaborationMode?.settings);
+    for (const model of [params.model, settings?.model]) {
+      if (typeof model === "string") assertModelPin(this.deps.modelPin, model);
+    }
+  }
+
   private applyTurnWorkflowPolicy(
     params: Record<string, unknown>,
     preset: CodexModePreset,
@@ -4402,6 +4418,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (pendingStart.cancelRequested) {
         throw new Error("Codex turn start was interrupted before reaching Codex");
       }
+      this.assertTurnRunsModelPin(turnStart.params);
       await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
       return { turnId };
     } catch (error) {
@@ -4614,6 +4631,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async setModel(modelId: string | null): Promise<void> {
+    assertModelPin(this.deps.modelPin, modelId);
     this.config.model = modelId ?? undefined;
     this.reportedModel = null;
     if (!codexModelSupportsFastMode(this.config.model)) {
@@ -5260,6 +5278,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.currentThreadId) return;
 
     const { model, thinkingOptionId } = await this.resolveModelAndThinking();
+    assertModelPin(this.deps.modelPin, model);
     this.config.model = model;
     this.config.thinkingOptionId = thinkingOptionId;
 
@@ -7204,6 +7223,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       customCodexConfig: gateway
         ? buildCodexModelGatewayConfig(gateway, this.deps.customProvider)
         : this.customProviderConfig(),
+      modelPin: launchContext?.modelPin,
     };
   }
 

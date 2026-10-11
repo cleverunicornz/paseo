@@ -657,6 +657,12 @@ export interface AgentLaunchContext {
    * harness environment with `buildAllowlistedHarnessEnv` instead of inheriting one.
    */
   modelGateway?: AgentModelGateway;
+  /**
+   * Runtime-only: the model the agent was created with, outside session mode.
+   * A provider that receives it starts, switches to and sends turns for no
+   * other model, and throws `ModelPinError` before anything reaches the harness.
+   */
+  modelPin?: string;
 }
 
 export interface AgentCreateSessionOptions {

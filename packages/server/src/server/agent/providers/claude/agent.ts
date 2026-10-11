@@ -152,6 +152,7 @@ import type { SpawnEnvOptions } from "../../../../utils/spawn.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
+import { assertModelPin } from "../../model-pin.js";
 
 const fsPromises = promises;
 const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
@@ -428,6 +429,7 @@ interface ClaudeAgentSessionOptions {
   agentId?: string;
   launchEnv?: Record<string, string>;
   modelGateway?: AgentModelGateway;
+  modelPin?: string;
   harnessEnvironment: HarnessEnvironment;
   persistSession?: boolean;
   logger: Logger;
@@ -1551,6 +1553,7 @@ export class ClaudeAgentClient implements AgentClient {
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       modelGateway: launchContext?.modelGateway,
+      modelPin: launchContext?.modelPin,
       harnessEnvironment: this.harnessEnvironment,
       persistSession: options?.persistSession,
       logger: this.logger,
@@ -1583,6 +1586,7 @@ export class ClaudeAgentClient implements AgentClient {
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       modelGateway: launchContext?.modelGateway,
+      modelPin: launchContext?.modelPin,
       harnessEnvironment: this.harnessEnvironment,
       logger: this.logger,
       queryFactory: this.queryFactory,
@@ -2109,6 +2113,8 @@ class ClaudeAgentSession implements AgentSession {
   private readonly config: ClaudeAgentConfig;
   private readonly launchEnv?: Record<string, string>;
   private readonly modelGateway?: AgentModelGateway;
+  /** The one model this session may run, when the daemon pins the agent's creation model. */
+  private readonly modelPin?: string;
   private readonly harnessEnvironment: HarnessEnvironment;
   private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
@@ -2191,6 +2197,7 @@ class ClaudeAgentSession implements AgentSession {
     assertClaudeThinkingOptionSupported(config.model, config.thinkingOptionId);
     this.launchEnv = options.launchEnv;
     this.modelGateway = options.modelGateway;
+    this.modelPin = options.modelPin;
     // A gateway route always launches under the allowlist.
     this.harnessEnvironment = options.modelGateway
       ? { kind: "allowlist", envPassthrough: options.modelGateway.envPassthrough }
@@ -2513,6 +2520,8 @@ class ClaudeAgentSession implements AgentSession {
   async setModel(modelId: string | null): Promise<void> {
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
+    // Refused before the query starts or hears of it.
+    assertModelPin(this.modelPin, normalizedModelId);
     const activeQuery = await this.ensureQuery();
     await activeQuery.setModel(normalizedModelId ?? undefined);
     this.config.model = normalizedModelId ?? undefined;
@@ -3429,6 +3438,7 @@ class ClaudeAgentSession implements AgentSession {
       base.mcpServers = this.normalizeMcpServers(this.config.mcpServers);
     }
 
+    assertModelPin(this.modelPin, this.config.model);
     if (this.config.model) {
       base.model = this.config.model;
     }
