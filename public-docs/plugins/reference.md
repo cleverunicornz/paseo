@@ -372,12 +372,13 @@ You can call for:
   agent had when shutdown began, so a recorder can send the timeline items it still holds from its
   `drain` or from a re-offered `agent.timeline_item`;
 - in [session mode](/docs/session-containers#one-member-per-session), an agent the session stopped
-  for running another model, while any plugin still has one of its timeline items unacknowledged.
+  for running another model, while any plugin still has one of its timeline items unacknowledged
+  and for at most `daemon.shutdown.timelineDrainMs` after it was stopped.
   The call carries the identity the agent had when it was stopped, and the session's refusal of the
   agent does not apply to it. The agent's own requests stay refused.
 
 Any other id is refused, including an agent closed before shutdown began, a stopped agent whose
-items are all acknowledged, and every agent once the shutdown drain has ended.
+items are all acknowledged or whose time is up, and every agent once the shutdown drain has ended.
 
 ## Entry point and cleanup
 

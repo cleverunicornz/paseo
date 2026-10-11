@@ -133,7 +133,7 @@ import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import { AgentTokenRegistry } from "./agent/agent-tokens.js";
-import { createMcpGatewayHandler } from "./mcp-gateway/mcp-gateway.js";
+import { createMcpGatewayHandler, McpGatewayRequests } from "./mcp-gateway/mcp-gateway.js";
 import { MCP_GATEWAY_ROUTE, type McpGatewayBackend } from "./mcp-gateway/backends.js";
 import {
   createPaseoToolCatalog,
@@ -1023,10 +1023,15 @@ export async function createPaseoDaemon(
   // Agents that no longer run keep their gateway identity for the plugin calls
   // that deliver their remaining timeline items: those the shutdown closes until
   // its drain ends (see stop()), and those the session refused for running
-  // another model while any of their items is unacknowledged.
-  const drainGatewayCallers = new DrainGatewayCallers((agentId) =>
-    pluginRuntime.hasUnacknowledgedTimeline(agentId),
-  );
+  // another model while any of their items is unacknowledged, at most
+  // timelineDrainMs from the refusal.
+  const drainGatewayCallers = new DrainGatewayCallers({
+    hasUndeliveredTimeline: (agentId) => pluginRuntime.hasUnacknowledgedTimeline(agentId),
+    refusedDrainMs: sessionRuntime.timelineDrainMs,
+  });
+  // The gateway requests in flight per agent, cut off when the session refuses
+  // the agent and again when a refused agent's token is revoked at close.
+  const mcpGatewayRequests = new McpGatewayRequests();
   const agentManager = new AgentManager({
     pluginLifecycle: pluginRuntime,
     clients: initialAgentManagerState.clients,
@@ -1044,8 +1049,15 @@ export async function createPaseoDaemon(
     prepareToolTree: localToolsRuntime.prepareToolTree,
     singleAgent: sessionRuntime.singleAgent,
     sessionIdentity: sessionRuntime.identity,
-    onSessionMemberRefusal: (agent) => drainGatewayCallers.retainRefused(agent),
+    onSessionMemberRefusal: ({ refusal, ...agent }) => {
+      drainGatewayCallers.retainRefused(agent);
+      mcpGatewayRequests.refuse(agent.agentId, refusal);
+    },
     logger,
+  });
+  agentTokens.onRevoke((agentId) => {
+    const refusal = agentManager.getSessionMemberRefusal(agentId);
+    if (refusal) mcpGatewayRequests.refuse(agentId, refusal);
   });
   const stopReadiness = new StopReadinessService({
     plugins: pluginRuntime,
@@ -1112,6 +1124,7 @@ export async function createPaseoDaemon(
       serverId,
       sessionIdentity: sessionRuntime.identity,
       agentRefusal: (agentId) => agentManager.getSessionMemberRefusal(agentId),
+      requests: mcpGatewayRequests,
       resolveUpstream: (request) => pluginRuntime.before("mcp_gateway.upstream", request),
       logger,
     }),

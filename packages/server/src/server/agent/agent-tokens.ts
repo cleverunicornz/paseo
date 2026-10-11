@@ -13,6 +13,7 @@ function digest(token: string): string {
 export class AgentTokenRegistry {
   private readonly agentByDigest = new Map<string, string>();
   private readonly tokenByAgent = new Map<string, string>();
+  private readonly revokeListeners = new Set<(agentId: string) => void>();
 
   /** Returns the agent's token, minting one on first use. */
   issue(agentId: string): string {
@@ -40,5 +41,12 @@ export class AgentTokenRegistry {
     }
     this.tokenByAgent.delete(agentId);
     this.agentByDigest.delete(digest(token));
+    for (const listener of this.revokeListeners) listener(agentId);
+  }
+
+  /** Calls `listener` with each agent whose token is revoked; returns the unsubscribe. */
+  onRevoke(listener: (agentId: string) => void): () => void {
+    this.revokeListeners.add(listener);
+    return () => this.revokeListeners.delete(listener);
   }
 }

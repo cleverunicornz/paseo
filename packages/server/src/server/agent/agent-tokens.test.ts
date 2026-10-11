@@ -46,4 +46,20 @@ describe("AgentTokenRegistry", () => {
     expect(reissued).not.toBe(original);
     expect(tokens.resolve(reissued)).toBe("agent-1");
   });
+
+  test("revoking an agent's token tells each listener which agent, once", () => {
+    const tokens = new AgentTokenRegistry();
+    const revoked: string[] = [];
+    const stop = tokens.onRevoke((agentId) => revoked.push(agentId));
+    tokens.issue("agent-1");
+
+    tokens.revoke("agent-1");
+    tokens.revoke("agent-1");
+    tokens.revoke("never-issued");
+    stop();
+    tokens.issue("agent-1");
+    tokens.revoke("agent-1");
+
+    expect(revoked).toEqual(["agent-1"]);
+  });
 });

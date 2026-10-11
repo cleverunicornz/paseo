@@ -23,6 +23,39 @@ export interface McpGatewayAgent {
   drain?: boolean;
 }
 
+/**
+ * The requests the gateway is forwarding, by agent, so the session's refusal
+ * of an agent also cuts off what the agent already sent: a body still arriving
+ * never completes at the backend, and an answer not yet passed on is replaced
+ * by the refusal. A plugin's drain calls are not tracked.
+ */
+export class McpGatewayRequests {
+  private readonly byAgent = new Map<string, Set<(refusal: string) => void>>();
+
+  /** Tracks one request until `untrack` is called; `cut` cuts it off with a refusal. */
+  track(agentId: string, cut: (refusal: string) => void): () => void {
+    let cuts = this.byAgent.get(agentId);
+    if (!cuts) {
+      cuts = new Set();
+      this.byAgent.set(agentId, cuts);
+    }
+    cuts.add(cut);
+    return () => {
+      const current = this.byAgent.get(agentId);
+      current?.delete(cut);
+      if (current?.size === 0) this.byAgent.delete(agentId);
+    };
+  }
+
+  /** Cuts off every request of the agent still being forwarded, each answered with `refusal`. */
+  refuse(agentId: string, refusal: string): void {
+    const cuts = this.byAgent.get(agentId);
+    if (!cuts) return;
+    this.byAgent.delete(agentId);
+    for (const cut of cuts) cut(refusal);
+  }
+}
+
 export interface McpGatewayOptions {
   getBackends: () => ReadonlyMap<string, McpGatewayBackend>;
   /** Resolves the caller from its daemon-issued bearer token; nothing else names a caller. */
@@ -35,6 +68,8 @@ export interface McpGatewayOptions {
    * not forwarded, except a plugin's drain calls for it.
    */
   agentRefusal?: (agentId: string) => string | null;
+  /** Where forwarded requests are tracked, so a refusal can cut them off. */
+  requests?: McpGatewayRequests;
   /** Runs the `mcp_gateway.upstream` plugin hooks. */
   resolveUpstream: (request: McpGatewayUpstreamRequest) => Promise<McpGatewayUpstreamRequest>;
   /**
@@ -262,6 +297,16 @@ function sendError(res: express.Response, status: number, error: string): void {
   res.status(status).json({ error });
 }
 
+/** Tracks an agent's own request; a plugin's drain call is never cut off by a refusal. */
+function trackForRefusal(
+  requests: McpGatewayRequests | undefined,
+  agent: McpGatewayAgent,
+  cut: (refusal: string) => void,
+): () => void {
+  if (!requests || agent.drain) return () => undefined;
+  return requests.track(agent.agentId, cut);
+}
+
 /**
  * The daemon's MCP gateway, mounted at `/mcp/backends`. An agent reaches a
  * configured backend by name through its own daemon; the daemon authenticates
@@ -367,6 +412,17 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
       sendError(res, 504, `MCP backend ${backend} did not answer`);
       upstreamRequest.destroy();
     }, responseTimeoutMs);
+    // Tracked from the last refusal check on, with no await between: a refusal
+    // either stopped this request above or cuts it off here.
+    let cutOff = false;
+    const untrack = trackForRefusal(options.requests, agent, (reason) => {
+      cutOff = true;
+      clearTimeout(responseTimer);
+      req.unpipe(upstreamRequest);
+      upstreamRequest.destroy();
+      sendError(res, 403, reason);
+      req.resume();
+    });
 
     upstreamRequest.on("response", (upstreamResponse) => {
       clearTimeout(responseTimer);
@@ -385,12 +441,13 @@ export function createMcpGatewayHandler(options: McpGatewayOptions): express.Req
     });
     upstreamRequest.on("error", (error) => {
       clearTimeout(responseTimer);
-      if (timedOut) return;
+      if (timedOut || cutOff) return;
       logger.warn({ err: error, backend, agentId: agent.agentId }, "MCP backend unreachable");
       sendError(res, 502, `MCP backend ${backend} is unreachable`);
     });
     res.on("close", () => {
       clearTimeout(responseTimer);
+      untrack();
       if (!res.writableFinished) {
         upstreamRequest.destroy();
       }

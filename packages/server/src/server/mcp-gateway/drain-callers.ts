@@ -8,43 +8,71 @@ function digest(token: string): string {
 /** Until when a retained agent's identity is admitted. */
 type Retention =
   /** Until the shutdown's timeline drain ends. */
-  | "shutdown"
-  /** While plugins still hold timeline items of the agent that they have not acknowledged. */
-  | "undelivered";
+  | { kind: "shutdown" }
+  /**
+   * While plugins still hold timeline items of the agent that they have not
+   * acknowledged, and at most until `deadline`.
+   */
+  | { kind: "undelivered"; deadline: number };
+
+export interface DrainGatewayCallersOptions {
+  hasUndeliveredTimeline: (agentId: string) => boolean;
+  /** How long after its refusal a refused agent's identity is admitted at most: `timelineDrainMs`. */
+  refusedDrainMs: number;
+  now?: () => number;
+}
 
 /**
  * The gateway identities of agents that no longer run but whose timeline items
  * plugins still deliver, kept so plugins can call the gateway on their behalf
  * for that delivery: the agents a shutdown closes, until the shutdown's
  * timeline drain ends, and the agents the session refused for running another
- * model, while plugins hold any of their items unacknowledged. A closed agent
- * adds no timeline items, so those are items it emitted before it closed.
+ * model, while plugins hold any of their items unacknowledged and for at most
+ * `refusedDrainMs` from the refusal, the same bound a shutdown's drain has. A
+ * closed agent adds no timeline items, so those are items it emitted before it
+ * closed.
  *
  * Each identity is captured before its agent closes, and the table mints a
  * separate token per agent that only the daemon ever holds: the agent's own
  * token, which its harness and the processes it ran received, is not revived,
  * and stays refused. An agent whose close failed stays live and calls with its
- * own token as before. `end` drops every identity and token once the
- * shutdown's drain is over.
+ * own token as before. An identity past its bound is dropped with its token;
+ * `end` drops every identity and token once the shutdown's drain is over.
  */
 export class DrainGatewayCallers {
   private readonly retained = new Map<string, { agent: McpGatewayAgent; until: Retention }>();
   private readonly agentByDigest = new Map<string, string>();
   private readonly tokenByAgent = new Map<string, string>();
+  private readonly hasUndeliveredTimeline: (agentId: string) => boolean;
+  private readonly refusedDrainMs: number;
+  private readonly now: () => number;
   private ended = false;
 
-  constructor(private readonly hasUndeliveredTimeline: (agentId: string) => boolean) {}
+  constructor(options: DrainGatewayCallersOptions) {
+    this.hasUndeliveredTimeline = options.hasUndeliveredTimeline;
+    this.refusedDrainMs = options.refusedDrainMs;
+    this.now = options.now ?? Date.now;
+  }
 
   /** Keeps the identities of the agents the shutdown is about to close. */
   retain(agents: readonly McpGatewayAgent[]): void {
     if (this.ended) return;
-    for (const agent of agents) this.retained.set(agent.agentId, { agent, until: "shutdown" });
+    for (const agent of agents) {
+      this.retained.set(agent.agentId, { agent, until: { kind: "shutdown" } });
+    }
   }
 
-  /** Keeps the identity of an agent the session refused, before it closes. */
+  /**
+   * Keeps the identity of an agent the session refused, before it closes, for
+   * `refusedDrainMs`. Each refusal starts its own window with its own token.
+   */
   retainRefused(agent: McpGatewayAgent): void {
-    if (this.ended || this.retained.has(agent.agentId)) return;
-    this.retained.set(agent.agentId, { agent, until: "undelivered" });
+    if (this.ended || this.retained.get(agent.agentId)?.until.kind === "shutdown") return;
+    this.drop(agent.agentId);
+    this.retained.set(agent.agentId, {
+      agent,
+      until: { kind: "undelivered", deadline: this.now() + this.refusedDrainMs },
+    });
   }
 
   /** The daemon-only token for an admitted agent, or null for any other id or after `end`. */
@@ -79,6 +107,19 @@ export class DrainGatewayCallers {
     if (this.ended) return false;
     const retained = this.retained.get(agentId);
     if (!retained) return false;
-    return retained.until === "shutdown" || this.hasUndeliveredTimeline(agentId);
+    if (retained.until.kind === "shutdown") return true;
+    if (this.now() >= retained.until.deadline) {
+      this.drop(agentId);
+      return false;
+    }
+    return this.hasUndeliveredTimeline(agentId);
+  }
+
+  private drop(agentId: string): void {
+    this.retained.delete(agentId);
+    const token = this.tokenByAgent.get(agentId);
+    if (!token) return;
+    this.tokenByAgent.delete(agentId);
+    this.agentByDigest.delete(digest(token));
   }
 }

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   createMcpGatewayHandler,
+  McpGatewayRequests,
   resolveUpstreamUrl,
   type McpGatewayAgent,
   type McpGatewayUpstreamRequest,
@@ -81,6 +82,65 @@ async function startUpstream(handler?: UpstreamHandler): Promise<Upstream> {
   return { url, requests, close };
 }
 
+interface HalfBodyUpstream {
+  url: string;
+  /** The agent of each request whose whole body arrived, in order. */
+  completed: string[];
+  /** Resolved, one per request, when its first bytes arrive. */
+  started: Array<() => void>;
+}
+
+/** An upstream that tells when each request's first bytes arrive, and answers once a body is whole. */
+async function startHalfBodyUpstream(): Promise<HalfBodyUpstream> {
+  const upstream: HalfBodyUpstream = { url: "", completed: [], started: [] };
+  const server = http.createServer((req, res) => {
+    req.once("data", () => upstream.started.shift()?.());
+    req.resume();
+    req.on("end", () => {
+      upstream.completed.push(String(req.headers["x-paseo-agent-id"]));
+      res.end("{}");
+    });
+  });
+  upstream.url = await listen(server);
+  closers.push(closeServer(server));
+  return upstream;
+}
+
+interface HalfRequest {
+  answer: Promise<{ status: number; body: string }>;
+  finish: () => void;
+}
+
+function readAnswer(request: http.ClientRequest): HalfRequest["answer"] {
+  return new Promise((resolve) => {
+    request.on("response", (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () =>
+        resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }),
+      );
+    });
+    request.on("error", () => resolve({ status: 0, body: "" }));
+  });
+}
+
+/** Sends half an MCP request's body and resolves once the upstream has that half. */
+async function openHalfRequest(
+  upstream: HalfBodyUpstream,
+  url: string,
+  token: string,
+): Promise<HalfRequest> {
+  const begun = new Promise<void>((resolve) => upstream.started.push(resolve));
+  const request = http.request(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+  });
+  const answer = readAnswer(request);
+  request.write(MCP_INIT.slice(0, 20));
+  await begun;
+  return { answer, finish: () => request.end(MCP_INIT.slice(20)) };
+}
+
 const AGENTS: Record<string, McpGatewayAgent> = {
   "token-a": { agentId: "agent-a", sessionId: "session-a", workspaceId: "workspace-a" },
   "token-b": { agentId: "agent-b", sessionId: null, workspaceId: null },
@@ -96,6 +156,7 @@ interface GatewayOptions {
   responseTimeoutMs?: number;
   sessionIdentity?: SessionIdentity | null;
   agentRefusal?: (agentId: string) => string | null;
+  requests?: McpGatewayRequests;
 }
 
 async function startGateway(options: GatewayOptions): Promise<string> {
@@ -114,6 +175,7 @@ async function startGateway(options: GatewayOptions): Promise<string> {
       serverId: "server-1",
       sessionIdentity: options.sessionIdentity ?? null,
       agentRefusal: options.agentRefusal,
+      requests: options.requests,
       resolveUpstream: options.resolveUpstream ?? (async (request) => request),
       responseTimeoutMs: options.responseTimeoutMs,
       logger: pino({ level: "silent" }),
@@ -332,6 +394,49 @@ describe("MCP gateway", () => {
       "x-paseo-member": "codex/gpt-6-astra",
       "x-paseo-role": "validator",
     });
+  });
+
+  test("a refusal cuts off the agent's requests already being forwarded, not its drain calls or other agents'", async () => {
+    const upstream = await startHalfBodyUpstream();
+    const refused = new Map<string, string>();
+    const requests = new McpGatewayRequests();
+    const gateway = await startGateway({
+      backends: { cluster: upstream.url },
+      sessionIdentity: SESSION_IDENTITY,
+      agentRefusal: (agentId) => refused.get(agentId) ?? null,
+      requests,
+    });
+    const own = await openHalfRequest(upstream, `${gateway}/cluster`, "token-b");
+    const drain = await openHalfRequest(upstream, `${gateway}/cluster`, "drain-token-b");
+    const other = await openHalfRequest(upstream, `${gateway}/cluster`, "token-a");
+    const refusal =
+      "This session's member is codex/gpt-6-astra. This agent would run codex/gpt-5.4. A different model needs a new session.";
+
+    refused.set("agent-b", refusal);
+    requests.refuse("agent-b", refusal);
+    for (const request of [own, drain, other]) request.finish();
+
+    expect(await own.answer).toEqual({ status: 403, body: JSON.stringify({ error: refusal }) });
+    expect((await drain.answer).status).toBe(200);
+    expect((await other.answer).status).toBe(200);
+    // The cut-off request never completed upstream: for agent-b only the drain call did.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(upstream.completed.sort()).toEqual(["agent-a", "agent-b"]);
+  });
+
+  test("a request that finished before the refusal is not cut off again", async () => {
+    const upstream = await startUpstream();
+    const requests = new McpGatewayRequests();
+    const gateway = await startGateway({ backends: { cluster: upstream.url }, requests });
+
+    const done = await fetch(`${gateway}/cluster`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-a" },
+      body: MCP_INIT,
+    });
+    expect(done.status).toBe(200);
+    requests.refuse("agent-a", "refused");
+    expect(await done.json()).toEqual({ ok: true });
   });
 
   test("forwards nothing for an agent refused while its request waits on the upstream hook", async () => {

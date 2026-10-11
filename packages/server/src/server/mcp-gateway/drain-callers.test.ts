@@ -6,7 +6,10 @@ const refused = { agentId: "agent-2", sessionId: "session-2", workspaceId: "work
 
 /** Callers whose plugins hold undelivered timeline items of the agents in `undelivered`. */
 function callersWithUndelivered(undelivered: Set<string>) {
-  return new DrainGatewayCallers((agentId) => undelivered.has(agentId));
+  return new DrainGatewayCallers({
+    hasUndeliveredTimeline: (agentId) => undelivered.has(agentId),
+    refusedDrainMs: 300_000,
+  });
 }
 
 describe("DrainGatewayCallers", () => {
@@ -76,5 +79,32 @@ describe("DrainGatewayCallers", () => {
     callers.retain([refused]);
 
     expect(callers.resolve(callers.issue("agent-2"))).toEqual({ ...refused, drain: true });
+  });
+
+  test("a refused agent's drain identity ends timelineDrainMs after the refusal, though a plugin never acknowledges", () => {
+    let now = 1_000;
+    const callers = new DrainGatewayCallers({
+      hasUndeliveredTimeline: () => true,
+      refusedDrainMs: 300,
+      now: () => now,
+    });
+    callers.retainRefused(refused);
+    const token = callers.issue("agent-2");
+
+    now += 299;
+    expect(callers.resolve(token)).toEqual({ ...refused, drain: true });
+    expect(callers.issue("agent-2")).toBe(token);
+
+    now += 1;
+    expect(callers.resolve(token)).toBeNull();
+    expect(callers.issue("agent-2")).toBeNull();
+    // The agent refused again later, after a resume, gets a window of its own.
+    callers.retainRefused(refused);
+    const next = callers.issue("agent-2");
+    expect(next).toEqual(expect.any(String));
+    expect(next).not.toBe(token);
+    expect(callers.resolve(token)).toBeNull();
+    now += 300;
+    expect(callers.resolve(next)).toBeNull();
   });
 });

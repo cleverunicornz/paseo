@@ -371,12 +371,14 @@ export interface AgentManagerOptions {
   /**
    * Called when the session refuses an agent for running another model, before
    * it records the refusal or closes the agent, with the identity the agent has
-   * now. Plugins still deliver the agent's timeline items after it closes.
+   * now and the refusal. The gateway's requests in flight for it are cut off,
+   * and plugins still deliver its timeline items after it closes.
    */
-  onSessionMemberRefusal?: (agent: {
+  onSessionMemberRefusal?: (refused: {
     agentId: string;
     sessionId: string | null;
     workspaceId: string | null;
+    refusal: string;
   }) => void;
   beforeSteerUnavailableFallback?: (input: {
     agentId: string;
@@ -4213,6 +4215,7 @@ export class AgentManager {
       agentId: agent.id,
       sessionId: agent.persistence?.sessionId ?? null,
       workspaceId: agent.workspaceId ?? null,
+      refusal: refusal.message,
     });
     this.logger.warn(
       { agentId: agent.id, member: refusal.member, reported: refusal.attempted },
