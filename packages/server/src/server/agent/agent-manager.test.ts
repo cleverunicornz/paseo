@@ -451,7 +451,8 @@ class TestAgentSession implements AgentSession {
   readonly provider = "codex" as const;
   readonly capabilities = TEST_CAPABILITIES;
   readonly id = randomUUID();
-  private runtimeModel: string | null = null;
+  protected runtimeModel: string | null = null;
+  protected runtimeThinkingOptionId: string | null = null;
   private subscribers = new Set<(event: AgentStreamEvent) => void>();
   private turnIdCounter = 0;
   private interrupted = false;
@@ -466,6 +467,9 @@ class TestAgentSession implements AgentSession {
     };
   }
 
+  /** What the runtime reports differently once a turn completes; nothing by default. */
+  protected afterTurn(): void {}
+
   async startTurn(): Promise<{ turnId: string }> {
     this.interrupted = false;
     const turnId = `turn-${++this.turnIdCounter}`;
@@ -473,7 +477,7 @@ class TestAgentSession implements AgentSession {
     setTimeout(() => {
       this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
       this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
-      this.runtimeModel = "gpt-5.2-codex";
+      this.afterTurn();
     }, 0);
     return { turnId };
   }
@@ -503,6 +507,7 @@ class TestAgentSession implements AgentSession {
       sessionId: this.id,
       model: this.runtimeModel ?? this.config.model ?? null,
       modeId: this.config.modeId ?? null,
+      ...(this.runtimeThinkingOptionId ? { thinkingOptionId: this.runtimeThinkingOptionId } : {}),
     };
   }
 
@@ -2869,6 +2874,7 @@ test("createAgent passes daemon launch env through the provider launch context",
       PASEO_AGENT_ID: snapshot.id,
       PASEO_AGENT_CWD: workdir,
     },
+    modelPin: "gpt-5.4",
   });
 });
 
@@ -4640,6 +4646,7 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
       PASEO_AGENT_ID: resumed.id,
       PASEO_AGENT_CWD: workdir,
     },
+    modelPin: "gpt-5.4",
   });
 });
 
@@ -5262,7 +5269,7 @@ test("updateAgentMetadata bumps updatedAt for stored agents", async () => {
   expect(Date.parse(after!.updatedAt)).toBeGreaterThan(Date.parse(before!.updatedAt));
 });
 
-test("persists live mode, model, and thinking changes without an external snapshot subscriber", async () => {
+test("persists live mode, model, and thinking settings without an external snapshot subscriber", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-persist-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -5288,23 +5295,24 @@ test("persists live mode, model, and thinking changes without an external snapsh
   );
 
   await manager.setAgentMode(snapshot.id, "build");
-  await manager.setAgentModel(snapshot.id, "gpt-5.4");
+  // An agent keeps its creation model; selecting it again goes through the same path.
+  await manager.setAgentModel(snapshot.id, "gpt-5.2-codex");
   await manager.setAgentThinkingOption(snapshot.id, "high");
   await manager.flush();
 
   const persisted = await storage.get(snapshot.id);
   expect(persisted).not.toBeNull();
   expect(persisted?.lastModeId).toBe("build");
-  expect(persisted?.config?.model).toBe("gpt-5.4");
+  expect(persisted?.config?.model).toBe("gpt-5.2-codex");
   expect(persisted?.config?.thinkingOptionId).toBe("high");
   expect(persisted?.runtimeInfo?.modeId).toBe("build");
-  expect(persisted?.runtimeInfo?.model).toBe("gpt-5.4");
+  expect(persisted?.runtimeInfo?.model).toBe("gpt-5.2-codex");
 });
 
-test("model changes persist the resolved thinking and fresh provider handle before another turn", async () => {
+test("selecting the model persists the resolved thinking and fresh provider handle before another turn", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-model-selection-"));
   class ModelSession extends TestAgentSession {
-    selection = { model: "source", thinkingOptionId: "medium" as string | undefined };
+    selection = { model: "initial", thinkingOptionId: "medium" as string | undefined };
     async setModel(model: string | null) {
       this.selection = { model: model ?? "default", thinkingOptionId: undefined };
       this.pushEvent({
@@ -5334,12 +5342,13 @@ test("model changes persist the resolved thinking and fresh provider handle befo
       undefined,
       { workspaceId: undefined },
     );
-    await manager.setAgentModel(agent.id, "target");
+    // Selecting the agent's own model again resets its thinking, as a provider may.
+    await manager.setAgentModel(agent.id, "source");
     await manager.flush();
     const stored = await storage.get(agent.id);
-    expect(stored?.config?.model).toBe("target");
+    expect(stored?.config?.model).toBe("source");
     expect(stored?.config?.thinkingOptionId).toBeUndefined();
-    expect(stored?.persistence?.metadata?.model).toBe("target");
+    expect(stored?.persistence?.metadata?.model).toBe("source");
     expect(stored?.persistence?.metadata?.thinkingOptionId).toBeUndefined();
   } finally {
     for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
@@ -5388,7 +5397,7 @@ test("later explicit config mutations win over events emitted by earlier mutatio
     { workspaceId: undefined },
   );
 
-  await manager.setAgentModel(snapshot.id, "gpt-5.4");
+  await manager.setAgentModel(snapshot.id, "gpt-5.2-codex");
   await manager.setAgentThinkingOption(snapshot.id, "high");
   await manager.flush();
 
@@ -5536,7 +5545,8 @@ test("session config drift events update state through the stream channel", asyn
     runtimeInfo: {
       provider: "codex",
       sessionId: capturedSession.id,
-      model: "gpt-5.4",
+      // The agent's own model: a report of another one would stop it.
+      model: "gpt-5.2-codex",
       modeId: "build",
       thinkingOptionId: "low",
     },
@@ -5556,7 +5566,7 @@ test("session config drift events update state through the stream channel", asyn
     { id: "build", label: "Build" },
   ]);
   expect(agent?.runtimeInfo).toMatchObject({
-    model: "gpt-5.4",
+    model: "gpt-5.2-codex",
     modeId: "build",
     thinkingOptionId: "high",
   });
@@ -6756,9 +6766,19 @@ test("runAgent refreshes runtimeInfo after completion", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
+  class ThinkingSession extends TestAgentSession {
+    protected override afterTurn(): void {
+      this.runtimeThinkingOptionId = "high";
+    }
+  }
+  class ThinkingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new ThinkingSession(config);
+    }
+  }
   const manager = new AgentManager({
     clients: {
-      codex: new TestAgentClient(),
+      codex: new ThinkingClient(),
     },
     registry: storage,
     logger,
@@ -6774,12 +6794,54 @@ test("runAgent refreshes runtimeInfo after completion", async () => {
     { workspaceId: undefined },
   );
 
-  expect(snapshot.runtimeInfo?.model).toBe("gpt-5.4");
+  expect(snapshot.runtimeInfo?.thinkingOptionId).toBeUndefined();
 
   await manager.runAgent(snapshot.id, "hello");
 
   const refreshed = manager.getAgent(snapshot.id);
-  expect(refreshed?.runtimeInfo?.model).toBe("gpt-5.2-codex");
+  expect(refreshed?.runtimeInfo?.thinkingOptionId).toBe("high");
+});
+
+test("outside session mode an agent whose runtime reports another model after a turn is stopped", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class SwitchingSession extends TestAgentSession {
+    protected override afterTurn(): void {
+      this.runtimeModel = "gpt-5.2-codex";
+    }
+  }
+  class SwitchingClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new SwitchingSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new SwitchingClient() },
+    registry: storage,
+    logger,
+  });
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    expect(snapshot.creationModel).toBe("gpt-5.4");
+
+    await manager.runAgent(snapshot.id, "hello").catch(() => undefined);
+
+    const refusal =
+      "This agent's model is gpt-5.4. This agent would run gpt-5.2-codex. A different model needs a new session.";
+    await vi.waitFor(() => expect(manager.getAgent(snapshot.id)).toBeNull());
+    expect(manager.getSessionMemberRefusal(snapshot.id)).toBe(refusal);
+    await vi.waitFor(async () =>
+      expect(await storage.get(snapshot.id)).toMatchObject({
+        lastStatus: "closed",
+        lastError: refusal,
+        creationModel: "gpt-5.4",
+      }),
+    );
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("waitForAgentEvent does not resolve idle until foreground turn is finalized", async () => {
@@ -11927,7 +11989,7 @@ test("in session mode an agent launches, switches and reloads only as the sessio
   }
 });
 
-test("outside session mode an agent launches and switches to any model", async () => {
+test("outside session mode an agent launches on any model, then keeps it", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-no-session-member-"));
   const manager = new AgentManager({
     clients: { codex: new TestAgentClient("codex"), claude: new TestAgentClient("claude") },
@@ -11944,10 +12006,21 @@ test("outside session mode an agent launches and switches to any model", async (
       undefined,
       { workspaceId: undefined },
     );
-    await manager.setAgentModel(agent.id, "gpt-5.2-codex");
-    expect(manager.getAgent(agent.id)?.config.model).toBe("gpt-5.2-codex");
-    const reloaded = await manager.reloadAgentSession(agent.id, { model: "gpt-5.4" });
-    expect(reloaded.config.model).toBe("gpt-5.4");
+    const refusal = (attempted: string) =>
+      `This agent's model is gpt-5.4-mini. This agent would run ${attempted}. A different model needs a new session.`;
+    await expect(manager.setAgentModel(agent.id, "gpt-5.2-codex")).rejects.toThrow(
+      refusal("gpt-5.2-codex"),
+    );
+    await expect(manager.reloadAgentSession(agent.id, { model: "gpt-5.4" })).rejects.toThrow(
+      refusal("gpt-5.4"),
+    );
+    expect(manager.getAgent(agent.id)).toMatchObject({
+      lifecycle: "idle",
+      creationModel: "gpt-5.4-mini",
+      config: { model: "gpt-5.4-mini" },
+    });
+    const reloaded = await manager.reloadAgentSession(agent.id);
+    expect(reloaded.config.model).toBe("gpt-5.4-mini");
   } finally {
     for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
     rmSync(workdir, { recursive: true, force: true });

@@ -199,6 +199,14 @@ function storedCreationModel(record: StoredAgentRecord): string | null {
   return record.creationModel ?? record.config?.model ?? null;
 }
 
+/** A known agent's recorded creation model; a new agent's is the model it starts on. */
+function registeredCreationModel(
+  known: string | null | undefined,
+  config: AgentSessionConfig,
+): string | null {
+  return known ?? config.model ?? null;
+}
+
 /**
  * The model a resumed session was created with: its agent's record's, else the
  * model its persistence handle recorded, or null when neither says.
@@ -928,14 +936,29 @@ export class AgentManager {
    * another, before an operation changes anything. Session mode holds agents
    * to its member instead.
    */
-  private assertKeepsCreationModel(creationModel: string | null, model: string | null | undefined): void {
+  private assertKeepsCreationModel(
+    creationModel: string | null,
+    model: string | null | undefined,
+  ): void {
     if (this.sessionMemberGate) return;
     const refusal = modelPinRefusal(creationModel, model);
     if (refusal) throw refusal;
   }
 
+  /** A reload that names a model is held to the agent's creation model; one that names none keeps it. */
+  private assertReloadKeepsCreationModel(
+    agent: ManagedAgent,
+    overrides: Partial<AgentSessionConfig> | undefined,
+  ): void {
+    if (overrides?.model === undefined) return;
+    this.assertKeepsCreationModel(agent.creationModel, overrides.model);
+  }
+
   /** Outside session mode, a launch of an agent with a known creation model runs only that model. */
-  private pinLaunchModel(context: AgentLaunchContext, creationModel: string | null | undefined): void {
+  private pinLaunchModel(
+    context: AgentLaunchContext,
+    creationModel: string | null | undefined,
+  ): void {
     if (this.sessionMemberGate || !creationModel) return;
     context.modelPin = creationModel;
   }
@@ -1817,9 +1840,7 @@ export class AgentManager {
     let existing = this.requireSessionAgent(agentId);
     const checkedOverrides = await this.checkReloadSessionMember(existing, overrides);
     // Nor may a reload onto another model than the agent was created with.
-    if (checkedOverrides?.model !== undefined) {
-      this.assertKeepsCreationModel(existing.creationModel, checkedOverrides.model);
-    }
+    this.assertReloadKeepsCreationModel(existing, checkedOverrides);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
@@ -3982,7 +4003,7 @@ export class AgentManager {
       session,
       capabilities: session.capabilities,
       config,
-      creationModel: options?.creationModel ?? config.model ?? null,
+      creationModel: registeredCreationModel(options?.creationModel, config),
       runtimeInfo: undefined,
       lifecycle: "initializing",
       createdAt: options?.createdAt ?? now,

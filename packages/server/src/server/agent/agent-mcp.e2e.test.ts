@@ -2385,9 +2385,13 @@ describe("console daemon: an agent keeps the model it was created with (outside 
 
         await vi.waitFor(() => expect(host.manager.getAgent(agent.id)).toBeNull());
         expect(host.manager.getSessionMemberRefusal(agent.id)).toBe(refusal);
-        expect(await host.daemon.agentStorage.get(agent.id)).toMatchObject({
-          lastError: refusal,
-        });
+        // Closing drops the live agent before it writes the closed record.
+        await vi.waitFor(async () =>
+          expect(await host.daemon.agentStorage.get(agent.id)).toMatchObject({
+            lastStatus: "closed",
+            lastError: refusal,
+          }),
+        );
       } finally {
         await host.close();
       }
