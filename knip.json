@@ -54,10 +54,6 @@
       "entry": ["src/index.ts", "src/e2ee.ts", "src/cloudflare-adapter.ts", "src/**/*.test.ts"],
       "project": ["src/**/*.ts"]
     },
-    "packages/desktop": {
-      "entry": ["src/main.ts", "src/preload.ts", "src/**/*.test.ts"],
-      "project": ["src/**/*.ts"]
-    },
     "packages/highlight": {
       "entry": ["src/index.ts", "src/**/*.test.ts"],
       "project": ["src/**/*.ts"]
