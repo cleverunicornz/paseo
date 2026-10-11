@@ -605,3 +605,67 @@ test("an agent the session stopped for running another model still has its timel
 
   expect(await shutDown(running)).toMatchObject({ timelineDrain: { status: "drained" } });
 }, 60_000);
+
+test("a plugin's calls for an agent the session stopped end timelineDrainMs after the refusal, though it never acknowledges", async () => {
+  await writeRetryingRecorder();
+  const claude = new ClaudeAgentClient({
+    logger: pino({ level: "silent" }),
+    resolveBinary: async () => "/fixture/claude",
+    queryFactory: claudeQueryOpusThenSonnet() as never,
+  });
+  const agentClients = createTestAgentClients();
+  agentClients.claude!.createSession = claude.createSession.bind(claude);
+  const running = await startDaemon({
+    agentClients,
+    sessionRuntime: {
+      ...DEFAULT_SESSION_RUNTIME_CONFIG,
+      timelineDrainMs: 1_000,
+      identity: { member: "claude/claude-opus-5-5", role: "implementer" },
+    },
+  });
+  const client = await connectClient(running);
+  const manager = running.daemon.agentManager;
+  try {
+    await client.patchDaemonConfig({ pluginsEnabled: true });
+    await client.installDirectoryPlugin(directory);
+    const agent = await manager.createAgent(
+      { provider: "claude", cwd: directory, model: "claude-opus-5-5" },
+      undefined,
+      { workspaceId: undefined },
+    );
+
+    // The recorder's backend never comes back, so nothing is ever acknowledged.
+    backend.down = true;
+    await manager.runAgent(agent.id, "reply OK");
+    await expect(manager.runAgent(agent.id, "reply OK again")).rejects.toThrow(SONNET_REFUSAL);
+    const refusedAt = Date.now();
+    await expect.poll(() => manager.getAgent(agent.id)).toBeNull();
+    const failures = async () =>
+      (await readLogged()).flatMap((entry) =>
+        typeof entry.failed === "number" ? [String(entry.error)] : [],
+      );
+    // Within the window the recorder still reaches the gateway as the agent.
+    await expect.poll(async () => (await failures()).length).toBeGreaterThan(1);
+    expect(Date.now() - refusedAt).toBeLessThan(1_000);
+    expect((await failures()).some((error) => error.includes("No live agent"))).toBe(false);
+
+    // Once timelineDrainMs has passed since the refusal, an offer again is refused at once.
+    await expect
+      .poll(
+        async () => {
+          await fetch(`http://127.0.0.1:${running.port}/api/stop-readiness`);
+          return (await failures()).some((error) => error.includes(`No live agent ${agent.id}`));
+        },
+        { timeout: 15_000, interval: 500 },
+      )
+      .toBe(true);
+    const forwarded = backend.recorded.length;
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    await fetch(`http://127.0.0.1:${running.port}/api/stop-readiness`);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(backend.recorded).toHaveLength(forwarded);
+  } finally {
+    await client.close();
+  }
+  await shutDown(running);
+}, 60_000);

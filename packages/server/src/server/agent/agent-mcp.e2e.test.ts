@@ -14,7 +14,10 @@ import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { DEFAULT_SESSION_RUNTIME_CONFIG } from "../session-runtime-config.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { ClaudeAgentClient } from "./providers/claude/agent.js";
+import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
+import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -448,6 +451,233 @@ function claudeQueryAnsweringTurns(
         return this;
       },
     };
+  };
+}
+
+/** A Claude Code query the test feeds frame by frame. */
+function claudeFrameQueue() {
+  const frames: Array<Record<string, unknown>> = [];
+  const state = { closed: false, wake: null as (() => void) | null };
+  const close = () => {
+    state.closed = true;
+    state.wake?.();
+  };
+  return {
+    push(frame: Record<string, unknown>) {
+      frames.push(frame);
+      state.wake?.();
+    },
+    next: async (): Promise<IteratorResult<Record<string, unknown>>> => {
+      while (!state.closed && frames.length === 0) {
+        await new Promise<void>((resolve) => {
+          state.wake = resolve;
+        });
+      }
+      const frame = frames.shift();
+      return frame ? { done: false, value: frame } : { done: true, value: undefined };
+    },
+    return: async () => {
+      close();
+      return { done: true, value: undefined };
+    },
+    interrupt: async () => close(),
+    close,
+    applyFlagSettings: async () => undefined,
+    setPermissionMode: async () => undefined,
+    setModel: async () => undefined,
+    supportedModels: async () => [],
+    supportedCommands: async () => [],
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+}
+
+type ModelReportKind =
+  | { provider: "claude"; kind: ClaudeModelReport }
+  | { provider: "codex"; kind: "model/rerouted" | "thread/settings/updated" };
+
+interface BackendCall {
+  /** The whole request body reached the backend, so its tool ran. */
+  ranAfterRefusal: boolean | null;
+}
+
+/**
+ * A daemon in session mode whose one agent runs the real Claude or Codex
+ * adapter on its member, with a `fixture` gateway backend that records when
+ * each tool request's body completes. With `holdResponses`, the backend
+ * answers only when `releaseResponses` is called.
+ */
+async function startReportingSession(provider: "claude" | "codex") {
+  const member = provider === "claude" ? "claude-opus-5-5" : "gpt-6-astra";
+  const switched = provider === "claude" ? "claude-sonnet-5-5" : "gpt-5.4";
+  const queue = claudeFrameQueue();
+  const appServer =
+    provider === "codex"
+      ? createFakeCodexAppServer({
+          "thread/loaded/list": () => ({ data: ["thread-1"] }),
+          "thread/unsubscribe": () => ({}),
+          "turn/interrupt": () => ({}),
+        })
+      : null;
+  const clients = createTestAgentClients({ supportsMcpServers: true });
+  if (appServer) {
+    clients.codex!.createSession = async (config, context) =>
+      new CodexAppServerAgentSession(
+        config,
+        null,
+        pino({ level: "silent" }),
+        async () => appServer.child,
+        {},
+        false,
+        false,
+        false,
+        context?.agentId,
+      );
+  } else {
+    const claude = new ClaudeAgentClient({
+      logger: pino({ level: "silent" }),
+      resolveBinary: async () => "/fixture/claude",
+      queryFactory: (() => queue) as never,
+    });
+    clients.claude!.createSession = claude.createSession.bind(claude);
+  }
+
+  const calls: BackendCall[] = [];
+  const arrived: Array<() => void> = [];
+  const held: Array<() => void> = [];
+  let holdResponses = false;
+  let refused = () => false;
+  const backend = http.createServer((req, res) => {
+    const call: BackendCall = { ranAfterRefusal: null };
+    calls.push(call);
+    req.once("data", () => arrived.shift()?.());
+    req.resume();
+    req.on("end", () => {
+      call.ranAfterRefusal = refused();
+      const answer = () => res.end('{"jsonrpc":"2.0","id":1,"result":{}}');
+      if (holdResponses) held.push(answer);
+      else answer();
+    });
+  });
+  await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+  const backendPort = (backend.address() as net.AddressInfo).port;
+  const running = await createTestPaseoDaemon({
+    agentClients: clients,
+    mcpGatewayBackends: { fixture: { url: `http://127.0.0.1:${backendPort}/mcp` } },
+    sessionRuntime: {
+      ...DEFAULT_SESSION_RUNTIME_CONFIG,
+      timelineDrainMs: 200,
+      identity: { member: `${provider}/${member}`, role: "implementer" },
+    },
+  });
+  const manager = running.daemon.agentManager;
+  const agent = await manager.createAgent(
+    {
+      provider,
+      cwd: running.paseoHome,
+      model: member,
+      ...(provider === "codex" ? { modeId: "full-access" } : {}),
+    },
+    undefined,
+    { workspaceId: undefined },
+  );
+  refused = () => manager.getSessionMemberRefusal(agent.id) !== null;
+  const token = manager.issueAgentToken(agent.id);
+  const url = `http://127.0.0.1:${running.port}/mcp/backends/fixture`;
+
+  return {
+    manager,
+    agent,
+    calls,
+    refusal: `This session's member is ${provider}/${member}. This agent would run ${provider}/${switched}. A different model needs a new session.`,
+    /** Starts a turn and waits until the harness runs it on the member. */
+    startTurn: async () => {
+      const turn = manager.runAgent(agent.id, "read two things").then(
+        () => null,
+        (error: Error) => error.message,
+      );
+      if (appServer) {
+        await appServer.waitForTurnStart();
+        appServer.startsTurn({ threadId: "thread-1", turnId: "turn-1" });
+      } else {
+        queue.push({
+          type: "system",
+          subtype: "init",
+          session_id: "fixture-claude",
+          permissionMode: "default",
+          model: member,
+        });
+      }
+      // Wrapped, so awaiting the start does not wait for the turn.
+      return { ended: turn };
+    },
+    /** The harness reports the switched model the way `kind` does. */
+    report: (kind: ModelReportKind["kind"]) => {
+      const shared = { session_id: "fixture-claude", parent_tool_use_id: null };
+      if (kind === "init") {
+        queue.push({ ...shared, type: "system", subtype: "init", model: switched });
+      } else if (kind === "message_start") {
+        queue.push({
+          ...shared,
+          type: "stream_event",
+          event: { type: "message_start", message: { id: "msg-switch", model: switched } },
+        });
+      } else if (kind === "assistant") {
+        queue.push({
+          ...shared,
+          type: "assistant",
+          message: { id: "msg-switch", model: switched, content: [{ type: "text", text: "OK" }] },
+        });
+      } else {
+        const params =
+          kind === "model/rerouted"
+            ? { threadId: "thread-1", turnId: "turn-1", fromModel: member, toModel: switched }
+            : {
+                threadId: "thread-1",
+                threadSettings: { model: switched, modelProvider: "openai" },
+              };
+        appServer!.child.stdout.write(`${JSON.stringify({ method: kind, params })}\n`);
+      }
+    },
+    /** Tool requests whose whole body reached the backend before the refusal. */
+    completedBeforeRefusal: () => calls.filter((call) => call.ranAfterRefusal === false).length,
+    holdResponses: () => {
+      holdResponses = true;
+    },
+    releaseResponses: () => {
+      for (const answer of held.splice(0)) answer();
+    },
+    /**
+     * Opens a tool request as the agent's harness and resolves once the backend
+     * received its first bytes: the body's first half, or all of it.
+     */
+    openToolRequest: async (body: "streamed" | "complete") => {
+      const payload = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pr_read"}}';
+      const reachedBackend = new Promise<void>((resolve) => arrived.push(resolve));
+      const request = http.request(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+      });
+      const status = new Promise<number>((resolve) => {
+        request.on("response", (response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        });
+        // A request cut off with no answer has no status.
+        request.on("error", () => resolve(0));
+      });
+      if (body === "complete") request.end(payload);
+      else request.write(payload.slice(0, 40));
+      await reachedBackend;
+      return { status, finish: () => request.end(payload.slice(40)) };
+    },
+    close: async () => {
+      queue.close();
+      await running.close();
+      backend.closeAllConnections();
+      await new Promise<void>((resolve) => backend.close(() => resolve()));
+    },
   };
 }
 
@@ -1642,6 +1872,71 @@ describe("agent MCP end-to-end (offline)", () => {
         expect([401, 403]).toContain((await session.callGatewayAsAgent()).status);
         expect(session.seen).toHaveLength(1);
         expect(session.launches).toEqual(["claude-opus-5-5"]);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  const MODEL_REPORT_KINDS: ModelReportKind[] = [
+    { provider: "claude", kind: "init" },
+    { provider: "claude", kind: "message_start" },
+    { provider: "claude", kind: "assistant" },
+    { provider: "codex", kind: "model/rerouted" },
+    { provider: "codex", kind: "thread/settings/updated" },
+  ];
+
+  test.each(MODEL_REPORT_KINDS)(
+    "in session mode tool requests a $provider agent streamed before its $kind report are cut off at the refusal",
+    async ({ provider, kind }) => {
+      // The harness already sent two tool requests of the switched turn, each with
+      // part of its body, when the daemon reads the report of the other model.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        const requests = [
+          await session.openToolRequest("streamed"),
+          await session.openToolRequest("streamed"),
+        ];
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        for (const request of requests) request.finish();
+
+        expect(await Promise.all(requests.map((request) => request.status))).toEqual([403, 403]);
+        expect(await turn.ended).toBe(session.refusal);
+        // Neither body ever completed at the backend, so neither tool ran.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(session.calls).toEqual([{ ranAfterRefusal: null }, { ranAfterRefusal: null }]);
+      } finally {
+        await session.close();
+      }
+    },
+    30_000,
+  );
+
+  test.each(MODEL_REPORT_KINDS)(
+    "in session mode tool requests a $provider agent completed before its $kind report get the refusal, not the backend's answer",
+    async ({ provider, kind }) => {
+      // The backend has both whole requests but has not answered when the report arrives.
+      const session = await startReportingSession(provider);
+      try {
+        const turn = await session.startTurn();
+        session.holdResponses();
+        const requests = [
+          await session.openToolRequest("complete"),
+          await session.openToolRequest("complete"),
+        ];
+        await vi.waitFor(() => expect(session.completedBeforeRefusal()).toBe(2));
+
+        session.report(kind);
+        await vi.waitFor(() => expect(session.manager.getAgent(session.agent.id)).toBeNull());
+        session.releaseResponses();
+
+        expect(await Promise.all(requests.map((request) => request.status))).toEqual([403, 403]);
+        expect(await turn.ended).toBe(session.refusal);
+        expect(session.calls).toEqual([{ ranAfterRefusal: false }, { ranAfterRefusal: false }]);
       } finally {
         await session.close();
       }
