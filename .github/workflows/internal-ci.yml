@@ -108,6 +108,39 @@ jobs:
           sha512sum *.tgz > SHA512SUMS
           printf '%s\n' "$GITHUB_SHA" > SOURCE_COMMIT
           node --version > NODE_VERSION
+      - name: Install the release packages as the session image does
+        # As runner-images images/repo-pod/install-paseo-release.sh: the seven packages in one
+        # global install, each at the packages' version, the CLI resolving the installed server.
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./packages/server/package.json").version')"
+          image="$RUNNER_TEMP/paseo-image"
+          (cd "$RUNNER_TEMP/paseo-release" && sha256sum --check SHA256SUMS)
+          npm install --global --prefix "$image" --no-audit --no-fund "$RUNNER_TEMP/paseo-release/"*.tgz
+          node --input-type=module - "$image/lib/node_modules" "$version" <<'JS'
+          import assert from "node:assert/strict";
+          import fs from "node:fs";
+          import path from "node:path";
+          import { createRequire } from "node:module";
+          const [root, version] = process.argv.slice(2);
+          for (const name of ["highlight", "relay", "protocol", "client", "plugin", "server", "cli"]) {
+            const pkg = JSON.parse(fs.readFileSync(path.join(root, "@getpaseo", name, "package.json"), "utf8"));
+            assert.equal(pkg.version, version, `@getpaseo/${name}`);
+          }
+          const fromCli = createRequire(path.join(root, "@getpaseo/cli/package.json"));
+          assert.equal(
+            fs.realpathSync(fromCli.resolve("@getpaseo/server")),
+            fs.realpathSync(path.join(root, "@getpaseo/server/dist/server/server/exports.js")),
+          );
+          JS
+          test "$("$image/bin/paseo" --version)" = "$version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paseo-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/paseo-release
+          retention-days: 7
+          if-no-files-found: error
       - name: Publish source-qualified release
         if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
         env:
@@ -165,3 +198,37 @@ jobs:
           done
           cd packages/server
           PLAYWRIGHT_WS_ENDPOINT=ws://127.0.0.1:39123/ npx vitest run src/server/web-base-path.browser.e2e.test.ts --maxWorkers=1
+
+  server-unit:
+    # The whole server unit suite, beyond the daemon job's list; e2e files stay there.
+    runs-on: { group: ci, labels: build-native }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install verified Node 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --output /tmp/paseo-node.tar.xz https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+          echo 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de  /tmp/paseo-node.tar.xz' | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/paseo-node"
+          tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
+          echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Install the CLIs the unit tests resolve
+        # Claude Code and Codex on PATH, pinned, and the GitHub CLI, as upstream's runners have them.
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/clis" --no-audit --no-fund --no-save @anthropic-ai/claude-code@2.1.296 @openai/codex@0.159.2
+          bin="$RUNNER_TEMP/clis/node_modules/.bin"
+          test "$("$bin/claude" --version)" = "2.1.296 (Claude Code)"
+          test "$("$bin/codex" --version)" = "codex-cli 0.159.2"
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "PASEO_TEST_CODEX_BIN=$bin/codex" >> "$GITHUB_ENV"
+          command -v gh >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q gh; }
+          command -v rg >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q ripgrep; }
+      - name: Build server dependencies
+        run: npm run build:server-deps
+      - name: Run the whole server unit suite
+        run: npm run test:unit --workspace=@getpaseo/server -- --maxWorkers=6

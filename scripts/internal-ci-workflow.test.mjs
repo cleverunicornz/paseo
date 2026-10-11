@@ -90,3 +90,30 @@ test("a candidate lane publishes a prerelease; internal/main publishes as before
   );
   assert.ok(stepIndex("Pack release packages") < stepIndex("Publish source-qualified release"));
 });
+
+test("the packed release installs the way the session image installs it, before anything is published", () => {
+  const install = step("Install the release packages as the session image does");
+  assert.match(install.text, /npm install --global --prefix "\$image" --no-audit --no-fund/);
+  assert.match(install.text, /test "\$\("\$image\/bin\/paseo" --version\)" = "\$version"/);
+  assert.ok(
+    stepIndex("Pack release packages") <
+      stepIndex("Install the release packages as the session image does"),
+  );
+  assert.ok(
+    stepIndex("Install the release packages as the session image does") <
+      stepIndex("Publish source-qualified release"),
+  );
+});
+
+test("the whole server unit suite runs on every run, with the CLIs its tests resolve", () => {
+  const unit = jobSteps("server-unit");
+  const run = unit.find((entry) => entry.name === "Run the whole server unit suite");
+  assert.ok(run, "step Run the whole server unit suite");
+  assert.match(run.text, /npm run test:unit --workspace=@getpaseo\/server/);
+  assert.doesNotMatch(run.text, /\n {8}if:/);
+  const tools = unit.find((entry) => entry.name === "Install the CLIs the unit tests resolve");
+  assert.ok(tools, "step Install the CLIs the unit tests resolve");
+  assert.match(tools.text, /@anthropic-ai\/claude-code@\d+\.\d+\.\d+/);
+  assert.match(tools.text, /@openai\/codex@\d+\.\d+\.\d+/);
+  assert.match(tools.text, /command -v gh/);
+});
