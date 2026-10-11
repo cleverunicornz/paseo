@@ -155,6 +155,10 @@ export function normalizeClaudeRuntimeModelId(value: string | null | undefined):
  */
 const CLAUDE_PLACEHOLDER_MODEL_IDS = new Set(["<synthetic>"]);
 
+export function isClaudePlaceholderModelId(value: string): boolean {
+  return CLAUDE_PLACEHOLDER_MODEL_IDS.has(value);
+}
+
 /**
  * Resolve a model id observed on a Claude assistant frame, for display.
  *

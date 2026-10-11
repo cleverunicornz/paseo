@@ -153,6 +153,7 @@ import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 import { assertModelPin } from "../../model-pin.js";
+import { pinnedRuntimeModel } from "./pinned-runtime-model.js";
 
 const fsPromises = promises;
 const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
@@ -4693,9 +4694,7 @@ class ClaudeAgentSession implements AgentSession {
    * rather than at turn completion. Placeholders such as `<synthetic>` report nothing.
    */
   private observeRuntimeModel(reported: unknown, events: AgentStreamEvent[]): void {
-    const normalized = this.inPinnedSpelling(
-      typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null,
-    );
+    const normalized = this.reportedRuntimeModel(reported);
     if (!normalized || normalized === this.lastOptionsModel) return;
     this.lastOptionsModel = normalized;
     this.lastRuntimeModel = reported as string;
@@ -4704,16 +4703,15 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
-   * A runtime model that names the same manifest model as the pinned one, such
-   * as `claude-fable-5` for the retired `claude-fable-5[1m]`, in the pinned
-   * spelling: the daemon holds the agent to the model it was created with and
-   * must not read a respelling as a switch. Unpinned sessions, session mode's
-   * among them, report the normalized model as before.
+   * The model a runtime frame reports. A pinned session compares the reported
+   * ID exactly, with only the listed spellings of its pin (see
+   * pinned-runtime-model.ts), so a model the manifest does not know, or one
+   * that merely normalises to the pin, still reads as a switch. An unpinned
+   * session, session mode's among them, reports the normalised model.
    */
-  private inPinnedSpelling(normalized: string | null): string | null {
-    const pin = this.modelPin;
-    if (!normalized || !pin) return normalized;
-    return normalizeClaudeRuntimeModelId(pin) === normalized ? pin : normalized;
+  private reportedRuntimeModel(reported: unknown): string | null {
+    if (this.modelPin !== undefined) return pinnedRuntimeModel(this.modelPin, reported);
+    return typeof reported === "string" ? normalizeClaudeRuntimeModelId(reported) : null;
   }
 
   private pushModelChanged(events: AgentStreamEvent[]): void {
@@ -4772,9 +4770,7 @@ class ClaudeAgentSession implements AgentSession {
     }
     this.persistence = null;
     if (message.model) {
-      const normalizedRuntimeModel = this.inPinnedSpelling(
-        normalizeClaudeRuntimeModelId(message.model),
-      );
+      const normalizedRuntimeModel = this.reportedRuntimeModel(message.model);
       this.logger.debug(
         { runtimeModel: message.model, normalizedRuntimeModel },
         "Captured runtime model from SDK init",

@@ -945,13 +945,21 @@ export class AgentManager {
     if (refusal) throw refusal;
   }
 
-  /** A reload that names a model is held to the agent's creation model; one that names none keeps it. */
-  private assertReloadKeepsCreationModel(
+  /**
+   * Outside session mode, a reload that names another model than the agent was
+   * created with is refused, and one that names none, an undefined `model`
+   * included, launches the creation model rather than a provider default.
+   */
+  private keepCreationModelOnReload(
     agent: ManagedAgent,
     overrides: Partial<AgentSessionConfig> | undefined,
-  ): void {
-    if (overrides?.model === undefined) return;
-    this.assertKeepsCreationModel(agent.creationModel, overrides.model);
+  ): Partial<AgentSessionConfig> | undefined {
+    if (this.sessionMemberGate) return overrides;
+    if (overrides?.model !== undefined) {
+      this.assertKeepsCreationModel(agent.creationModel, overrides.model);
+    }
+    if (!agent.creationModel) return overrides;
+    return { ...overrides, model: overrides?.model ?? agent.creationModel };
   }
 
   /** Outside session mode, a launch of an agent with a known creation model runs only that model. */
@@ -1838,9 +1846,11 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
-    const checkedOverrides = await this.checkReloadSessionMember(existing, overrides);
     // Nor may a reload onto another model than the agent was created with.
-    this.assertReloadKeepsCreationModel(existing, checkedOverrides);
+    const checkedOverrides = this.keepCreationModelOnReload(
+      existing,
+      await this.checkReloadSessionMember(existing, overrides),
+    );
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
@@ -2275,15 +2285,18 @@ export class AgentManager {
         ? ((await this.resolveDefaultModelId({ ...agent.config, model: undefined })) ?? null)
         : null);
     this.assertKeepsCreationModel(agent.creationModel, requestedModel);
+    // Outside session mode the session is told the model that was checked, which a
+    // pinned adapter compares with its pin; session mode passes the selection as before.
+    const selectedModel = this.sessionMemberGate ? normalizedModelId : requestedModel;
 
     if (agent.session.setModel) {
-      await agent.session.setModel(normalizedModelId);
+      await agent.session.setModel(selectedModel);
     }
     await this.drainSessionEvents(agentId);
 
-    agent.config.model = normalizedModelId ?? undefined;
+    agent.config.model = selectedModel ?? undefined;
     if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, model: normalizedModelId };
+      agent.runtimeInfo = { ...agent.runtimeInfo, model: selectedModel };
     }
     this.refreshSessionPersistence(agent);
     this.touchUpdatedAt(agent);
