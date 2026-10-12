@@ -5,6 +5,8 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { ProviderRuntimeSettings } from "@getpaseo/protocol/provider-config";
+import { z } from "zod";
+import type { PaseoToolCatalog, PaseoToolDefinition } from "../tools/types.js";
 import { ClaudeAgentClient } from "./claude/agent.js";
 import { CodexAppServerAgentClient } from "./codex-app-server-agent.js";
 
@@ -75,14 +77,22 @@ async function launchClaude(runtimeSettings?: ProviderRuntimeSettings): Promise<
   return JSON.parse(readFileSync(recordPath, "utf8")) as ClaudeLaunch;
 }
 
-/** A stand-in Codex app server that records its argv and answers every request. */
-function createRecordingCodexAppServer(root: string): { script: string; recordPath: string } {
+/**
+ * A stand-in Codex app server that records its argv, every request and every answer to its own requests, and
+ * answers every request. With `toolCall`, it asks the client to run that dynamic tool once a turn starts.
+ */
+function createRecordingCodexAppServer(
+  root: string,
+  toolCall?: { namespace: string; tool: string; arguments: unknown },
+): { script: string; recordPath: string } {
   const recordPath = join(root, "codex.jsonl");
   const script = join(root, "fake-codex-app-server.cjs");
   writeFileSync(
     script,
     `const fs = require("node:fs");
-fs.appendFileSync(${JSON.stringify(recordPath)}, JSON.stringify({ argv: process.argv.slice(2) }) + "\\n");
+const record = (entry) => fs.appendFileSync(${JSON.stringify(recordPath)}, JSON.stringify(entry) + "\\n");
+const toolCall = ${JSON.stringify(toolCall ?? null)};
+record({ argv: process.argv.slice(2) });
 let buffer = "";
 function resultFor(method) {
   if (method === "thread/start") return { thread: { id: "thread-1" } };
@@ -101,8 +111,17 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     if (!line) continue;
     const message = JSON.parse(line);
+    if (message.method === undefined) {
+      record({ answer: message });
+      continue;
+    }
+    record({ request: { method: message.method, params: message.params } });
     if (message.id !== undefined) {
       process.stdout.write(JSON.stringify({ id: message.id, result: resultFor(message.method) }) + "\\n");
+    }
+    if (message.method === "turn/start" && toolCall) {
+      const params = { threadId: "thread-1", turnId: "turn-1", callId: "call-1", ...toolCall };
+      process.stdout.write(JSON.stringify({ id: "server-1", method: "item/tool/call", params }) + "\\n");
     }
   }
 });
@@ -111,31 +130,106 @@ process.stdin.on("data", (chunk) => {
   return { script, recordPath };
 }
 
-async function launchCodexArgv(
+interface CodexRecord {
+  argv?: string[];
+  request?: { method: string; params?: Record<string, unknown> };
+  answer?: { id?: unknown; result?: unknown; error?: unknown };
+}
+
+interface CodexLaunch {
+  /** The argv of every app server the session started. */
+  launches: string[][];
+  requests: Array<{ method: string; params?: Record<string, unknown> }>;
+  answers: Array<{ id?: unknown; result?: unknown; error?: unknown }>;
+}
+
+function readCodexRecords(recordPath: string): CodexRecord[] {
+  return readFileSync(recordPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as CodexRecord);
+}
+
+async function launchCodex(
   runtimeSettings: Omit<ProviderRuntimeSettings, "command"> = {},
-): Promise<string[]> {
+  options: {
+    paseoTools?: PaseoToolCatalog;
+    toolCall?: { namespace: string; tool: string; arguments: unknown };
+  } = {},
+): Promise<CodexLaunch> {
   const root = createRoot("codex");
-  const { script, recordPath } = createRecordingCodexAppServer(root);
+  const { script, recordPath } = createRecordingCodexAppServer(root, options.toolCall);
   const client = new CodexAppServerAgentClient(createTestLogger(), {
     ...runtimeSettings,
     command: { mode: "replace", argv: [process.execPath, script] },
   });
   const session = await client
-    .createSession({ provider: "codex", cwd: root, modeId: "auto" })
+    .createSession(
+      { provider: "codex", cwd: root, modeId: "auto" },
+      options.paseoTools ? { paseoTools: options.paseoTools } : undefined,
+    )
     .catch(() => null);
   try {
     await session?.startTurn("hello").catch(() => undefined);
+    if (options.toolCall) {
+      // The answer to the app server's tool call arrives after the turn started.
+      const start = Date.now();
+      while (!readCodexRecords(recordPath).some((entry) => entry.answer?.id === "server-1")) {
+        if (Date.now() - start > 10_000) throw new Error("No answer to the dynamic tool call");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
   } finally {
     await session?.close().catch(() => undefined);
   }
   expect(existsSync(recordPath)).toBe(true);
-  const launches = readFileSync(recordPath, "utf8")
-    .trim()
-    .split("\n")
-    .map((line) => (JSON.parse(line) as { argv: string[] }).argv);
+  const records = readCodexRecords(recordPath);
+  const launches = records.flatMap((entry) => (entry.argv ? [entry.argv] : []));
   // Every app server the session started carries the same options.
   expect(launches.length).toBeGreaterThan(0);
-  return launches[0]!;
+  return {
+    launches,
+    requests: records.flatMap((entry) => (entry.request ? [entry.request] : [])),
+    answers: records.flatMap((entry) => (entry.answer ? [entry.answer] : [])),
+  };
+}
+
+async function launchCodexArgv(
+  runtimeSettings: Omit<ProviderRuntimeSettings, "command"> = {},
+): Promise<string[]> {
+  return (await launchCodex(runtimeSettings)).launches[0]!;
+}
+
+/** Every value that follows `flag` in `argv`. */
+function followingValues(argv: string[], flag: string): string[] {
+  return argv.flatMap((arg, index) =>
+    arg === flag && index + 1 < argv.length ? [argv[index + 1]!] : [],
+  );
+}
+
+/** Two Paseo tools as a catalogue, recording each call. */
+function createDirectCatalog(calls: Array<{ name: string; input: unknown }>): PaseoToolCatalog {
+  const tools = new Map<string, PaseoToolDefinition>();
+  const define = (name: string, description: string, inputSchema: z.ZodRawShape): void => {
+    tools.set(name, {
+      name,
+      description,
+      inputSchema,
+      handler: async () => ({ content: [{ type: "text", text: `${name} ran` }] }),
+    });
+  };
+  define("exec", "Run a command.", { command: z.array(z.string()) });
+  define("read_file", "Read a file.", { path: z.string() });
+  return {
+    tools,
+    getTool: (name) => tools.get(name),
+    executeTool: async (name, input, context) => {
+      calls.push({ name, input });
+      const tool = tools.get(name);
+      if (!tool) throw new Error(`Unknown tool ${name}`);
+      return tool.handler(input, context ?? {});
+    },
+  };
 }
 
 function followingValue(argv: string[], flag: string): string | undefined {
@@ -171,6 +265,78 @@ describe("harness built-in tools", () => {
     );
     expect(argv.join(" ")).toContain("--disable shell_tool");
     expect(argv.join(" ")).toContain("--disable unified_exec");
+  });
+
+  test("Codex with built-ins off offers none of its own tools but apply_patch", async () => {
+    const { launches } = await launchCodex({ builtinTools: "off" });
+    for (const argv of launches) {
+      // Codex turns goals, view_image and sleep on by default: they are switched off, never on.
+      expect(argv).not.toContain("--enable");
+      expect(followingValues(argv, "--disable")).toEqual(
+        expect.arrayContaining(["shell_tool", "unified_exec", "goals", "view_image", "sleep_tool"]),
+      );
+      expect(followingValues(argv, "-c")).toContain(
+        "tools.experimental_request_user_input.enabled=false",
+      );
+    }
+  });
+
+  test("Codex given Paseo's tools offers them as its own tools in the paseo namespace, with no MCP server", async () => {
+    const calls: Array<{ name: string; input: unknown }> = [];
+    const { requests, answers } = await launchCodex(
+      { builtinTools: "off" },
+      {
+        paseoTools: createDirectCatalog(calls),
+        toolCall: { namespace: "paseo", tool: "read_file", arguments: { path: "package.json" } },
+      },
+    );
+    const threadStart = requests.find((request) => request.method === "thread/start");
+    expect(threadStart?.params?.dynamicTools).toEqual([
+      {
+        type: "namespace",
+        name: "paseo",
+        description: expect.any(String),
+        tools: [
+          {
+            type: "function",
+            name: "exec",
+            description: "Run a command.",
+            inputSchema: expect.objectContaining({ type: "object", required: ["command"] }),
+          },
+          {
+            type: "function",
+            name: "read_file",
+            description: "Read a file.",
+            inputSchema: expect.objectContaining({ type: "object", required: ["path"] }),
+          },
+        ],
+      },
+    ]);
+    const config = (threadStart?.params?.config ?? {}) as Record<string, unknown>;
+    expect(config.mcp_servers).toBeUndefined();
+
+    // The app server's call runs the catalogue's tool and gets its result back.
+    expect(calls).toEqual([{ name: "read_file", input: { path: "package.json" } }]);
+    expect(answers.find((answer) => answer.id === "server-1")?.result).toEqual({
+      contentItems: [{ type: "inputText", text: "read_file ran" }],
+      success: true,
+    });
+  });
+
+  test("Codex answers a call to a tool outside its paseo namespace as failed, running nothing", async () => {
+    const calls: Array<{ name: string; input: unknown }> = [];
+    const { answers } = await launchCodex(
+      { builtinTools: "off" },
+      {
+        paseoTools: createDirectCatalog(calls),
+        toolCall: { namespace: "memory", tool: "memory_status", arguments: {} },
+      },
+    );
+    expect(calls).toEqual([]);
+    expect(answers.find((answer) => answer.id === "server-1")?.result).toEqual({
+      contentItems: [{ type: "inputText", text: expect.stringMatching(/memory\.memory_status/) }],
+      success: false,
+    });
   });
 
   test("Codex keeps its shell tools by default", async () => {

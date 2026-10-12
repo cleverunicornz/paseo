@@ -13,9 +13,14 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import pino from "pino";
 
 import { createPaseoDaemon } from "../bootstrap.js";
-import type { AgentClient, AgentLaunchContext } from "../agent/agent-sdk-types.js";
+import type {
+  AgentClient,
+  AgentLaunchContext,
+  AgentSessionConfig,
+} from "../agent/agent-sdk-types.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { resolveTestCodexBinary } from "../test-utils/codex-binary.js";
+import { HARNESS_DIRECT_TOOLS } from "./direct-tools.js";
 
 const codexPath = resolveTestCodexBinary();
 
@@ -43,18 +48,27 @@ async function waitForPath(target: string, timeoutMs = 15_000): Promise<void> {
 }
 
 interface RecordedLaunch {
+  provider: string;
+  /** The configuration the harness was started with. */
+  config: AgentSessionConfig;
   context: AgentLaunchContext | undefined;
   /** The tree's files that existed when the harness was started. */
   treeFilesAtLaunch: string[];
 }
 
+/**
+ * Records every launch of Claude Code and Codex. The Codex stand-in takes Paseo's direct tools natively, as the
+ * real Codex client does.
+ */
 function recordLaunchContexts(
   clients: Record<string, AgentClient>,
   seen: RecordedLaunch[],
 ): Record<string, AgentClient> {
-  const claude = clients.claude!;
-  const recording = Object.create(claude) as AgentClient;
-  const record = (launchContext: AgentLaunchContext | undefined): void => {
+  const record = (
+    provider: string,
+    config: AgentSessionConfig,
+    launchContext: AgentLaunchContext | undefined,
+  ): void => {
     const tree = launchContext?.env?.PASEO_TOOL_TREE;
     const treeFilesAtLaunch =
       tree && existsSync(tree)
@@ -62,17 +76,31 @@ function recordLaunchContexts(
             entry.split(path.sep).join("/"),
           )
         : [];
-    seen.push({ context: launchContext, treeFilesAtLaunch });
+    seen.push({ provider, config, context: launchContext, treeFilesAtLaunch });
   };
-  recording.createSession = (config, launchContext, options) => {
-    record(launchContext);
-    return claude.createSession(config, launchContext, options);
+  const recording = (provider: string, capabilities?: Partial<AgentClient["capabilities"]>) => {
+    const client = clients[provider]!;
+    const wrapped = Object.create(client) as AgentClient;
+    if (capabilities) {
+      Object.defineProperty(wrapped, "capabilities", {
+        value: { ...client.capabilities, ...capabilities },
+      });
+    }
+    wrapped.createSession = (config, launchContext, options) => {
+      record(provider, config, launchContext);
+      return client.createSession(config, launchContext, options);
+    };
+    wrapped.resumeSession = (handle, overrides, launchContext, options) => {
+      record(provider, { provider, cwd: "", ...overrides } as AgentSessionConfig, launchContext);
+      return client.resumeSession(handle, overrides, launchContext, options);
+    };
+    return wrapped;
   };
-  recording.resumeSession = (handle, overrides, launchContext, options) => {
-    record(launchContext);
-    return claude.resumeSession(handle, overrides, launchContext, options);
+  return {
+    ...clients,
+    claude: recording("claude"),
+    codex: recording("codex", { supportsNativeDirectTools: true }),
   };
-  return { ...clients, claude: recording };
 }
 
 const BETA_TOOLS = ["beta_one", "beta_two", "beta_three"];
@@ -164,6 +192,52 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
     }
   }
 
+  async function connectAgent(agentId: string, route: string): Promise<Client> {
+    const client = new Client({ name: "tree-harness", version: "1.0.0" });
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}${route}`), {
+        requestInit: {
+          headers: { Authorization: `Bearer ${daemon.agentManager.issueAgentToken(agentId)}` },
+        },
+      }),
+    );
+    return client;
+  }
+
+  async function toolNames(agentId: string, route: string): Promise<string[]> {
+    const client = await connectAgent(agentId, route);
+    try {
+      return (await client.listTools()).tools.map((tool) => tool.name).sort();
+    } finally {
+      await client.close();
+    }
+  }
+
+  /** Runs a script through `exec` that calls two tree tools at once and prints what each returned. */
+  async function runTwoCallsAtOnce(agentId: string, cwd: string): Promise<unknown> {
+    const client = await connectAgent(agentId, "/mcp/agents");
+    try {
+      const script = [
+        "const tree = process.env.PASEO_TOOL_TREE;",
+        'const { whoami } = await import(tree + "/servers/fixture/whoami.ts");',
+        'const { readFile } = await import(tree + "/servers/paseo/read_file.ts");',
+        'const [who, marker] = await Promise.all([whoami(), readFile({ path: "marker.txt" })]);',
+        "console.log(JSON.stringify({ who: who[0].text, marker: marker.content }));",
+      ].join("\n");
+      await writeFile(path.join(cwd, "two-at-once.ts"), script);
+      const ran = (await client.callTool({
+        name: "exec",
+        arguments: {
+          command: ["node", "--experimental-strip-types", "--no-warnings", "two-at-once.ts"],
+        },
+      })) as { structuredContent?: { stdout?: string; stderr?: string } };
+      expect(ran.structuredContent?.stderr).toBe("");
+      return JSON.parse(ran.structuredContent?.stdout ?? "null");
+    } finally {
+      await client.close();
+    }
+  }
+
   /**
    * Starts a launch and holds its tree discovery open after `beta` has answered; meanwhile the agent
    * lists its own tools, which queues an ordinary refresh, and `beta` fails for that queued pass.
@@ -236,7 +310,10 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
         mcpEnabled: true,
         staticDir: path.join(root, "static"),
         mcpDebug: false,
-        agentClients: recordLaunchContexts(createTestAgentClients(), launches),
+        agentClients: recordLaunchContexts(
+          createTestAgentClients({ supportsMcpServers: true }),
+          launches,
+        ),
         agentStoragePath: path.join(paseoHome, "agents"),
         mcpGatewayBackends: {
           fixture: { url: `http://127.0.0.1:${backendPort}/mcp` },
@@ -383,5 +460,94 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
     for (const name of BETA_TOOLS) {
       expect(existsSync(path.join(tree, "servers/beta", `${name}.ts`))).toBe(true);
     }
+  });
+  // O-000221 (infra-v2) at the daemon: a Claude Code agent and a Codex agent under the same grant.
+  test("Claude Code and Codex get the same tree and the same direct tools, and nothing else", async () => {
+    const launched = new Map<string, { agentId: string; cwd: string; launch: RecordedLaunch }>();
+    for (const provider of ["claude", "codex"]) {
+      const cwd = path.join(root, `workspace-same-${provider}`);
+      await mkdir(cwd);
+      await writeFile(path.join(cwd, "marker.txt"), `${provider} workspace\n`);
+      const agent = await daemon.agentManager.createAgent(
+        { provider, cwd, title: `Same tools ${provider}` },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const launch = launches.findLast((entry) => entry.context?.agentId === agent.id);
+      expect(launch?.provider).toBe(provider);
+      launched.set(provider, { agentId: agent.id, cwd, launch: launch! });
+    }
+    const claude = launched.get("claude")!;
+    const codex = launched.get("codex")!;
+
+    // T1: the same tree, written before the harness started.
+    const claudeTree = [...claude.launch.treeFilesAtLaunch].sort();
+    expect(claudeTree).toEqual(
+      expect.arrayContaining(["servers/fixture/whoami.ts", "servers/paseo/exec.ts"]),
+    );
+    expect([...codex.launch.treeFilesAtLaunch].sort()).toEqual(claudeTree);
+
+    // T3: one direct set for both, Paseo's declared list; Claude Code reaches it as its only MCP server, Codex
+    // natively, with no MCP server at all.
+    const direct = [...HARNESS_DIRECT_TOOLS].sort();
+    expect(claude.launch.config.mcpServers).toEqual({
+      paseo: {
+        type: "http",
+        url: `http://127.0.0.1:${port}/mcp/agents/direct`,
+        headers: { Authorization: expect.stringMatching(/^Bearer \S+$/) },
+      },
+    });
+    expect(await toolNames(claude.agentId, "/mcp/agents/direct")).toEqual(direct);
+    expect(codex.launch.config.mcpServers ?? {}).toEqual({});
+    expect([...(codex.launch.context?.paseoTools?.tools.keys() ?? [])].sort()).toEqual(direct);
+    // The declared list is Paseo's own tools, every one of them.
+    expect(await toolNames(claude.agentId, "/mcp/agents")).toEqual(direct);
+
+    // T4: a backend's tool is not on the direct surface; it is reached through the tree only.
+    const directClient = await connectAgent(claude.agentId, "/mcp/agents/direct");
+    try {
+      const refused = await directClient
+        .callTool({ name: "whoami", arguments: {} })
+        .then((result) => (result as { isError?: boolean }).isError === true)
+        .catch(() => true);
+      expect(refused).toBe(true);
+    } finally {
+      await directClient.close();
+    }
+
+    // T2: a script calls two tree tools at once, each reaching Paseo as the agent whose run it is.
+    for (const { agentId, cwd } of [claude, codex]) {
+      expect(await runTwoCallsAtOnce(agentId, cwd)).toEqual({
+        who: agentId,
+        marker: `${path.basename(cwd).replace("workspace-same-", "")} workspace\n`,
+      });
+    }
+  });
+
+  test("a launch that brings its own MCP server is refused while the tree is on", async () => {
+    const cwd = path.join(root, "workspace-own-mcp");
+    await mkdir(cwd);
+    const launchesBefore = launches.length;
+    for (const provider of ["claude", "codex"]) {
+      await expect(
+        daemon.agentManager.createAgent(
+          {
+            provider,
+            cwd,
+            title: `Own MCP ${provider}`,
+            mcpServers: {
+              fixture: {
+                type: "http",
+                url: "{paseoMcpGatewayUrl}/fixture",
+                headers: { Authorization: "Bearer {paseoAgentToken}" },
+              },
+            },
+          },
+          undefined,
+          { workspaceId: undefined },
+        ),
+      ).rejects.toThrow(/tool tree.*fixture/s);
+    }
+    expect(launches.length).toBe(launchesBefore);
   });
 });
