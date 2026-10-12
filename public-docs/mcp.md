@@ -333,15 +333,37 @@ console.log(JSON.parse(pkg.content).version);
 
 Run it with `node --experimental-strip-types script.ts` or `bun script.ts`.
 
+### One way in for every harness
+
+While the tree is on, every harness gets its tools the same way: the tree, and one fixed set of tools
+it may call directly, outside a script. The set is `HARNESS_DIRECT_TOOLS` in
+`packages/server/src/server/local-tools/direct-tools.ts`, the only place it is declared; today it is
+Paseo's own tools. Every other tool, and every gateway backend's, reaches the agent through the tree
+only.
+
+| Harness     | How it gets the direct tools                                                                                                   |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Claude Code | One MCP server, `paseo`, on `/mcp/agents/direct`: the agent endpoint narrowed to the set. The model sees `mcp__paseo__<tool>`. |
+| Codex       | Codex dynamic tools in the `paseo` namespace, run by Paseo as the agent; no MCP server. The model sees `paseo.<tool>`.         |
+
+Codex gets no MCP server because one would bring Codex's MCP resource tools (`list_mcp_resources`
+and two more), which Codex registers for any MCP server and which no other harness has. It names the
+namespace `paseo` because Codex reserves `mcp__*` for MCP servers. A launch whose configuration
+brings an MCP server of its own fails, naming the server: serve it as a gateway backend instead, and
+it reaches the agent through the tree.
+
+`/mcp/agents/direct` authenticates like `/mcp/agents`, with the agent's token. Scripts keep using
+`PASEO_MCP_URL`, the whole endpoint.
+
 ## Harness built-in tools
 
 Set `builtinTools` to `off` on a provider to launch its harness with Paseo's tools only. Pair it with
 [local tools](#local-tools) so the agent can still run commands and edit files.
 
-| Harness     | Launch                                                                                                                                       |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code | `--tools ""` (no built-in tool) and `--strict-mcp-config` (only the MCP servers Paseo passes).                                               |
-| Codex       | `--disable shell_tool --disable unified_exec`. Codex registers `apply_patch` per model and has no switch for it, so that one built-in stays. |
+| Harness     | Launch                                                                                                                                                                                                                                        |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | `--tools ""` (no built-in tool) and `--strict-mcp-config` (only the MCP servers Paseo passes).                                                                                                                                                |
+| Codex       | `--disable` `shell_tool`, `unified_exec`, `goals`, `view_image` and `sleep_tool`, and `-c tools.experimental_request_user_input.enabled=false`. Codex registers `apply_patch` per model and has no switch for it, so that one built-in stays. |
 
 ```json
 {
@@ -350,6 +372,12 @@ Set `builtinTools` to `off` on a provider to launch its harness with Paseo's too
   }
 }
 ```
+
+Codex's model catalogue can still add tools: a model whose entry sets `tool_mode` to a code mode puts
+every tool inside a code-execution tool, `supports_search_tool` defers MCP tools behind a search tool,
+and `experimental_supported_tools` adds `clock` and `request_user_input_async`. For Paseo's tools
+alone, give Codex a catalogue (`model_catalog_json`) with `tool_mode: "direct"`,
+`supports_search_tool: false` and no `experimental_supported_tools`.
 
 The switch turns off Codex's built-in tools, not what Codex loads from its home. Codex still reads
 MCP servers from `[mcp_servers]` in `$CODEX_HOME/config.toml`, instructions from

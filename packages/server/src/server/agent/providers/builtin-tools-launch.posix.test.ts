@@ -121,7 +121,7 @@ process.stdin.on("data", (chunk) => {
     }
     if (message.method === "turn/start" && toolCall) {
       const params = { threadId: "thread-1", turnId: "turn-1", callId: "call-1", ...toolCall };
-      process.stdout.write(JSON.stringify({ id: "server-1", method: "item/tool/call", params }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: 9001, method: "item/tool/call", params }) + "\\n");
     }
   }
 });
@@ -174,7 +174,7 @@ async function launchCodex(
     if (options.toolCall) {
       // The answer to the app server's tool call arrives after the turn started.
       const start = Date.now();
-      while (!readCodexRecords(recordPath).some((entry) => entry.answer?.id === "server-1")) {
+      while (!readCodexRecords(recordPath).some((entry) => entry.answer?.id === 9001)) {
         if (Date.now() - start > 10_000) throw new Error("No answer to the dynamic tool call");
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
@@ -317,7 +317,7 @@ describe("harness built-in tools", () => {
 
     // The app server's call runs the catalogue's tool and gets its result back.
     expect(calls).toEqual([{ name: "read_file", input: { path: "package.json" } }]);
-    expect(answers.find((answer) => answer.id === "server-1")?.result).toEqual({
+    expect(answers.find((answer) => answer.id === 9001)?.result).toEqual({
       contentItems: [{ type: "inputText", text: "read_file ran" }],
       success: true,
     });
@@ -333,7 +333,7 @@ describe("harness built-in tools", () => {
       },
     );
     expect(calls).toEqual([]);
-    expect(answers.find((answer) => answer.id === "server-1")?.result).toEqual({
+    expect(answers.find((answer) => answer.id === 9001)?.result).toEqual({
       contentItems: [{ type: "inputText", text: expect.stringMatching(/memory\.memory_status/) }],
       success: false,
     });

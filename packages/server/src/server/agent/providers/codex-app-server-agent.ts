@@ -39,6 +39,12 @@ import {
   type ProviderRefreshContext,
   type ResolveAgentDefaultModeInput,
 } from "../agent-sdk-types.js";
+import {
+  addModelVisibleStructuredContent,
+  serializePaseoToolInputParameters,
+} from "../tools/paseo-tool-serialization.js";
+import type { PaseoToolCatalog, PaseoToolResult } from "../tools/types.js";
+import { DIRECT_TOOLS_NAMESPACE } from "../../local-tools/direct-tools.js";
 import type { ProcessEnvRecord } from "../../paseo-env.js";
 import {
   INHERITED_HARNESS_ENVIRONMENT,
@@ -163,6 +169,7 @@ const CODEX_TOOL_THREAD_ITEM_TYPES = new Set([
   "commandExecution",
   "fileChange",
   "mcpToolCall",
+  "dynamicToolCall",
   "webSearch",
   "collabAgentToolCall",
   "subAgentActivity",
@@ -223,6 +230,9 @@ const CODEX_APP_SERVER_CAPABILITIES: AgentCapabilityFlags = {
   supportsSessionListing: true,
   supportsDynamicModes: false,
   supportsMcpServers: true,
+  // With a tool tree, Paseo's direct tools are Codex dynamic tools: an MCP server would bring Codex's MCP
+  // resource tools with it, which no other harness offers (infra-v2 I-000029).
+  supportsNativeDirectTools: true,
   supportsReasoningStream: true,
   supportsToolInvocations: true,
   supportsRewindConversation: true,
@@ -271,6 +281,8 @@ interface CodexAppServerAgentDeps {
   codexHome?: string;
   /** The one model the session may run, when the daemon pins the agent's creation model. */
   modelPin?: string;
+  /** Paseo's tools the session offers as Codex dynamic tools, and runs when Codex calls them. */
+  paseoTools?: PaseoToolCatalog;
   /** How every process started from the Codex binary gets its environment. */
   harnessEnvironment?: HarnessEnvironment;
   _createCodexClient?: (
@@ -1372,6 +1384,8 @@ function normalizeCodexThreadItemType(rawType: string | undefined): string | und
       return "fileChange";
     case "McpToolCall":
       return "mcpToolCall";
+    case "DynamicToolCall":
+      return "dynamicToolCall";
     case "WebSearch":
       return "webSearch";
     case "CollabAgentToolCall":
@@ -3956,6 +3970,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.client.setRequestHandler("tool/requestUserInput", (params) =>
       this.handleToolApprovalRequest(params),
     );
+    this.client.setRequestHandler("item/tool/call", (params) =>
+      runCodexDynamicToolCall(this.deps.paseoTools, params),
+    );
   }
 
   private async readArchivedHistory(): Promise<void> {
@@ -5338,6 +5355,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       ...(developerInstructions ? { developerInstructions } : {}),
       ...(innerConfig ? { config: innerConfig } : {}),
       ...(this.ephemeral ? { ephemeral: true } : {}),
+      ...(this.deps.paseoTools ? { dynamicTools: codexDynamicTools(this.deps.paseoTools) } : {}),
     };
     if (this.hasWorkflowModeOverride) {
       params.approvalsReviewer = preset.approvalsReviewer;
@@ -7186,7 +7204,79 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 }
 
-const CODEX_BUILTIN_TOOLS_OFF_ARGS = ["--disable", "shell_tool", "--disable", "unified_exec"];
+/** Paseo's tools as Codex dynamic tools, in one namespace (local-tools/direct-tools.ts). */
+function codexDynamicTools(catalog: PaseoToolCatalog): Array<Record<string, unknown>> {
+  return [
+    {
+      type: "namespace",
+      name: DIRECT_TOOLS_NAMESPACE,
+      description: "Paseo's tools.",
+      tools: [...catalog.tools.values()].map((tool) => ({
+        type: "function",
+        name: tool.name,
+        description: tool.description,
+        inputSchema: serializePaseoToolInputParameters(tool),
+      })),
+    },
+  ];
+}
+
+type CodexDynamicToolContent =
+  | { type: "inputText"; text: string }
+  | { type: "inputImage"; imageUrl: string };
+
+function toCodexDynamicToolContent(result: PaseoToolResult): CodexDynamicToolContent[] {
+  return addModelVisibleStructuredContent(result).content.flatMap(
+    (block): CodexDynamicToolContent[] => {
+      if (block.type === "image" && typeof block.data === "string") {
+        const mimeType = typeof block.mimeType === "string" ? block.mimeType : "image/png";
+        return [{ type: "inputImage", imageUrl: `data:${mimeType};base64,${block.data}` }];
+      }
+      return [{ type: "inputText", text: typeof block.text === "string" ? block.text : "" }];
+    },
+  );
+}
+
+/** Runs Codex's call of one of Paseo's dynamic tools; a call outside them runs nothing and fails. */
+async function runCodexDynamicToolCall(
+  catalog: PaseoToolCatalog | undefined,
+  params: unknown,
+): Promise<{ contentItems: CodexDynamicToolContent[]; success: boolean }> {
+  const call = toObjectRecord(params);
+  const namespace = typeof call?.namespace === "string" ? call.namespace : null;
+  const tool = typeof call?.tool === "string" ? call.tool : "";
+  const failed = (text: string) => ({
+    contentItems: [{ type: "inputText" as const, text }],
+    success: false,
+  });
+  if (!catalog || namespace !== DIRECT_TOOLS_NAMESPACE || !catalog.getTool(tool)) {
+    return failed(`${namespace ?? ""}.${tool} is not one of this agent's tools`);
+  }
+  try {
+    const result = await catalog.executeTool(tool, call?.arguments ?? {});
+    return { contentItems: toCodexDynamicToolContent(result), success: result.isError !== true };
+  } catch (error) {
+    return failed(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Built-ins off: the shell, and every tool Codex offers by default beside Paseo's (goals, view_image, sleep,
+// request_user_input), so its model is offered Paseo's tools and apply_patch alone (infra-v2 I-000029).
+// apply_patch stays: Codex registers it per model and offers no switch for it.
+const CODEX_BUILTIN_TOOLS_OFF_ARGS = [
+  "--disable",
+  "shell_tool",
+  "--disable",
+  "unified_exec",
+  "--disable",
+  "goals",
+  "--disable",
+  "view_image",
+  "--disable",
+  "sleep_tool",
+  "-c",
+  "tools.experimental_request_user_input.enabled=false",
+];
 
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
@@ -7250,6 +7340,7 @@ export class CodexAppServerAgentClient implements AgentClient {
         ? buildCodexModelGatewayConfig(gateway, this.deps.customProvider)
         : this.customProviderConfig(),
       modelPin: launchContext?.modelPin,
+      paseoTools: launchContext?.paseoTools,
     };
   }
 
@@ -7258,6 +7349,10 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   private resolveGoalsEnabled(): Promise<boolean> {
+    if (this.runtimeSettings?.builtinTools === "off") {
+      // Goals are one of Codex's own tools, off with the rest.
+      return Promise.resolve(false);
+    }
     if (!this.goalsEnabledPromise) {
       this.goalsEnabledPromise = (async () => {
         try {
@@ -7329,8 +7424,6 @@ export class CodexAppServerAgentClient implements AgentClient {
       args.push("--enable", "goals");
     }
     if (this.runtimeSettings?.builtinTools === "off") {
-      // The agent runs commands through Paseo's tools. apply_patch stays: Codex
-      // registers it per model and offers no switch for it.
       args.push(...CODEX_BUILTIN_TOOLS_OFF_ARGS);
     }
     this.logger.trace(

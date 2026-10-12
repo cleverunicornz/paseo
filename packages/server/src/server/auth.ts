@@ -111,7 +111,12 @@ export function createRequireBearerMiddleware(
   };
 }
 
-const SELF_AUTHENTICATING_ROUTES = new Set(["/api/files/download", "/mcp/agents"]);
+const SELF_AUTHENTICATING_ROUTES = new Set([
+  "/api/files/download",
+  "/mcp/agents",
+  // The direct tools' view of the same endpoint (local-tools/direct-tools.ts).
+  "/mcp/agents/direct",
+]);
 
 function isBearerFreeRoute(path: string): boolean {
   return path === "/api/health" || SELF_AUTHENTICATING_ROUTES.has(path);

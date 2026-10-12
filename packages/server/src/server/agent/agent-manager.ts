@@ -84,8 +84,9 @@ import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { AgentTokenRegistry } from "./agent-tokens.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
-import type { PaseoToolCatalogFactory } from "./tools/types.js";
+import type { PaseoToolCatalog, PaseoToolCatalogFactory } from "./tools/types.js";
 import { isPaseoToolPolicyEnabled } from "./paseo-tool-policy.js";
+import { DIRECT_TOOLS_ROUTE_SUFFIX, directToolCatalog } from "../local-tools/direct-tools.js";
 import {
   ProviderSubagentStore,
   type ProviderSubagentDescriptor,
@@ -851,6 +852,8 @@ export class AgentManager {
   private readonly prepareToolTree: (agentId: string) => Promise<string | null>;
   /** Agents whose launch is preparing their tool tree, possibly before they are registered. */
   private readonly launchingAgents = new Map<string, LaunchingAgent>();
+  /** Launches whose agent has a tool tree: its harness is given the direct tools and nothing else. */
+  private readonly toolTreeLaunches = new WeakSet<AgentLaunchContext>();
   private readonly agentTokens: AgentTokenRegistry;
   private readonly modelGatewaySettings: ModelGatewaySettings;
   private paseoToolsEnabled = true;
@@ -5937,22 +5940,49 @@ export class AgentManager {
         ...(toolTreeDir ? { PASEO_TOOL_TREE: toolTreeDir } : {}),
       },
     };
+    if (toolTreeDir) {
+      this.toolTreeLaunches.add(context);
+    }
     const modelGateway = this.resolveModelGateway(agentId, client);
     if (modelGateway) {
       context.modelGateway = modelGateway;
     }
-    if (
-      this.paseoToolsEnabled &&
-      isPaseoToolPolicyEnabled(paseoToolPolicy) &&
-      client.capabilities.supportsNativePaseoTools &&
-      this.paseoToolCatalogFactory
-    ) {
-      context.paseoTools = await this.paseoToolCatalogFactory({
-        callerAgentId: agentId,
-        paseoToolPolicy,
-      });
+    const paseoTools = await this.resolveNativePaseoTools(
+      agentId,
+      client,
+      paseoToolPolicy,
+      toolTreeDir !== null,
+    );
+    if (paseoTools) {
+      context.paseoTools = paseoTools;
     }
     return context;
+  }
+
+  /**
+   * The Paseo tools a provider takes natively, if it does. With a tool tree, a provider that can take them
+   * natively gets the direct tools that way; the others reach them on the direct MCP route
+   * (resolveProviderLaunchConfig).
+   */
+  private async resolveNativePaseoTools(
+    agentId: string,
+    client: AgentClient,
+    paseoToolPolicy: ProviderPaseoToolsPolicy | undefined,
+    toolTree: boolean,
+  ): Promise<PaseoToolCatalog | undefined> {
+    const native =
+      client.capabilities.supportsNativePaseoTools === true ||
+      (toolTree && client.capabilities.supportsNativeDirectTools === true);
+    if (
+      !this.paseoToolsEnabled ||
+      !isPaseoToolPolicyEnabled(paseoToolPolicy) ||
+      !native ||
+      !this.paseoToolCatalogFactory
+    ) {
+      return undefined;
+    }
+    const catalog = await this.paseoToolCatalogFactory({ callerAgentId: agentId, paseoToolPolicy });
+    return toolTree ? directToolCatalog(catalog) : catalog;
   }
 
   /**
@@ -5987,6 +6017,23 @@ export class AgentManager {
     launchContext: AgentLaunchContext,
     options: { agentId: string; paseoToolPolicy: ProviderPaseoToolsPolicy | undefined },
   ): AgentSessionConfig {
+    const toolTree = this.toolTreeLaunches.has(launchContext);
+    if (toolTree) {
+      // infra-v2 I-000029: with a tool tree, every tool reaches the agent through it, and the harness offers
+      // the direct tools alone. An MCP server of the agent's own would be a second path.
+      const own = Object.keys(stripInternalPaseoMcpServer(launchConfig).mcpServers ?? {});
+      if (own.length > 0) {
+        throw new Error(
+          `Agent ${options.agentId} is not launched: with the tool tree on, every tool reaches the agent ` +
+            `through its tool tree, and this launch also brings the MCP server(s) ${own.join(", ")}. ` +
+            "Serve them as MCP gateway backends instead.",
+        );
+      }
+    }
+    const mcpBaseUrl =
+      this.mcpBaseUrl && toolTree
+        ? `${this.mcpBaseUrl.replace(/\/+$/, "")}${DIRECT_TOOLS_ROUTE_SUFFIX}`
+        : this.mcpBaseUrl;
     return withRuntimePaseoMcpServer({
       config: launchConfig,
       agentId: options.agentId,
@@ -5995,7 +6042,7 @@ export class AgentManager {
         this.paseoToolsEnabled &&
         isPaseoToolPolicyEnabled(options.paseoToolPolicy) &&
         !launchContext.paseoTools
-          ? this.mcpBaseUrl
+          ? mcpBaseUrl
           : null,
       agentToken: this.agentTokens.issue(options.agentId),
       mcpGatewayBaseUrl: this.mcpGatewayBaseUrl,

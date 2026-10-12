@@ -5787,6 +5787,72 @@ describe("Codex app-server provider", () => {
     rmSync(source, { force: true });
   });
 
+  test("a dynamic tool call is a tool call named by its namespace and tool", async () => {
+    const appServer = createFakeCodexAppServer();
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    const timelineEvent = new Promise<Extract<AgentStreamEvent, { type: "timeline" }>>(
+      (resolve, reject) => {
+        const timeout = setTimeout(() => {
+          unsubscribe();
+          reject(new Error("Timed out waiting for the dynamic tool call"));
+        }, 1000);
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type !== "timeline") return;
+          clearTimeout(timeout);
+          unsubscribe();
+          resolve(event);
+        });
+      },
+    );
+
+    try {
+      const { turnId } = await session.startTurn("list the files");
+      appServer.child.stdout.write(
+        `${JSON.stringify({
+          method: "item/completed",
+          params: {
+            item: {
+              id: "dynamic-exec",
+              type: "dynamicToolCall",
+              namespace: "paseo",
+              tool: "exec",
+              arguments: { command: ["ls"] },
+              status: "completed",
+              contentItems: [{ type: "inputText", text: "package.json" }],
+              success: true,
+              durationMs: 5,
+            },
+          },
+        })}\n`,
+      );
+
+      expect(await timelineEvent).toEqual({
+        type: "timeline",
+        provider: "codex",
+        turnId,
+        item: {
+          type: "tool_call",
+          callId: "dynamic-exec",
+          name: "paseo.exec",
+          status: "completed",
+          error: null,
+          detail: {
+            type: "unknown",
+            input: { command: ["ls"] },
+            output: { content: [{ type: "text", text: "package.json" }] },
+          },
+        },
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
   test("mcpToolCall image content emits a completed tool call plus assistant markdown image", async () => {
     const appServer = createFakeCodexAppServer();
     const session = new CodexAppServerAgentSession(

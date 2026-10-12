@@ -12,6 +12,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import pino from "pino";
 
+import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon } from "../bootstrap.js";
 import type {
   AgentClient,
@@ -321,6 +322,8 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
         },
         localTools: { codexPath: codexPath! },
         toolTree: { enabled: true },
+        // As in a session container: the daemon has a password, and agents use their own tokens.
+        auth: { password: hashDaemonPassword("daemon-secret") },
       },
       pino({ level: "silent" }),
     );

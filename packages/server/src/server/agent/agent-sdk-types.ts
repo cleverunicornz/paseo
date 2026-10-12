@@ -187,6 +187,11 @@ export interface AgentCapabilityFlags {
   supportsDynamicModes: boolean;
   supportsMcpServers: boolean;
   supportsNativePaseoTools?: boolean;
+  /**
+   * With a tool tree, the provider takes Paseo's direct tools natively (`AgentLaunchContext.paseoTools`)
+   * instead of as an MCP server, so its harness offers nothing beside them (infra-v2 I-000029).
+   */
+  supportsNativeDirectTools?: boolean;
   supportsReasoningStream: boolean;
   supportsToolInvocations: boolean;
   supportsRewindConversation?: boolean;

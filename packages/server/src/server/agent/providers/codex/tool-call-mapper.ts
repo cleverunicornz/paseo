@@ -169,6 +169,22 @@ const CodexMcpToolCallItemSchema = z
   })
   .passthrough();
 
+const CodexDynamicToolCallItemSchema = z
+  .object({
+    type: z.literal("dynamicToolCall"),
+    id: z.string().min(1),
+    status: z.string().optional(),
+    namespace: z.string().nullable().optional(),
+    tool: z.string().min(1),
+    arguments: z.unknown().optional(),
+    contentItems: z
+      .array(z.object({ type: z.string(), text: z.string().optional() }).passthrough())
+      .nullable()
+      .optional(),
+    success: z.boolean().nullable().optional(),
+  })
+  .passthrough();
+
 const CodexWebSearchItemSchema = z
   .object({
     type: z.literal("webSearch"),
@@ -207,6 +223,7 @@ const CodexToolThreadItemSchema = z.discriminatedUnion("type", [
   CodexCommandExecutionItemSchema,
   CodexFileChangeItemSchema,
   CodexMcpToolCallItemSchema,
+  CodexDynamicToolCallItemSchema,
   CodexWebSearchItemSchema,
 ]);
 
@@ -214,6 +231,7 @@ const CodexThreadItemSchema = z.discriminatedUnion("type", [
   CodexCommandExecutionItemSchema,
   CodexFileChangeItemSchema,
   CodexMcpToolCallItemSchema,
+  CodexDynamicToolCallItemSchema,
   CodexWebSearchItemSchema,
   CodexCollabAgentToolCallItemSchema,
   CodexSubAgentActivityItemSchema,
@@ -922,6 +940,37 @@ function mapMcpToolCallItem(
   };
 }
 
+/** A call to one of the tools Paseo gave Codex as its own (dynamic tools), named like an MCP tool. */
+function mapDynamicToolCallItem(
+  item: z.infer<typeof CodexDynamicToolCallItemSchema>,
+  options?: CodexMapperOptions,
+): CodexNormalizedToolCallEnvelope | null {
+  const tool = item.tool.trim();
+  if (!tool) {
+    return null;
+  }
+  const output = item.contentItems
+    ? {
+        content: item.contentItems.map((content) =>
+          content.type === "inputText" ? { type: "text", text: content.text ?? "" } : content,
+        ),
+      }
+    : null;
+  const error =
+    item.success === false
+      ? (item.contentItems?.map((content) => content.text ?? "").join("\n") ?? "failed")
+      : null;
+  return {
+    callId: item.id,
+    name: buildMcpToolName(item.namespace ?? undefined, tool),
+    input: item.arguments ?? null,
+    output,
+    status: normalizeToolCallStatus(item.status, error, output),
+    error,
+    cwd: options?.cwd ?? null,
+  };
+}
+
 function mapWebSearchItem(
   item: z.infer<typeof CodexWebSearchItemSchema>,
 ): CodexNormalizedToolCallEnvelope {
@@ -1023,6 +1072,8 @@ function mapThreadItemToNormalizedEnvelope(
       return mapFileChangeItem(item, options);
     case "mcpToolCall":
       return mapMcpToolCallItem(item, options);
+    case "dynamicToolCall":
+      return mapDynamicToolCallItem(item, options);
     case "webSearch":
       return mapWebSearchItem(item);
     default: {

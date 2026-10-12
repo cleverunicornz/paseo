@@ -142,6 +142,7 @@ import {
 import type { PaseoToolRuntimeContext } from "./agent/tools/types.js";
 import type { LocalToolsConfig, ToolTreeConfig } from "./local-tools/config.js";
 import { createLocalToolsRuntime } from "./local-tools/runtime.js";
+import { DIRECT_TOOLS_ROUTE_SUFFIX, directToolCatalog } from "./local-tools/direct-tools.js";
 import { createAgentProviderRuntime } from "./agent/provider-runtime.js";
 import { bootstrapWorkspaceRegistries } from "./workspace-registry-bootstrap.js";
 import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
@@ -278,6 +279,28 @@ function createAgentMcpBaseUrl(listenTarget: ListenTarget | null): string | null
     "/mcp/agents",
     `http://${formatHostForHttpUrl(host)}:${listenTarget.port}`,
   ).toString();
+}
+
+/**
+ * The agent endpoint, and beside it the harness's own view while the tool tree is on: the direct tools alone
+ * (local-tools/direct-tools.ts).
+ */
+function mountAgentMcpRoutes(
+  app: express.Express,
+  route: string,
+  run: (req: express.Request, res: express.Response, direct: boolean) => Promise<void>,
+): void {
+  for (const [mountPath, direct] of [
+    [route, false],
+    [`${route}${DIRECT_TOOLS_ROUTE_SUFFIX}`, true],
+  ] as const) {
+    const handler: express.RequestHandler = (req, res) => {
+      void run(req, res, direct);
+    };
+    app.post(mountPath, handler);
+    app.get(mountPath, handler);
+    app.delete(mountPath, handler);
+  }
 }
 
 function isToolsListRequest(body: unknown): boolean {
@@ -1638,7 +1661,7 @@ export async function createPaseoDaemon(
   {
     const agentMcpRoute = "/mcp/agents";
 
-    const createAgentMcpSession = async (callerAgentId?: string) => {
+    const createAgentMcpSession = async (callerAgentId: string | undefined, direct: boolean) => {
       const agentMcpServer = await createAgentMcpServer(
         createAgentToolHostDependencies({
           callerAgentId,
@@ -1646,6 +1669,7 @@ export async function createPaseoDaemon(
             ? agentManager.getPaseoToolPolicy(callerAgentId)
             : undefined,
         }),
+        direct ? directToolCatalog : undefined,
       );
 
       // Stateless mode: each HTTP request builds a fresh server + transport that is
@@ -1672,6 +1696,7 @@ export async function createPaseoDaemon(
     const runAgentMcpRequest = async (
       req: express.Request,
       res: express.Response,
+      direct: boolean,
     ): Promise<void> => {
       if (!mcpEnabled) {
         res.status(404).json({ error: "Agent MCP endpoint disabled" });
@@ -1718,7 +1743,10 @@ export async function createPaseoDaemon(
           return;
         }
         // The caller is the agent its token names.
-        const { server, transport } = await createAgentMcpSession(authorization.callerAgentId);
+        const { server, transport } = await createAgentMcpSession(
+          authorization.callerAgentId,
+          direct,
+        );
         if (authorization.callerAgentId && isToolsListRequest(req.body)) {
           localToolsRuntime.onToolsListed(authorization.callerAgentId);
         }
@@ -1747,13 +1775,7 @@ export async function createPaseoDaemon(
       }
     };
 
-    const handleAgentMcpRequest: express.RequestHandler = (req, res) => {
-      void runAgentMcpRequest(req, res);
-    };
-
-    app.post(agentMcpRoute, handleAgentMcpRequest);
-    app.get(agentMcpRoute, handleAgentMcpRequest);
-    app.delete(agentMcpRoute, handleAgentMcpRequest);
+    mountAgentMcpRoutes(app, agentMcpRoute, runAgentMcpRequest);
     logger.info({ route: agentMcpRoute, enabled: mcpEnabled }, "Agent MCP route mounted");
   }
 

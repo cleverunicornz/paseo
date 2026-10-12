@@ -70,6 +70,7 @@ describe("daemon bearer validator", () => {
     // Guarded by per-agent tokens (see authorizeAgentMcpRequest), not the
     // daemon password.
     expect(shouldBypassBearerAuth("POST", "/mcp/agents")).toBe(true);
+    expect(shouldBypassBearerAuth("POST", "/mcp/agents/direct")).toBe(true);
     // Everything else stays behind the daemon password.
     expect(shouldBypassBearerAuth("GET", "/api/status")).toBe(false);
     expect(shouldBypassBearerAuth("POST", "/api/files/upload")).toBe(false);

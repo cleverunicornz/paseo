@@ -1,3 +1,4 @@
+import { DIRECT_TOOLS_ROUTE_SUFFIX } from "../local-tools/direct-tools.js";
 import type { AgentSessionConfig, McpServerConfig } from "./agent-sdk-types.js";
 
 const PASEO_MCP_SERVER_NAME = "paseo";
@@ -106,7 +107,11 @@ function isInternalPaseoMcpServer(config: McpServerConfig): boolean {
   }
 
   try {
-    return new URL(config.url).pathname === PASEO_MCP_PATHNAME;
+    const pathname = new URL(config.url).pathname;
+    return (
+      pathname === PASEO_MCP_PATHNAME ||
+      pathname === `${PASEO_MCP_PATHNAME}${DIRECT_TOOLS_ROUTE_SUFFIX}`
+    );
   } catch {
     return false;
   }
