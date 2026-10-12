@@ -98,6 +98,14 @@ const REVIEWED_IMPORTS: readonly ReviewedImport[] = [
     why: "Build environment records and the launch command from settings; none starts a process.",
   },
   {
+    module: "server/agent/tools/paseo-tool-serialization.ts",
+    names: ["addModelVisibleStructuredContent", "serializePaseoToolInputParameters"],
+    importer: "server/agent/providers/codex-app-server-agent.ts",
+    why:
+      "Turn a Paseo tool's input schema into JSON Schema and its result into model-visible content, " +
+      "for Paseo's tools as Codex dynamic tools; neither starts a process.",
+  },
+  {
     module: "server/agent/providers/diagnostic-utils.ts",
     names: ["formatProviderDiagnostic", "formatProviderDiagnosticError"],
     why: "Format diagnostic text.",
