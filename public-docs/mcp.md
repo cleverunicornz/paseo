@@ -312,8 +312,8 @@ harness gets the directory as `PASEO_TOOL_TREE`: `$PASEO_HOME/tool-trees/<agentI
 names another parent. Paseo writes the whole tree, Paseo's tools and every backend's, before the
 harness starts, so the agent's first listing shows every tool. When a backend cannot be listed then,
 the launch fails with an error naming the backend. Paseo checks the tree again whenever the agent
-lists its tools, rewriting it only when the list changed; a backend that does not answer at that
-point is left out until the next check.
+starts a turn or lists its tools, rewriting it only when the list changed; a backend that does not
+answer at that point is left out until the next check.
 
 File and function names come from tool names: a character other than a letter, digit or `_`
 becomes `_`, and a file name compares without case. When two tools would share a file or an

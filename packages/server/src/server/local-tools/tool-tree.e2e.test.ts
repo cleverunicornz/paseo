@@ -147,6 +147,7 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
   let backend: http.Server;
   let port: number;
   let backendHasExtraTool = false;
+  let backendHasTurnTool = false;
   let backendFails = false;
   let betaFails = false;
   let betaListings = 0;
@@ -163,6 +164,9 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
       }));
       if (backendHasExtraTool) {
         mcp.registerTool("added_later", { inputSchema: {} }, async () => ({ content: [] }));
+      }
+      if (backendHasTurnTool) {
+        mcp.registerTool("added_before_turn", { inputSchema: {} }, async () => ({ content: [] }));
       }
     },
     beforeList: async () => {
@@ -525,6 +529,27 @@ describe.skipIf(!codexPath)("tool tree (daemon)", () => {
         marker: `${path.basename(cwd).replace("workspace-same-", "")} workspace\n`,
       });
     }
+  });
+
+  test("a tree follows its backends at every turn, also for a harness that never lists its tools", async () => {
+    const cwd = path.join(root, "workspace-turn-refresh");
+    await mkdir(cwd);
+    // Codex takes the direct tools natively: it never lists them on Paseo's MCP endpoint.
+    const agent = await daemon.agentManager.createAgent(
+      { provider: "codex", cwd, title: "Turn refresh" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const added = path.join(
+      paseoHome,
+      "tool-trees",
+      agent.id,
+      "servers/fixture/added_before_turn.ts",
+    );
+    expect(existsSync(added)).toBe(false);
+    backendHasTurnTool = true;
+    await daemon.agentManager.runAgent(agent.id, "next turn");
+    await waitForPath(added);
   });
 
   test("a launch that brings its own MCP server is refused while the tree is on", async () => {

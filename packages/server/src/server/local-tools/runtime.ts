@@ -38,7 +38,10 @@ export interface LocalToolsRuntime {
    * off. Rejects when the tree cannot be completed: the launch fails.
    */
   prepareToolTree: (agentId: string) => Promise<string | null>;
-  /** An agent changed: a closed agent's tree is removed. */
+  /**
+   * An agent changed: a closed agent's tree is removed; one that starts a turn has its tree checked, so it
+   * follows the backends for every harness, also one that never lists its tools (infra-v2 I-000029).
+   */
   onAgentState: (agent: { id: string; lifecycle: string }) => void;
   /** The agent listed its tools: its tree follows what it was shown. */
   onToolsListed: (agentId: string) => void;
@@ -139,6 +142,10 @@ export function createLocalToolsRuntime(options: LocalToolsRuntimeOptions): Loca
       return toolTree.dirFor(agentId);
     },
     onAgentState(agent) {
+      if (agent.lifecycle === "running" && toolTree && treeAgents.has(agent.id)) {
+        toolTree.scheduleRefresh(agent.id);
+        return;
+      }
       if (agent.lifecycle === "closed") {
         void processes?.releaseAgent(agent.id);
         if (toolTree && treeAgents.delete(agent.id)) {
