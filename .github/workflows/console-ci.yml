@@ -178,6 +178,17 @@ jobs:
           echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
+      - name: Install the CLIs the unit tests resolve
+        # Two assertions resolve the real Claude Code binary: the provider registry only lists
+        # `claude` when its binary is on PATH, and ClaudeAgentClient resolves its version. Without
+        # it they see "Provider 'claude' is not available", as the fork's own job found.
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/clis" --no-audit --no-fund --no-save @anthropic-ai/claude-code@2.1.296
+          bin="$RUNNER_TEMP/clis/node_modules/.bin"
+          test "$("$bin/claude" --version)" = "2.1.296 (Claude Code)"
+          echo "$bin" >> "$GITHUB_PATH"
       - name: Build server dependencies
         run: npm run build:server-deps
       - name: Run the server unit suite
