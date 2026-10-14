@@ -43,9 +43,7 @@ function buildRun(overrides = {}) {
   const o = { ...DEFAULTS, ...overrides };
   const heapAt = o.heapAt ?? (() => o.baselineMiB);
   const records = [];
-  records.push(
-    buildHeader({ ...o, heapAt, baseline: o.baselineMiB * MIB }),
-  );
+  records.push(buildHeader({ ...o, heapAt, baseline: o.baselineMiB * MIB }));
 
   const calls = buildSamples(records, { ...o, heapAt });
 
@@ -82,7 +80,12 @@ function buildRun(overrides = {}) {
   });
   if (o.workerExit)
     records.push({ stage: "worker-exit", elapsed: o.workerExit.elapsed, ...o.workerExit });
-  records.push({ stage: "cleanup", rpcErrors: o.rpcErrors, workerDeaths: o.workerDeaths, calls: calls.total });
+  records.push({
+    stage: "cleanup",
+    rpcErrors: o.rpcErrors,
+    workerDeaths: o.workerDeaths,
+    calls: calls.total,
+  });
   return records;
 }
 
@@ -196,7 +199,12 @@ test("finding 2: a 90-second minute bucket is inconclusive", () => {
 
 test("finding 2: an off-mix minute is inconclusive", () => {
   const r = buildRun({ postRestHeapMiB: 200 });
-  r.find((x) => x.stage === "minute" && x.index === 239).byKind = { logs: 15, inspect: 9, ls: 3, send: 0 };
+  r.find((x) => x.stage === "minute" && x.index === 239).byKind = {
+    logs: 15,
+    inspect: 9,
+    ls: 3,
+    send: 0,
+  };
   assert.ok(veto(analyze(r)));
 });
 
@@ -254,10 +262,23 @@ test("finding 7: a control rising 510,000,000 bytes passes", () => {
 
 test("finding 8: a control reaching the bound at 600 s passes", () => {
   const r = buildRun({ control: true, heapAt: () => 200 }).filter(
-    (x) => !["sample", "minute", "load-end", "post-rest"].includes(x.stage) || (x.elapsed ?? 0) < 600,
+    (x) =>
+      !["sample", "minute", "load-end", "post-rest"].includes(x.stage) || (x.elapsed ?? 0) < 600,
   );
-  r.push({ stage: "worker-exit", elapsed: 600, code: null, signal: "SIGABRT", reason: "Reached heap limit" });
-  r.push({ stage: "load-end", elapsed: 600, memory: { heapUsed: 955 * MIB }, workerDeaths: 1, rpcErrors: 0 });
+  r.push({
+    stage: "worker-exit",
+    elapsed: 600,
+    code: null,
+    signal: "SIGABRT",
+    reason: "Reached heap limit",
+  });
+  r.push({
+    stage: "load-end",
+    elapsed: 600,
+    memory: { heapUsed: 955 * MIB },
+    workerDeaths: 1,
+    rpcErrors: 0,
+  });
   r.find((x) => x.stage === "cleanup").workerDeaths = 1;
   const result = analyze(r, { control: true });
   assert.equal(result.verdict, "pass");

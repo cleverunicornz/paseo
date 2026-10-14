@@ -76,9 +76,7 @@ function readRecords(records) {
     }))
     .filter((s) => typeof s.elapsed === "number" && typeof s.heapUsed === "number");
   const loadEndRec = records.findLast((r) => r.stage === "load-end") ?? null;
-  const loadEnd = loadEndRec
-    ? { elapsed: loadEndRec.elapsed, heapUsed: heapOf(loadEndRec) }
-    : null;
+  const loadEnd = loadEndRec ? { elapsed: loadEndRec.elapsed, heapUsed: heapOf(loadEndRec) } : null;
   const loadSamples = [...samples, ...(loadEnd ? [loadEnd] : [])].sort(
     (a, b) => a.elapsed - b.elapsed,
   );
@@ -106,7 +104,8 @@ function headerProblems(header, expected) {
   if (header.boundaryCopy === true)
     problems.push("boundary-copy diagnostic run (never a qualification)");
   const p = header.protocol ?? {};
-  if (p.seconds !== expected.seconds) problems.push(`protocol.seconds ${p.seconds} != ${expected.seconds}`);
+  if (p.seconds !== expected.seconds)
+    problems.push(`protocol.seconds ${p.seconds} != ${expected.seconds}`);
   if (p.restSeconds !== expected.restSeconds)
     problems.push(`protocol.restSeconds ${p.restSeconds} != ${expected.restSeconds}`);
   if (p.connectionsPerMinute !== expected.rate)
@@ -164,7 +163,9 @@ function sampleProblems(samples, loadSamples, windowEnd) {
     maxGap = Math.max(maxGap, inWindow[i].elapsed - inWindow[i - 1].elapsed);
   }
   if (maxGap > SAMPLE_PERIOD_SECONDS + SAMPLE_GAP_TOLERANCE_SECONDS)
-    problems.push(`sample gap ${maxGap.toFixed(1)}s > ${SAMPLE_PERIOD_SECONDS}s (a missing sample)`);
+    problems.push(
+      `sample gap ${maxGap.toFixed(1)}s > ${SAMPLE_PERIOD_SECONDS}s (a missing sample)`,
+    );
   const spanEnd = inWindow.at(-1)?.elapsed ?? 0;
   if (spanEnd < windowEnd - SAMPLE_GAP_TOLERANCE_SECONDS)
     problems.push(`sampled span ${spanEnd.toFixed(0)}s < ${windowEnd}s`);
@@ -203,23 +204,37 @@ function phaseProblems(loadEnd, postRest, samples, expected) {
 
 // Cumulative counters must never be erased by a later, smaller one: take the maximum observed and
 // reconcile with the event records.
-function reconcileCounters({ samples, loadEndRec, postRest, cleanup, workerExits, rpcErrorEvents }) {
+function reconcileCounters({
+  samples,
+  loadEndRec,
+  postRest,
+  cleanup,
+  workerExits,
+  rpcErrorEvents,
+}) {
   const observed = [loadEndRec, postRest, cleanup, ...samples];
   const maxOf = (field, events) =>
-    Math.max(
-      ...observed.map((r) => numberOrNull(r?.[field]) ?? 0),
-      events.length,
-      0,
-    );
-  const deaths = maxOf("workerDeaths", workerExits.filter((r) => r.stopping !== true));
+    Math.max(...observed.map((r) => numberOrNull(r?.[field]) ?? 0), events.length, 0);
+  const deaths = maxOf(
+    "workerDeaths",
+    workerExits.filter((r) => r.stopping !== true),
+  );
   const errors = maxOf("rpcErrors", rpcErrorEvents);
   const streamErrors = Math.max(...observed.map((r) => numberOrNull(r?.streamErrors) ?? 0), 0);
   const oomDeaths = workerExits.filter(
     (r) =>
       r.stopping !== true &&
-      (r.oom === true || (typeof r.reason === "string" && HEAP_LIMIT_RE.test(r.reason)) || r.signal === "SIGABRT"),
+      (r.oom === true ||
+        (typeof r.reason === "string" && HEAP_LIMIT_RE.test(r.reason)) ||
+        r.signal === "SIGABRT"),
   );
-  return { errors, deaths, streamErrors, oomDeaths, unexplainedDeaths: Math.max(0, deaths - oomDeaths.length) };
+  return {
+    errors,
+    deaths,
+    streamErrors,
+    oomDeaths,
+    unexplainedDeaths: Math.max(0, deaths - oomDeaths.length),
+  };
 }
 
 function buildNumbers(ctx) {
@@ -286,6 +301,25 @@ function totalMix(minutes) {
   );
 }
 
+// What makes a fixed or control run's own kind disqualify it, on top of the common protocol
+// checks: an unexplained worker death is a break; and a run with no demonstrated leak (every
+// fixed run, and a control that never leaks) must carry the full load and rest.
+function runKindProblems({
+  control,
+  leakShown,
+  unexplainedDeaths,
+  loadEnd,
+  postRest,
+  samples,
+  expected,
+}) {
+  const problems = [];
+  if (control && unexplainedDeaths > 0)
+    problems.push(`${unexplainedDeaths} unexplained worker death(s)`);
+  if (!control || !leakShown) problems.push(...phaseProblems(loadEnd, postRest, samples, expected));
+  return problems;
+}
+
 function evaluateFixed(numbers) {
   const checks = [
     {
@@ -296,7 +330,8 @@ function evaluateFixed(numbers) {
     {
       name: "max sample within 64 MiB of baseline",
       ok:
-        numbers.maxAboveBaselineBytes !== null && numbers.maxAboveBaselineBytes <= MAX_ABOVE_BASELINE,
+        numbers.maxAboveBaselineBytes !== null &&
+        numbers.maxAboveBaselineBytes <= MAX_ABOVE_BASELINE,
       detail: `+${mib(numbers.maxAboveBaselineBytes)} MiB (limit ${mib(MAX_ABOVE_BASELINE)})`,
     },
     {
@@ -396,8 +431,15 @@ export function analyze(records, options = {}) {
     ...headerProblems(header, expected),
     ...minutes.problems,
     ...sampleCheck.problems,
-    ...phaseKindProblems(control, leak.leakShown, counters.unexplainedDeaths),
-    ...phaseProblems(r.loadEnd, r.postRest, r.samples, expected),
+    ...runKindProblems({
+      control,
+      leakShown: leak.leakShown,
+      unexplainedDeaths: counters.unexplainedDeaths,
+      loadEnd: r.loadEnd,
+      postRest: r.postRest,
+      samples: r.samples,
+      expected,
+    }),
   ];
 
   const evaluation = control ? evaluateControl(leak.leakShown, numbers) : evaluateFixed(numbers);
@@ -441,7 +483,9 @@ function printReport(result, source) {
   out.push(
     `mix per minute: ${JSON.stringify(n.mixPerMinute)} (expected ${JSON.stringify(EXPECTED_MIX)})`,
   );
-  out.push(`streaming:      ${n.streamingAgents} agent(s) (expected ${EXPECTED_FIXTURE.streamingAgents})`);
+  out.push(
+    `streaming:      ${n.streamingAgents} agent(s) (expected ${EXPECTED_FIXTURE.streamingAgents})`,
+  );
   out.push(`samples:        ${n.samples}, max gap ${n.maxSampleGapSeconds.toFixed(1)}s`);
   out.push("");
   for (const m of result.offProtocolMinutes.slice(0, 20)) {
