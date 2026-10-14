@@ -119,7 +119,7 @@ test("the managed-update anchors the image build edits survive the build", () =>
   }
 });
 
-test("the server's unit suite runs, on the smallest runner set first, and no Dockerfile compiles", () => {
+test("the server's unit suite runs unconditionally, and no Dockerfile compiles", () => {
   const unit = jobSteps(workflow, "server-unit");
   const run = unit.find((entry) => entry.name === "Run the server unit suite");
   assert.ok(run, "step Run the server unit suite");
