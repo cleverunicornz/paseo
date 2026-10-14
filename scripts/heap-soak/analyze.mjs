@@ -16,8 +16,9 @@
 //   bound (died, or a sample at/over the bound), within the 4 hours.
 //
 // INCONCLUSIVE when the load breaks its protocol: fewer than 7 streaming agents, a minute off
-// the 27-call 15/9/2/1 rate or mix, a missing 30-second sample, or a run cut short of its
-// load or its rest. The protocol numbers are fixed constants and are never relaxed.
+// the 27-call 15/9/2/1 rate or mix, or — in a fixed run — a missing 30-second sample or a run
+// cut short of its load or its rest. The control run is expected to die at the heap bound, so
+// its length is not required. The protocol numbers are fixed constants and are never relaxed.
 
 import fs from "node:fs";
 
@@ -53,7 +54,7 @@ function collectSeries(records) {
     .filter((r) => r.stage === "sample")
     .map((r) => ({ elapsed: r.elapsed, heapUsed: heapOf(r) }))
     .filter((s) => typeof s.heapUsed === "number");
-  const loadEndRec = records.filter((r) => r.stage === "load-end").at(-1) ?? null;
+  const loadEndRec = records.findLast((r) => r.stage === "load-end") ?? null;
   const loadEndPoint =
     loadEndRec && typeof heapOf(loadEndRec) === "number"
       ? [{ elapsed: loadEndRec.elapsed, heapUsed: heapOf(loadEndRec) }]
@@ -65,58 +66,62 @@ function collectSeries(records) {
   };
 }
 
-function protocolProblems(
-  { baselineRec, samples, minutes, loadEndRec, loadSamples, postRestRec, runningCounts },
-  expected,
-) {
-  const problems = [];
-  const offProtocolMinutes = minutes.filter(
-    (m) =>
-      m.calls !== expected.rate || MIX_KEYS.some((k) => (m.byKind?.[k] ?? 0) !== EXPECTED_MIX[k]),
-  );
-  const streamingAgents = baselineRec?.fixture?.streamingAgents ?? null;
-  const badRunning = runningCounts.filter((n) => n !== EXPECTED_STREAMING_AGENTS);
-
-  if (!baselineRec) problems.push("no baseline record");
-  if (baselineRec && streamingAgents === null) problems.push("baseline fixture missing");
-  if (streamingAgents !== EXPECTED_STREAMING_AGENTS)
-    problems.push(`streaming agents ${streamingAgents} != ${EXPECTED_STREAMING_AGENTS}`);
-  if (badRunning.length > 0)
-    problems.push(
-      `${badRunning.length} sample(s) with running agents != ${EXPECTED_STREAMING_AGENTS}`,
-    );
-
-  const requiredMinutes = Math.floor(expected.seconds / 60) - 1;
-  if (minutes.length < requiredMinutes)
-    problems.push(`only ${minutes.length} complete minutes, expected ${requiredMinutes}`);
-  if (offProtocolMinutes.length > 0)
-    problems.push(`${offProtocolMinutes.length} off-protocol minute(s)`);
-
-  const loadSeconds = loadEndRec?.elapsed ?? loadSamples.at(-1)?.elapsed ?? 0;
-  if (loadSeconds < expected.seconds - SAMPLE_PERIOD_SECONDS)
-    problems.push(`load ran ${loadSeconds.toFixed(0)}s, expected ${expected.seconds}s`);
-
-  const expectedSamples = Math.floor(expected.seconds / SAMPLE_PERIOD_SECONDS) + 1;
-  if (samples.length < expectedSamples - 2)
-    problems.push(`only ${samples.length} samples, expected ~${expectedSamples}`);
-  if (maxSampleGap(samples) > SAMPLE_GAP_TOLERANCE_SECONDS + SAMPLE_PERIOD_SECONDS)
-    problems.push(`sample gap ${maxSampleGap(samples).toFixed(0)}s > ${SAMPLE_PERIOD_SECONDS}s`);
-
-  if (!expected.control) {
-    if (!postRestRec) problems.push("no post-rest record (run cut short)");
-    const restSeconds = postRestRec ? postRestRec.elapsed - loadSeconds : 0;
-    if (postRestRec && restSeconds < expected.restSeconds - SAMPLE_PERIOD_SECONDS)
-      problems.push(`rest ran ${restSeconds.toFixed(0)}s, expected ${expected.restSeconds}s`);
-  }
-  return { problems, offProtocolMinutes };
-}
-
 function maxSampleGap(samples) {
   let maxGap = 0;
   for (let i = 1; i < samples.length; i++) {
     maxGap = Math.max(maxGap, samples[i].elapsed - samples[i - 1].elapsed);
   }
   return maxGap;
+}
+
+function loadSecondsOf(loadEndRec, loadSamples) {
+  return loadEndRec?.elapsed ?? loadSamples.at(-1)?.elapsed ?? 0;
+}
+
+// Fixture and the per-minute rate/mix must hold in every run, fixed or control: they are what
+// shows the load was the stated one.
+function loadShapeProblems({ baselineRec, minutes, runningCounts, offProtocolMinutes }, expected) {
+  const problems = [];
+  if (!baselineRec) {
+    problems.push("no baseline record");
+  } else if (baselineRec.fixture?.streamingAgents !== EXPECTED_STREAMING_AGENTS) {
+    problems.push(
+      `streaming agents ${baselineRec.fixture?.streamingAgents} != ${EXPECTED_STREAMING_AGENTS}`,
+    );
+  }
+  const badRunning = runningCounts.filter((n) => n !== EXPECTED_STREAMING_AGENTS);
+  if (badRunning.length > 0)
+    problems.push(
+      `${badRunning.length} sample(s) with running agents != ${EXPECTED_STREAMING_AGENTS}`,
+    );
+  const requiredMinutes = Math.floor(expected.seconds / 60) - 1;
+  if (minutes.length < requiredMinutes)
+    problems.push(`only ${minutes.length} complete minutes, expected ${requiredMinutes}`);
+  if (offProtocolMinutes.length > 0)
+    problems.push(`${offProtocolMinutes.length} off-protocol minute(s)`);
+  return problems;
+}
+
+// A fixed run must carry its full load and its rest; the control is not required to.
+function fixedRunLengthProblems({ samples, loadEndRec, loadSamples, postRestRec }, expected) {
+  const problems = [];
+  const loadSeconds = loadSecondsOf(loadEndRec, loadSamples);
+  if (loadSeconds < expected.seconds - SAMPLE_PERIOD_SECONDS)
+    problems.push(`load ran ${loadSeconds.toFixed(0)}s, expected ${expected.seconds}s`);
+  const expectedSamples = Math.floor(expected.seconds / SAMPLE_PERIOD_SECONDS) + 1;
+  if (samples.length < expectedSamples - 2)
+    problems.push(`only ${samples.length} samples, expected ~${expectedSamples}`);
+  const gap = maxSampleGap(samples);
+  if (gap > SAMPLE_GAP_TOLERANCE_SECONDS + SAMPLE_PERIOD_SECONDS)
+    problems.push(`sample gap ${gap.toFixed(0)}s > ${SAMPLE_PERIOD_SECONDS}s`);
+  if (!postRestRec) {
+    problems.push("no post-rest record (run cut short)");
+  } else {
+    const restSeconds = postRestRec.elapsed - loadSeconds;
+    if (restSeconds < expected.restSeconds - SAMPLE_PERIOD_SECONDS)
+      problems.push(`rest ran ${restSeconds.toFixed(0)}s, expected ${expected.restSeconds}s`);
+  }
+  return problems;
 }
 
 function evaluateFixed(numbers) {
@@ -128,7 +133,9 @@ function evaluateFixed(numbers) {
     },
     {
       name: "max sample within 64 MiB of baseline",
-      ok: numbers.maxAboveBaselineBytes !== null && numbers.maxAboveBaselineBytes <= MAX_ABOVE_BASELINE,
+      ok:
+        numbers.maxAboveBaselineBytes !== null &&
+        numbers.maxAboveBaselineBytes <= MAX_ABOVE_BASELINE,
       detail: `+${mib(numbers.maxAboveBaselineBytes)} MiB (limit ${mib(MAX_ABOVE_BASELINE)})`,
     },
     {
@@ -149,8 +156,7 @@ function evaluateFixed(numbers) {
 }
 
 function evaluateControl(numbers) {
-  const leakShown =
-    numbers.maxAboveBaselineBytes > CONTROL_MIN_RISE || numbers.reachedHeapBound;
+  const leakShown = numbers.maxAboveBaselineBytes > CONTROL_MIN_RISE || numbers.reachedHeapBound;
   const checks = [
     {
       name: "control leak shown",
@@ -159,6 +165,66 @@ function evaluateControl(numbers) {
     },
   ];
   return { checks, verdict: leakShown ? "pass" : "fail" };
+}
+
+function errorCount(cleanupRec, loadEndRec, records) {
+  if (typeof cleanupRec?.rpcErrors === "number") return cleanupRec.rpcErrors;
+  if (typeof loadEndRec?.rpcErrors === "number") return loadEndRec.rpcErrors;
+  return records.filter((r) => r.stage === "rpc-error").length;
+}
+
+function totalMix(minutes) {
+  return Object.fromEntries(
+    MIX_KEYS.map((k) => [k, minutes.reduce((n, m) => n + (m.byKind?.[k] ?? 0), 0)]),
+  );
+}
+
+function buildNumbers(ctx) {
+  const {
+    baseline,
+    maxHeap,
+    loadSamples,
+    postRestRec,
+    cleanupRec,
+    loadEndRec,
+    samples,
+    minutes,
+    baselineRec,
+    offProtocolMinutes,
+    records,
+    workerHeapBoundBytes,
+    expected,
+  } = ctx;
+  const tail = loadSamples.filter(
+    (s) => s.elapsed >= loadSecondsOf(loadEndRec, loadSamples) - 3600,
+  );
+  const numbers = {
+    baselineBytes: baseline,
+    baselineMiB: mib(baseline),
+    maxSampleBytes: maxHeap,
+    maxAboveBaselineBytes: baseline === null ? null : maxHeap - baseline,
+    lastLoadSampleBytes: loadSamples.at(-1)?.heapUsed ?? null,
+    postRestBytes: heapOf(postRestRec),
+    slopeBytesPerHour: leastSquaresSlopePerHour(tail),
+    tailSamples: tail.length,
+    rpcErrors: errorCount(cleanupRec, loadEndRec, records),
+    workerDeaths: cleanupRec?.workerDeaths ?? loadEndRec?.workerDeaths ?? 0,
+    workerHeapBoundBytes,
+    samples: samples.length,
+    maxSampleGapSeconds: maxSampleGap(samples),
+    loadSeconds: loadSecondsOf(loadEndRec, loadSamples),
+    minutes: minutes.length,
+    offProtocolMinutes: offProtocolMinutes.length,
+    streamingAgents: baselineRec?.fixture?.streamingAgents ?? null,
+    expectedRate: expected.rate,
+    mixPerMinute: totalMix(minutes),
+    readStreaming: baselineRec?.readStreaming ?? null,
+    label: baselineRec?.label ?? null,
+  };
+  numbers.reachedHeapBound =
+    numbers.workerDeaths > 0 ||
+    (baseline !== null && maxHeap >= workerHeapBoundBytes * HEAP_BOUND_FRACTION);
+  return numbers;
 }
 
 export function analyze(records, options = {}) {
@@ -179,6 +245,10 @@ export function analyze(records, options = {}) {
     .filter((r) => r.stage === "sample")
     .map((r) => r.agents?.byLifecycle?.running)
     .filter((n) => typeof n === "number");
+  const offProtocolMinutes = minutes.filter(
+    (m) =>
+      m.calls !== expected.rate || MIX_KEYS.some((k) => (m.byKind?.[k] ?? 0) !== EXPECTED_MIX[k]),
+  );
 
   const baseline =
     typeof baselineRec?.baseline?.memory?.heapUsed === "number"
@@ -187,62 +257,49 @@ export function analyze(records, options = {}) {
   const workerHeapBoundBytes =
     baselineRec?.workerHeapBoundBytes ?? options.workerHeapBoundBytes ?? 768 * MIB;
 
-  const { problems, offProtocolMinutes } = protocolProblems(
-    { baselineRec, samples, minutes, loadEndRec, loadSamples, postRestRec, runningCounts },
+  const inconclusive = loadShapeProblems(
+    { baselineRec, minutes, runningCounts, offProtocolMinutes },
     expected,
   );
-  if (baseline === null) problems.push("baseline heapUsed missing");
+  if (baseline === null && !inconclusive.includes("no baseline record"))
+    inconclusive.push("baseline heapUsed missing");
+  if (!control)
+    inconclusive.push(
+      ...fixedRunLengthProblems({ samples, loadEndRec, loadSamples, postRestRec }, expected),
+    );
 
   const maxHeap = loadSamples.reduce((m, s) => Math.max(m, s.heapUsed), baseline ?? 0);
-  const lastHourStart = (loadSamples.at(-1)?.elapsed ?? 0) - 3600;
-  const tail = loadSamples.filter((s) => s.elapsed >= lastHourStart);
-  const numbers = {
-    baselineBytes: baseline,
-    baselineMiB: mib(baseline),
-    maxSampleBytes: maxHeap,
-    maxAboveBaselineBytes: baseline === null ? null : maxHeap - baseline,
-    lastLoadSampleBytes: loadSamples.at(-1)?.heapUsed ?? null,
-    postRestBytes: heapOf(postRestRec),
-    slopeBytesPerHour: leastSquaresSlopePerHour(tail),
-    tailSamples: tail.length,
-    rpcErrors:
-      cleanupRec?.rpcErrors ??
-      loadEndRec?.rpcErrors ??
-      records.filter((r) => r.stage === "rpc-error").length,
-    workerDeaths: cleanupRec?.workerDeaths ?? loadEndRec?.workerDeaths ?? 0,
+  const numbers = buildNumbers({
+    baseline,
+    maxHeap,
+    loadSamples,
+    postRestRec,
+    cleanupRec,
+    loadEndRec,
+    samples,
+    minutes,
+    baselineRec,
+    offProtocolMinutes,
+    records,
     workerHeapBoundBytes,
-    samples: samples.length,
-    maxSampleGapSeconds: maxSampleGap(samples),
-    loadSeconds: loadEndRec?.elapsed ?? loadSamples.at(-1)?.elapsed ?? 0,
-    minutes: minutes.length,
-    offProtocolMinutes: offProtocolMinutes.length,
-    streamingAgents: baselineRec?.fixture?.streamingAgents ?? null,
-    expectedRate: expected.rate,
-    mixPerMinute: Object.fromEntries(
-      MIX_KEYS.map((k) => [k, minutes.reduce((n, m) => n + (m.byKind?.[k] ?? 0), 0)]),
-    ),
-    readStreaming: baselineRec?.readStreaming ?? null,
-    label: baselineRec?.label ?? null,
-  };
-  numbers.reachedHeapBound =
-    numbers.workerDeaths > 0 ||
-    (baseline !== null && maxHeap >= workerHeapBoundBytes * HEAP_BOUND_FRACTION);
+    expected,
+  });
 
-  let evaluation;
-  if (problems.length > 0) {
-    evaluation = { verdict: "inconclusive", checks: [] };
-  } else {
-    evaluation = control ? evaluateControl(numbers) : evaluateFixed(numbers);
-  }
+  const evaluation = decide({ inconclusive, control, numbers });
 
   return {
     verdict: evaluation.verdict,
     control,
-    inconclusive: problems,
+    inconclusive,
     checks: evaluation.checks,
     numbers,
     offProtocolMinutes,
   };
+}
+
+function decide({ inconclusive, control, numbers }) {
+  if (inconclusive.length > 0) return { verdict: "inconclusive", checks: [] };
+  return control ? evaluateControl(numbers) : evaluateFixed(numbers);
 }
 
 function mib(bytes) {
@@ -257,15 +314,21 @@ function printReport(result, source) {
   out.push(`read targets:   ${n.readStreaming ? "all 15 agents (uniform)" : "the 8 idle agents"}`);
   out.push("");
   out.push(`baseline:       ${n.baselineMiB} MiB`);
-  out.push(`max sample:     +${mib(n.maxAboveBaselineBytes)} MiB above baseline (limit ${mib(MAX_ABOVE_BASELINE)})`);
+  out.push(
+    `max sample:     +${mib(n.maxAboveBaselineBytes)} MiB above baseline (limit ${mib(MAX_ABOVE_BASELINE)})`,
+  );
   out.push(`last-hour slope:${mib(n.slopeBytesPerHour)} MiB/h (limit ${mib(MAX_SLOPE_PER_HOUR)})`);
-  out.push(`post-rest:      ${mib(n.postRestBytes)} MiB vs last load ${mib(n.lastLoadSampleBytes)} MiB`);
+  out.push(
+    `post-rest:      ${mib(n.postRestBytes)} MiB vs last load ${mib(n.lastLoadSampleBytes)} MiB`,
+  );
   out.push(`rpc errors:     ${n.rpcErrors}`);
   out.push(`worker deaths:  ${n.workerDeaths}${n.reachedHeapBound ? " (heap bound reached)" : ""}`);
   out.push(
     `calls/minute:   ${n.expectedRate} expected; ${n.minutes} complete minute(s), ${n.offProtocolMinutes} off-protocol`,
   );
-  out.push(`mix per minute: ${JSON.stringify(n.mixPerMinute)} (expected ${JSON.stringify(EXPECTED_MIX)})`);
+  out.push(
+    `mix per minute: ${JSON.stringify(n.mixPerMinute)} (expected ${JSON.stringify(EXPECTED_MIX)})`,
+  );
   out.push(`streaming:      ${n.streamingAgents} agent(s) (expected ${EXPECTED_STREAMING_AGENTS})`);
   out.push(`samples:        ${n.samples}, max gap ${n.maxSampleGapSeconds.toFixed(0)}s`);
   out.push("");
@@ -287,7 +350,8 @@ function exitCodeFor(verdict) {
 }
 
 const isMain =
-  process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(new URL(import.meta.url).pathname);
+  process.argv[1] &&
+  fs.realpathSync(process.argv[1]) === fs.realpathSync(new URL(import.meta.url).pathname);
 
 if (isMain) {
   const args = process.argv.slice(2);

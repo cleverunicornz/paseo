@@ -144,8 +144,7 @@ async function stream(msg) {
       // Diagnostic-only boundary experiment (--boundary-copy): reattach each emitted suffix to a
       // fresh string. It reproduces the advisor's control and must never be used for a
       // release-qualification run.
-      if (msg.copy)
-        item = { ...item, text: Buffer.from(item.text, "utf16le").toString("utf16le") };
+      if (msg.copy) item = { ...item, text: Buffer.from(item.text, "utf16le").toString("utf16le") };
       session.notifySubscribers({ type: "timeline", provider: "claude", item });
     }
     await manager.drainSessionEvents(msg.agentId);

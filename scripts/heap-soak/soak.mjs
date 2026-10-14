@@ -134,6 +134,14 @@ function stopWorker() {
   }
 }
 
+// Wait for the worker to exit so its shutdown cannot recreate the home after cleanup removes it.
+function waitForWorkerExit(timeoutMs = 15000) {
+  if (child.exitCode !== null) return Promise.resolve();
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  const timeout = new Promise((resolve) => setTimeout(resolve, timeoutMs));
+  return Promise.race([exited, timeout]);
+}
+
 // The load loop ends when the daemon is gone; the helper keeps the condition out of the loop.
 function isWorkerAlive() {
   return !workerDead;
@@ -366,7 +374,11 @@ try {
   await sleep(restSeconds * 1000);
   const restSample = await rpc("gc").catch((e) => {
     rpcErrors++;
-    logger("rpc-error", { elapsed: (Date.now() - start) / 1000, kind: "post-rest", message: e.message });
+    logger("rpc-error", {
+      elapsed: (Date.now() - start) / 1000,
+      kind: "post-rest",
+      message: e.message,
+    });
     return null;
   });
   if (restSample) {
@@ -381,6 +393,7 @@ try {
 } finally {
   await Promise.allSettled([...clients].map((c) => c.close()));
   stopWorker();
+  await waitForWorkerExit();
   fs.rmSync(root, { recursive: true, force: true });
   logger("cleanup", {
     root,
