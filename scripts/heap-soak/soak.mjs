@@ -17,12 +17,14 @@
 //            27 short-lived connections a minute — 15 full-history logs reads, 9 inspect,
 //            2 ls, 1 send to an idle agent.
 //   Runs     reads over the 8 idle agents (default) and over all 15 (--read-streaming-agents).
-//   Sampling every 30 s, forced GC, heapUsed + cumulative call counts + RPC errors + worker
-//            deaths; the baseline is sampled after seeding and before load.
+//   Sampling every 30 s, forced GC, heapUsed with cumulative counts by call kind, RPC errors,
+//            streaming failures and worker deaths; the baseline is sampled after seeding and
+//            before load.
 //
-// The minute buckets are indexed by connection number, so every full minute carries exactly
-// 27 calls in the 15/9/2/1 mix. A minute that does not is a protocol break and analyze.mjs
-// reports the run as inconclusive.
+// Minutes are wall-clock buckets (index = floor(elapsed/60)), each emitted with its window, so a
+// stretched or missing minute is visible in the record. Every RPC failure — a call or a stream
+// chunk — is counted and logged. A worker exit is recorded as a `worker-exit` line with its
+// signal and, when the stderr shows it, the heap-limit abort.
 //
 // Options:
 //   --seconds <n>            load seconds (default 14400, four hours)
@@ -59,7 +61,7 @@ const control = flag("--control");
 const boundaryCopy = flag("--boundary-copy");
 const readStreaming = flag("--read-streaming-agents");
 const label = opt("--label") || null;
-const workerHeapBoundBytes = 768 * 1024 ** 2;
+const MAX_OLD_SPACE_MIB = 768;
 
 const req = createRequire(base + "/@getpaseo/server/package.json");
 const WS = req("ws");
@@ -74,14 +76,23 @@ const warn = (msg) => process.stderr.write(`[soak] ${msg}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const child = cp.fork(dir + "worker.mjs", [root], {
-  execArgv: ["--expose-gc", "--max-old-space-size=768"],
+  execArgv: ["--expose-gc", `--max-old-space-size=${MAX_OLD_SPACE_MIB}`],
   env: {
     PATH: "/usr/bin:/bin",
     TMPDIR: root + "/tmp",
     PASEO_HOME: root + "/home",
     PASEO_DIAGNOSTIC_MODULES: base,
   },
-  stdio: ["ignore", "inherit", "inherit", "ipc"],
+  stdio: ["ignore", "inherit", "pipe", "ipc"],
+});
+
+// The worker's own stderr carries the V8 OOM banner when it aborts. Keep it (for the run.err file
+// and the heap-limit evidence), and forward it so nothing is lost.
+let workerStderr = "";
+const HEAP_LIMIT_RE = /Reached heap limit|heap out of memory|Allocation failed/i;
+child.stderr.on("data", (d) => {
+  workerStderr += d.toString();
+  process.stderr.write(d);
 });
 
 const pending = new Map();
@@ -89,10 +100,22 @@ let seq = 0;
 let workerDeaths = 0;
 let workerDead = false;
 let stopping = false;
+let loadStartMs = null;
+const elapsedNow = () => (loadStartMs === null ? 0 : (Date.now() - loadStartMs) / 1000);
+
 child.on("error", () => {}); // a dead worker's IPC errors are reported through workerDeaths
-child.on("exit", (code) => {
+child.on("exit", (code, signal) => {
   workerDead = true;
   if (!stopping) workerDeaths++;
+  const reason = HEAP_LIMIT_RE.exec(workerStderr)?.[0] ?? null;
+  logger("worker-exit", {
+    elapsed: elapsedNow(),
+    code,
+    signal,
+    stopping,
+    oom: reason !== null,
+    reason,
+  });
   for (const p of pending.values()) p.reject(new Error("worker exit " + code));
   pending.clear();
 });
@@ -133,16 +156,12 @@ function stopWorker() {
     child.kill("SIGTERM");
   }
 }
-
-// Wait for the worker to exit so its shutdown cannot recreate the home after cleanup removes it.
 function waitForWorkerExit(timeoutMs = 15000) {
   if (child.exitCode !== null) return Promise.resolve();
   const exited = new Promise((resolve) => child.once("exit", resolve));
   const timeout = new Promise((resolve) => setTimeout(resolve, timeoutMs));
   return Promise.race([exited, timeout]);
 }
-
-// The load loop ends when the daemon is gone; the helper keeps the condition out of the loop.
 function isWorkerAlive() {
   return !workerDead;
 }
@@ -165,27 +184,52 @@ async function close(c) {
   clients.delete(c);
 }
 
-let baseline;
+let baseline = null;
 let maximum = 0;
 let rpcErrors = 0;
+let streamErrors = 0;
+let streamChunks = 0;
 let callsTotal = 0;
+const callsByKind = { logs: 0, inspect: 0, ls: 0, send: 0 };
+const errorsByKind = { logs: 0, inspect: 0, ls: 0, send: 0, stream: 0, sample: 0, other: 0 };
 const samples = [];
 const minutes = [];
-let minute = newMinute(0, 0);
+let bucket = newBucket(0, 0);
 
-function newMinute(index, elapsed) {
-  return { index, elapsed, byKind: { logs: 0, inspect: 0, ls: 0, send: 0 }, calls: 0 };
+function newBucket(index, elapsedStart) {
+  return {
+    index,
+    elapsedStart,
+    elapsedEnd: null,
+    byKind: { logs: 0, inspect: 0, ls: 0, send: 0 },
+    calls: 0,
+  };
+}
+function closeBucket(elapsedEnd) {
+  bucket.elapsedEnd = elapsedEnd;
+  minutes.push({ ...bucket });
+  logger("minute", { ...bucket });
+}
+// Wall-clock buckets: a call at elapsed t belongs to minute floor(t/60). A bucket closes when a
+// call crosses into the next minute, or at load end for the final one. Every full minute then
+// carries exactly `rate` calls, and every bucket records its own window.
+function recordCall(kind, elapsed) {
+  const index = Math.floor(elapsed / 60);
+  while (bucket.index < index) {
+    const boundary = Math.min((bucket.index + 1) * 60, elapsed);
+    closeBucket(boundary);
+    bucket = newBucket(bucket.index + 1, boundary);
+  }
+  bucket.byKind[kind]++;
+  bucket.calls++;
+  callsTotal++;
+  callsByKind[kind]++;
 }
 
-function recordCall(kind, elapsed) {
-  minute.byKind[kind]++;
-  minute.calls++;
-  callsTotal++;
-  if (minute.calls === rate) {
-    minutes.push({ ...minute, elapsedEnd: elapsed });
-    logger("minute", { ...minute, elapsedEnd: elapsed });
-    minute = newMinute(minute.index + 1, elapsed);
-  }
+function countError(kind, elapsed, message) {
+  rpcErrors++;
+  errorsByKind[kind] = (errorsByKind[kind] ?? 0) + 1;
+  logger("rpc-error", { elapsed, kind, message });
 }
 
 // Classify a connection by its number in the run, so every consecutive 27 calls is the fixed mix.
@@ -217,21 +261,17 @@ async function runCall(kind, agents) {
 }
 
 // 7 running agents stream through the real assembler, one 128 KiB message per `period` seconds.
+// A failed stream RPC is counted and logged; the run's counters then show it, so seven held turns
+// can never stand in for seven successful streams.
 async function streamAgents(agents, elapsed, streamed, cycle) {
   for (let i = 0; i < 7; i++) {
     const absolute = Math.floor((elapsed / period) * 2048);
     const targetCycle = Math.floor(absolute / 2048);
     while (cycle[i] < targetCycle) {
       if (streamed[i] < 2048) {
-        await rpc("stream", {
-          agentId: agents[i],
-          start: streamed[i],
-          count: 2048 - streamed[i],
-          copy: boundaryCopy,
-          kind: i % 2 ? "reasoning" : "assistant",
-          key: "message-" + cycle[i],
-          final: true,
-        }).catch(() => {});
+        const count = 2048 - streamed[i];
+        const ok = await streamChunk(agents[i], streamed[i], count, i, cycle[i], elapsed, true);
+        if (ok) streamChunks += count;
       }
       cycle[i]++;
       streamed[i] = 0;
@@ -239,42 +279,59 @@ async function streamAgents(agents, elapsed, streamed, cycle) {
     const target = absolute % 2048;
     const delta = target - streamed[i];
     if (delta > 0) {
-      await rpc("stream", {
-        agentId: agents[i],
-        start: streamed[i],
-        count: delta,
-        copy: boundaryCopy,
-        kind: i % 2 ? "reasoning" : "assistant",
-        key: "message-" + cycle[i],
-      }).catch(() => {});
-      streamed[i] = target;
+      const ok = await streamChunk(agents[i], streamed[i], delta, i, cycle[i], elapsed, false);
+      if (ok) {
+        streamChunks += delta;
+        streamed[i] = target;
+      }
     }
   }
 }
 
-// Sample the forced-GC heap. Periodic samples are recorded as `sample` and join the series the
-// analyzer's slope and bound use; the load-end sample is recorded only as `load-end`.
-async function sampleHeap(elapsed, kind) {
+async function streamChunk(agentId, start, count, i, key, elapsed, final) {
+  try {
+    await rpc("stream", {
+      agentId,
+      start,
+      count,
+      copy: boundaryCopy,
+      kind: i % 2 ? "reasoning" : "assistant",
+      key: "message-" + key,
+      final,
+    });
+    return true;
+  } catch (e) {
+    streamErrors++;
+    countError("stream", elapsed, e.message);
+    return false;
+  }
+}
+
+// Sample the forced-GC heap. Periodic samples join the series the analyzer's slope, bound and
+// per-kind counts use; the load-end sample is recorded only as `load-end`. Each sample carries
+// cumulative counts by call kind, streaming chunks, RPC errors and worker deaths.
+async function sampleHeap(elapsed, stage) {
   const s = await rpc("gc").catch((e) => {
-    rpcErrors++;
-    logger("rpc-error", { elapsed, kind, message: e.message });
+    countError("sample", elapsed, e.message);
     return null;
   });
   if (!s) return null;
   maximum = Math.max(maximum, s.memory.heapUsed);
-  const point = { elapsed, heapUsed: s.memory.heapUsed };
-  if (kind === "sample") {
-    samples.push(point);
-    logger("sample", {
-      elapsed,
-      calls: callsTotal,
-      minutes: minutes.length,
-      rpcErrors,
-      workerDeaths,
-      ...s,
-    });
+  const counters = {
+    calls: callsTotal,
+    byKind: { ...callsByKind },
+    minutes: minutes.length,
+    streamChunks,
+    streamErrors,
+    rpcErrors,
+    workerDeaths,
+    errorsByKind: { ...errorsByKind },
+  };
+  if (stage === "sample") {
+    samples.push({ elapsed, heapUsed: s.memory.heapUsed });
+    logger("sample", { elapsed, ...counters, ...s });
   }
-  return s;
+  return { ...s, ...counters };
 }
 
 try {
@@ -294,7 +351,8 @@ try {
     }
   }
 
-  // Fixture seeded, no load yet: this is the H1 baseline.
+  // Fixture seeded, no load yet: this is the H1 baseline. Its heapStatistics.heap_size_limit is
+  // the worker's real V8 bound, which analyze.mjs uses instead of the requested old-space size.
   baseline = await rpc("gc");
   maximum = baseline.memory.heapUsed;
   logger("baseline", {
@@ -321,18 +379,19 @@ try {
       messageSeconds: period,
       mix: { logs: 15, inspect: 9, ls: 2, send: 1 },
     },
-    workerHeapBoundBytes,
+    workerHeapBoundBytes: MAX_OLD_SPACE_MIB * 1024 ** 2,
+    heapSizeLimitBytes: baseline.heapStatistics?.heap_size_limit ?? null,
     baseline,
   });
 
-  const start = Date.now();
+  loadStartMs = Date.now();
   let nextConnection = 0;
   let nextMeasurement = 0;
   const streamed = Array(7).fill(0);
   const cycle = Array(7).fill(0);
 
-  while (isWorkerAlive() && Date.now() - start < seconds * 1000) {
-    const elapsed = (Date.now() - start) / 1000;
+  while (isWorkerAlive() && Date.now() - loadStartMs < seconds * 1000) {
+    const elapsed = (Date.now() - loadStartMs) / 1000;
 
     await streamAgents(agents, elapsed, streamed, cycle);
 
@@ -341,8 +400,7 @@ try {
       try {
         await runCall(kind, agents);
       } catch (e) {
-        rpcErrors++;
-        logger("rpc-error", { elapsed, kind, message: e.message });
+        countError(kind, elapsed, e.message);
       } finally {
         recordCall(kind, elapsed);
       }
@@ -357,13 +415,16 @@ try {
     await sleep(100);
   }
 
-  const loadEndElapsed = (Date.now() - start) / 1000;
+  const loadEndElapsed = elapsedNow();
+  closeBucket(loadEndElapsed);
   const final = await sampleHeap(loadEndElapsed, "load-end");
   logger("load-end", {
     elapsed: loadEndElapsed,
     calls: callsTotal,
+    byKind: { ...callsByKind },
     minutes: minutes.length,
-    incompleteMinute: minute.calls > 0 ? { ...minute } : null,
+    streamChunks,
+    streamErrors,
     rpcErrors,
     workerDeaths,
     ...final,
@@ -373,17 +434,21 @@ try {
   warn(`resting ${restSeconds}s without churn`);
   await sleep(restSeconds * 1000);
   const restSample = await rpc("gc").catch((e) => {
-    rpcErrors++;
-    logger("rpc-error", {
-      elapsed: (Date.now() - start) / 1000,
-      kind: "post-rest",
-      message: e.message,
-    });
+    countError("other", elapsedNow(), e.message);
     return null;
   });
   if (restSample) {
     maximum = Math.max(maximum, restSample.memory.heapUsed);
-    logger("post-rest", { elapsed: (Date.now() - start) / 1000, ...restSample });
+    logger("post-rest", {
+      elapsed: elapsedNow(),
+      calls: callsTotal,
+      byKind: { ...callsByKind },
+      streamChunks,
+      streamErrors,
+      rpcErrors,
+      workerDeaths,
+      ...restSample,
+    });
   }
 
   if (flag("--snapshot")) {
@@ -398,8 +463,11 @@ try {
   logger("cleanup", {
     root,
     removed: !fs.existsSync(root),
+    calls: callsTotal,
+    byKind: { ...callsByKind },
+    streamChunks,
+    streamErrors,
     rpcErrors,
     workerDeaths,
-    calls: callsTotal,
   });
 }

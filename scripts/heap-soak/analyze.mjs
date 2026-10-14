@@ -8,17 +8,19 @@
 //   node analyze.mjs --control <run.jsonl>  the unfixed build's run (leak must show)
 //
 // Fixed run PASS (P-000269 H1), all required:
-//   zero RPC errors, zero worker deaths;
+//   zero RPC errors (including streaming failures) and zero worker deaths;
 //   max post-GC heapUsed no more than 64 MiB above the baseline;
 //   least-squares slope over the last hour of load below 16 MiB an hour;
 //   post-rest post-GC heapUsed no higher than the last load sample.
-// Control PASS: heap rose more than 500 MB above its baseline, or the worker reached its heap
-//   bound (died, or a sample at/over the bound), within the 4 hours.
+// Control PASS (decimal MB): heap rose more than 500,000,000 bytes above its baseline, or the
+//   worker reached its own V8 heap limit, at any time within the first 14,400 seconds.
 //
-// INCONCLUSIVE when the load breaks its protocol: fewer than 7 streaming agents, a minute off
-// the 27-call 15/9/2/1 rate or mix, or — in a fixed run — a missing 30-second sample or a run
-// cut short of its load or its rest. The control run is expected to die at the heap bound, so
-// its length is not required. The protocol numbers are fixed constants and are never relaxed.
+// INCONCLUSIVE when a required observation is missing or the load breaks its protocol:
+//   a diagnostic copy (--boundary-copy) or altered fixture/protocol settings in the header;
+//   a wall-clock minute missing, duplicated or off the 27-call 15/9/2/1 rate or mix;
+//   a scheduled 30-second sample missing; a load or rest phase short of its full length;
+//   a sample with no observed running-agent count; a worker death that is not a heap-limit abort.
+// A control run is not required to reach four hours when it shows the leak early.
 
 import fs from "node:fs";
 
@@ -28,15 +30,27 @@ const EXPECTED_REST_SECONDS = 300;
 const EXPECTED_RATE = 27;
 const EXPECTED_MIX = { logs: 15, inspect: 9, ls: 2, send: 1 };
 const MIX_KEYS = ["logs", "inspect", "ls", "send"];
-const EXPECTED_STREAMING_AGENTS = 7;
+const EXPECTED_MESSAGE_SECONDS = 1800;
+const EXPECTED_ROW_BYTES = 2048;
+const EXPECTED_FIXTURE = {
+  agents: 15,
+  running: 7,
+  idle: 8,
+  seededRows: 10900,
+  persistentClients: 13,
+  subscribedClients: 2,
+  streamingAgents: 7,
+};
 const MAX_ABOVE_BASELINE = 64 * MIB;
 const MAX_SLOPE_PER_HOUR = 16 * MIB;
-const CONTROL_MIN_RISE = 500 * MIB;
+const CONTROL_MIN_RISE = 500_000_000; // decimal MB, H1
 const SAMPLE_PERIOD_SECONDS = 30;
-const SAMPLE_GAP_TOLERANCE_SECONDS = 40;
-const HEAP_BOUND_FRACTION = 0.95;
+const SAMPLE_GAP_TOLERANCE_SECONDS = 2;
+const MINUTE_WINDOW_TOLERANCE_SECONDS = 2;
+const HEAP_LIMIT_RE = /Reached heap limit|heap out of memory|Allocation failed/i;
 
 const heapOf = (rec) => rec?.memory?.heapUsed ?? rec?.heapUsed ?? null;
+const numberOrNull = (v) => (typeof v === "number" ? v : null);
 
 function leastSquaresSlopePerHour(points) {
   if (points.length < 2) return 0;
@@ -49,93 +63,240 @@ function leastSquaresSlopePerHour(points) {
   return (cov / denom) * 3600;
 }
 
-function collectSeries(records) {
+function readRecords(records) {
   const samples = records
     .filter((r) => r.stage === "sample")
-    .map((r) => ({ elapsed: r.elapsed, heapUsed: heapOf(r) }))
-    .filter((s) => typeof s.heapUsed === "number");
+    .map((r) => ({
+      elapsed: r.elapsed,
+      heapUsed: heapOf(r),
+      running: r.agents?.byLifecycle?.running ?? null,
+      byKind: r.byKind ?? null,
+      rpcErrors: numberOrNull(r.rpcErrors),
+      workerDeaths: numberOrNull(r.workerDeaths),
+    }))
+    .filter((s) => typeof s.elapsed === "number" && typeof s.heapUsed === "number");
   const loadEndRec = records.findLast((r) => r.stage === "load-end") ?? null;
-  const loadEndPoint =
-    loadEndRec && typeof heapOf(loadEndRec) === "number"
-      ? [{ elapsed: loadEndRec.elapsed, heapUsed: heapOf(loadEndRec) }]
-      : [];
+  const loadEnd = loadEndRec
+    ? { elapsed: loadEndRec.elapsed, heapUsed: heapOf(loadEndRec) }
+    : null;
+  const loadSamples = [...samples, ...(loadEnd ? [loadEnd] : [])].sort(
+    (a, b) => a.elapsed - b.elapsed,
+  );
   return {
     samples,
+    loadEnd,
     loadEndRec,
-    loadSamples: [...samples, ...loadEndPoint].sort((a, b) => a.elapsed - b.elapsed),
+    loadSamples,
+    baseline: records.find((r) => r.stage === "baseline") ?? null,
+    postRest: records.find((r) => r.stage === "post-rest") ?? null,
+    cleanup: records.find((r) => r.stage === "cleanup") ?? null,
+    minutes: records.filter((r) => r.stage === "minute"),
+    workerExits: records.filter((r) => r.stage === "worker-exit"),
+    rpcErrorEvents: records.filter((r) => r.stage === "rpc-error"),
   };
 }
 
-function maxSampleGap(samples) {
-  let maxGap = 0;
-  for (let i = 1; i < samples.length; i++) {
-    maxGap = Math.max(maxGap, samples[i].elapsed - samples[i - 1].elapsed);
-  }
-  return maxGap;
-}
-
-function loadSecondsOf(loadEndRec, loadSamples) {
-  return loadEndRec?.elapsed ?? loadSamples.at(-1)?.elapsed ?? 0;
-}
-
-// Fixture and the per-minute rate/mix must hold in every run, fixed or control: they are what
-// shows the load was the stated one.
-function loadShapeProblems({ baselineRec, minutes, runningCounts, offProtocolMinutes }, expected) {
+// The header line carries the run's identity. Any altered protocol or fixture setting, or the
+// diagnostics-only boundary copy, disqualifies the run.
+function headerProblems(header, expected) {
+  if (!header) return ["no baseline record"];
   const problems = [];
-  if (!baselineRec) {
-    problems.push("no baseline record");
-  } else if (baselineRec.fixture?.streamingAgents !== EXPECTED_STREAMING_AGENTS) {
-    problems.push(
-      `streaming agents ${baselineRec.fixture?.streamingAgents} != ${EXPECTED_STREAMING_AGENTS}`,
-    );
+  const b = header.baseline?.memory?.heapUsed;
+  if (typeof b !== "number") problems.push("baseline heapUsed missing");
+  if (header.boundaryCopy === true)
+    problems.push("boundary-copy diagnostic run (never a qualification)");
+  const p = header.protocol ?? {};
+  if (p.seconds !== expected.seconds) problems.push(`protocol.seconds ${p.seconds} != ${expected.seconds}`);
+  if (p.restSeconds !== expected.restSeconds)
+    problems.push(`protocol.restSeconds ${p.restSeconds} != ${expected.restSeconds}`);
+  if (p.connectionsPerMinute !== expected.rate)
+    problems.push(`protocol.connectionsPerMinute ${p.connectionsPerMinute} != ${expected.rate}`);
+  if (p.messageSeconds !== EXPECTED_MESSAGE_SECONDS)
+    problems.push(`protocol.messageSeconds ${p.messageSeconds} != ${EXPECTED_MESSAGE_SECONDS}`);
+  if (MIX_KEYS.some((k) => (p.mix?.[k] ?? null) !== EXPECTED_MIX[k]))
+    problems.push(`protocol.mix ${JSON.stringify(p.mix)} != ${JSON.stringify(EXPECTED_MIX)}`);
+  const f = header.fixture ?? {};
+  for (const [k, v] of Object.entries(EXPECTED_FIXTURE)) {
+    if (f[k] !== v) problems.push(`fixture.${k} ${f[k]} != ${v}`);
   }
-  const badRunning = runningCounts.filter((n) => n !== EXPECTED_STREAMING_AGENTS);
-  if (badRunning.length > 0)
-    problems.push(
-      `${badRunning.length} sample(s) with running agents != ${EXPECTED_STREAMING_AGENTS}`,
-    );
-  const requiredMinutes = Math.floor(expected.seconds / 60) - 1;
-  if (minutes.length < requiredMinutes)
-    problems.push(`only ${minutes.length} complete minutes, expected ${requiredMinutes}`);
-  if (offProtocolMinutes.length > 0)
-    problems.push(`${offProtocolMinutes.length} off-protocol minute(s)`);
+  if (f.rowBytes !== EXPECTED_ROW_BYTES)
+    problems.push(`fixture.rowBytes ${f.rowBytes} != ${EXPECTED_ROW_BYTES}`);
   return problems;
 }
 
-// A fixed run must carry its full load and its rest; the control is not required to.
-function fixedRunLengthProblems({ samples, loadEndRec, loadSamples, postRestRec }, expected) {
+// Wall-clock minute buckets: consecutive indices 0..n-1, each a ~60-second window with exactly
+// `rate` calls in the 15/9/2/1 mix, covering the analysis window [0, windowEnd]. Any deviation is
+// an off-protocol minute.
+function minuteProblems(minutes, expected, windowEnd) {
+  const complete = Math.floor(windowEnd / 60);
   const problems = [];
-  const loadSeconds = loadSecondsOf(loadEndRec, loadSamples);
-  if (loadSeconds < expected.seconds - SAMPLE_PERIOD_SECONDS)
+  const offProtocol = [];
+  const byIndex = new Map();
+  for (const m of minutes) {
+    if (byIndex.has(m.index)) problems.push(`duplicate minute index ${m.index}`);
+    byIndex.set(m.index, m);
+    if (m.index >= complete) continue; // a trailing partial bucket is allowed
+    const window = m.elapsedEnd - m.elapsedStart;
+    const offWindow = Math.abs(window - 60) > MINUTE_WINDOW_TOLERANCE_SECONDS;
+    const offMix = MIX_KEYS.some((k) => (m.byKind?.[k] ?? null) !== EXPECTED_MIX[k]);
+    if (m.calls !== expected.rate || offMix || offWindow) offProtocol.push(m);
+  }
+  for (let i = 0; i < complete; i++) {
+    if (!byIndex.has(i)) problems.push(`missing minute index ${i}`);
+  }
+  if (minutes.length < complete)
+    problems.push(`only ${minutes.length} minute buckets, expected ${complete}`);
+  if (offProtocol.length > 0) problems.push(`${offProtocol.length} off-protocol minute(s)`);
+  return { problems, offProtocol };
+}
+
+// Every scheduled 30-second sample through the window must be present and must carry its
+// cumulative per-kind counts and the observed running-agent count that establishes seven streams.
+// The load-end sample (at windowEnd) counts toward the window's span.
+function sampleProblems(samples, loadSamples, windowEnd) {
+  const problems = [];
+  const expectedCount = Math.floor(windowEnd / SAMPLE_PERIOD_SECONDS);
+  const inWindow = loadSamples.filter((s) => s.elapsed <= windowEnd);
+  if (samples.length < expectedCount)
+    problems.push(`only ${samples.length} samples, expected ${expectedCount}`);
+  let maxGap = 0;
+  for (let i = 1; i < inWindow.length; i++) {
+    maxGap = Math.max(maxGap, inWindow[i].elapsed - inWindow[i - 1].elapsed);
+  }
+  if (maxGap > SAMPLE_PERIOD_SECONDS + SAMPLE_GAP_TOLERANCE_SECONDS)
+    problems.push(`sample gap ${maxGap.toFixed(1)}s > ${SAMPLE_PERIOD_SECONDS}s (a missing sample)`);
+  const spanEnd = inWindow.at(-1)?.elapsed ?? 0;
+  if (spanEnd < windowEnd - SAMPLE_GAP_TOLERANCE_SECONDS)
+    problems.push(`sampled span ${spanEnd.toFixed(0)}s < ${windowEnd}s`);
+  const missingInstrument = samples.filter((s) => s.byKind === null).length;
+  if (missingInstrument > 0)
+    problems.push(`${missingInstrument} sample(s) without cumulative counts by kind`);
+  const missingRunning = samples.filter((s) => s.running === null).length;
+  if (missingRunning > 0)
+    problems.push(`${missingRunning} sample(s) without an observed running-agent count`);
+  const wrongRunning = samples.filter(
+    (s) => s.running !== null && s.running !== EXPECTED_FIXTURE.running,
+  ).length;
+  if (wrongRunning > 0)
+    problems.push(`${wrongRunning} sample(s) with running agents != ${EXPECTED_FIXTURE.running}`);
+  return { problems, maxGap };
+}
+
+// A fixed run must carry its full load and its rest. A control that shows the leak early is judged
+// only through that point, so this is required of a control only when no leak is demonstrated.
+function phaseProblems(loadEnd, postRest, samples, expected) {
+  const problems = [];
+  const loadSeconds = loadEnd?.elapsed ?? samples.at(-1)?.elapsed ?? 0;
+  if (loadSeconds < expected.seconds - SAMPLE_GAP_TOLERANCE_SECONDS)
     problems.push(`load ran ${loadSeconds.toFixed(0)}s, expected ${expected.seconds}s`);
-  const expectedSamples = Math.floor(expected.seconds / SAMPLE_PERIOD_SECONDS) + 1;
-  if (samples.length < expectedSamples - 2)
-    problems.push(`only ${samples.length} samples, expected ~${expectedSamples}`);
-  const gap = maxSampleGap(samples);
-  if (gap > SAMPLE_GAP_TOLERANCE_SECONDS + SAMPLE_PERIOD_SECONDS)
-    problems.push(`sample gap ${gap.toFixed(0)}s > ${SAMPLE_PERIOD_SECONDS}s`);
-  if (!postRestRec) {
+  if (loadSeconds > expected.seconds + SAMPLE_GAP_TOLERANCE_SECONDS)
+    problems.push(`load ran ${loadSeconds.toFixed(0)}s, past its ${expected.seconds}s window`);
+  if (!postRest) {
     problems.push("no post-rest record (run cut short)");
   } else {
-    const restSeconds = postRestRec.elapsed - loadSeconds;
-    if (restSeconds < expected.restSeconds - SAMPLE_PERIOD_SECONDS)
+    const restSeconds = postRest.elapsed - loadSeconds;
+    if (restSeconds < expected.restSeconds - SAMPLE_GAP_TOLERANCE_SECONDS)
       problems.push(`rest ran ${restSeconds.toFixed(0)}s, expected ${expected.restSeconds}s`);
   }
   return problems;
+}
+
+// Cumulative counters must never be erased by a later, smaller one: take the maximum observed and
+// reconcile with the event records.
+function reconcileCounters({ samples, loadEndRec, postRest, cleanup, workerExits, rpcErrorEvents }) {
+  const observed = [loadEndRec, postRest, cleanup, ...samples];
+  const maxOf = (field, events) =>
+    Math.max(
+      ...observed.map((r) => numberOrNull(r?.[field]) ?? 0),
+      events.length,
+      0,
+    );
+  const deaths = maxOf("workerDeaths", workerExits.filter((r) => r.stopping !== true));
+  const errors = maxOf("rpcErrors", rpcErrorEvents);
+  const streamErrors = Math.max(...observed.map((r) => numberOrNull(r?.streamErrors) ?? 0), 0);
+  const oomDeaths = workerExits.filter(
+    (r) =>
+      r.stopping !== true &&
+      (r.oom === true || (typeof r.reason === "string" && HEAP_LIMIT_RE.test(r.reason)) || r.signal === "SIGABRT"),
+  );
+  return { errors, deaths, streamErrors, oomDeaths, unexplainedDeaths: Math.max(0, deaths - oomDeaths.length) };
+}
+
+function buildNumbers(ctx) {
+  const {
+    baseline,
+    loadSamples,
+    loadEnd,
+    postRest,
+    counters,
+    header,
+    minutes,
+    samples,
+    offProtocol,
+    maxGap,
+  } = ctx;
+  const tail = loadSamples.filter((s) => s.elapsed >= (loadEnd?.elapsed ?? 0) - 3600);
+  const maxHeap = loadSamples.reduce((m, s) => Math.max(m, s.heapUsed), baseline ?? 0);
+  const heapBound = header?.heapSizeLimitBytes ?? header?.workerHeapBoundBytes ?? null;
+  const reachedBound = counters.oomDeaths.length > 0 || reachedBoundByHeap(loadSamples, heapBound);
+  return {
+    baselineBytes: baseline,
+    baselineMiB: mib(baseline),
+    maxSampleBytes: maxHeap,
+    maxAboveBaselineBytes: baseline === null ? null : maxHeap - baseline,
+    lastLoadSampleBytes: loadSamples.at(-1)?.heapUsed ?? null,
+    postRestBytes: heapOf(postRest),
+    slopeBytesPerHour: leastSquaresSlopePerHour(tail),
+    tailSamples: tail.length,
+    rpcErrors: counters.errors,
+    streamErrors: counters.streamErrors,
+    workerDeaths: counters.deaths,
+    oomDeaths: counters.oomDeaths.length,
+    unexplainedDeaths: counters.unexplainedDeaths,
+    heapBoundBytes: heapBound,
+    reachedHeapBound: reachedBound,
+    samples: samples.length,
+    maxSampleGapSeconds: maxGap,
+    loadSeconds: loadEnd?.elapsed ?? loadSamples.at(-1)?.elapsed ?? 0,
+    minutes: minutes.length,
+    offProtocolMinutes: offProtocol.length,
+    streamingAgents: samples.find((s) => s.running !== null)?.running ?? null,
+    mixPerMinute: totalMix(minutes),
+    ...identity(header, ctx.expected),
+  };
+}
+
+function identity(header, expected) {
+  return {
+    expectedRate: expected.rate,
+    readStreaming: header?.readStreaming ?? null,
+    control: header?.control ?? null,
+    label: header?.label ?? null,
+  };
+}
+
+function reachedBoundByHeap(loadSamples, heapBound) {
+  if (typeof heapBound !== "number") return false;
+  return loadSamples.some((s) => s.heapUsed >= heapBound);
+}
+
+function totalMix(minutes) {
+  return Object.fromEntries(
+    MIX_KEYS.map((k) => [k, minutes.reduce((n, m) => n + (m.byKind?.[k] ?? 0), 0)]),
+  );
 }
 
 function evaluateFixed(numbers) {
   const checks = [
     {
       name: "zero RPC errors and worker deaths",
-      ok: numbers.rpcErrors === 0 && numbers.workerDeaths === 0,
-      detail: `${numbers.rpcErrors} error(s), ${numbers.workerDeaths} death(s)`,
+      ok: numbers.rpcErrors === 0 && numbers.streamErrors === 0 && numbers.workerDeaths === 0,
+      detail: `${numbers.rpcErrors} rpc error(s), ${numbers.streamErrors} stream error(s), ${numbers.workerDeaths} death(s)`,
     },
     {
       name: "max sample within 64 MiB of baseline",
       ok:
-        numbers.maxAboveBaselineBytes !== null &&
-        numbers.maxAboveBaselineBytes <= MAX_ABOVE_BASELINE,
+        numbers.maxAboveBaselineBytes !== null && numbers.maxAboveBaselineBytes <= MAX_ABOVE_BASELINE,
       detail: `+${mib(numbers.maxAboveBaselineBytes)} MiB (limit ${mib(MAX_ABOVE_BASELINE)})`,
     },
     {
@@ -155,151 +316,100 @@ function evaluateFixed(numbers) {
   return { checks, verdict: checks.every((c) => c.ok) ? "pass" : "fail" };
 }
 
-function evaluateControl(numbers) {
-  const leakShown = numbers.maxAboveBaselineBytes > CONTROL_MIN_RISE || numbers.reachedHeapBound;
-  const checks = [
-    {
-      name: "control leak shown",
-      ok: leakShown,
-      detail: `max +${mib(numbers.maxAboveBaselineBytes)} MiB above baseline (>${mib(CONTROL_MIN_RISE)} MiB) or heap bound reached (${numbers.reachedHeapBound})`,
-    },
-  ];
-  return { checks, verdict: leakShown ? "pass" : "fail" };
+// The control shows the load leaks when its heap rises more than 500,000,000 bytes (decimal MB)
+// above its own baseline, or reaches the worker's own V8 heap limit, at any time within the first
+// 14,400 seconds. Returns the earliest such point, which bounds what completeness is required.
+function leakEvidence({ loadSamples, counters, baseline, heapBoundBytes, expectedSeconds }) {
+  const limit = expectedSeconds + SAMPLE_GAP_TOLERANCE_SECONDS;
+  let elapsed = Infinity;
+  for (const s of loadSamples) {
+    if (s.elapsed > limit) continue;
+    const rose = baseline !== null && s.heapUsed - baseline > CONTROL_MIN_RISE;
+    const bound = typeof heapBoundBytes === "number" && s.heapUsed >= heapBoundBytes;
+    if (rose || bound) elapsed = Math.min(elapsed, s.elapsed);
+  }
+  for (const d of counters.oomDeaths) {
+    const e = typeof d.elapsed === "number" ? d.elapsed : 0;
+    if (e <= limit) elapsed = Math.min(elapsed, e);
+  }
+  const leakShown = elapsed !== Infinity;
+  return { leakShown, leakElapsed: leakShown ? elapsed : null };
 }
 
-function errorCount(cleanupRec, loadEndRec, records) {
-  if (typeof cleanupRec?.rpcErrors === "number") return cleanupRec.rpcErrors;
-  if (typeof loadEndRec?.rpcErrors === "number") return loadEndRec.rpcErrors;
-  return records.filter((r) => r.stage === "rpc-error").length;
-}
-
-function totalMix(minutes) {
-  return Object.fromEntries(
-    MIX_KEYS.map((k) => [k, minutes.reduce((n, m) => n + (m.byKind?.[k] ?? 0), 0)]),
-  );
-}
-
-function buildNumbers(ctx) {
-  const {
-    baseline,
-    maxHeap,
-    loadSamples,
-    postRestRec,
-    cleanupRec,
-    loadEndRec,
-    samples,
-    minutes,
-    baselineRec,
-    offProtocolMinutes,
-    records,
-    workerHeapBoundBytes,
-    expected,
-  } = ctx;
-  const tail = loadSamples.filter(
-    (s) => s.elapsed >= loadSecondsOf(loadEndRec, loadSamples) - 3600,
-  );
-  const numbers = {
-    baselineBytes: baseline,
-    baselineMiB: mib(baseline),
-    maxSampleBytes: maxHeap,
-    maxAboveBaselineBytes: baseline === null ? null : maxHeap - baseline,
-    lastLoadSampleBytes: loadSamples.at(-1)?.heapUsed ?? null,
-    postRestBytes: heapOf(postRestRec),
-    slopeBytesPerHour: leastSquaresSlopePerHour(tail),
-    tailSamples: tail.length,
-    rpcErrors: errorCount(cleanupRec, loadEndRec, records),
-    workerDeaths: cleanupRec?.workerDeaths ?? loadEndRec?.workerDeaths ?? 0,
-    workerHeapBoundBytes,
-    samples: samples.length,
-    maxSampleGapSeconds: maxSampleGap(samples),
-    loadSeconds: loadSecondsOf(loadEndRec, loadSamples),
-    minutes: minutes.length,
-    offProtocolMinutes: offProtocolMinutes.length,
-    streamingAgents: baselineRec?.fixture?.streamingAgents ?? null,
-    expectedRate: expected.rate,
-    mixPerMinute: totalMix(minutes),
-    readStreaming: baselineRec?.readStreaming ?? null,
-    label: baselineRec?.label ?? null,
+function evaluateControl(leakShown, numbers) {
+  return {
+    checks: [
+      {
+        name: "control leak shown",
+        ok: leakShown,
+        detail: `rose > ${CONTROL_MIN_RISE} bytes above baseline or reached the heap limit (${mib(numbers.heapBoundBytes)} MiB) within ${EXPECTED_SECONDS}s`,
+      },
+    ],
+    verdict: leakShown ? "pass" : "fail",
   };
-  numbers.reachedHeapBound =
-    numbers.workerDeaths > 0 ||
-    (baseline !== null && maxHeap >= workerHeapBoundBytes * HEAP_BOUND_FRACTION);
-  return numbers;
 }
 
 export function analyze(records, options = {}) {
   const control = options.control ?? false;
   const expected = {
-    control,
     seconds: options.expectedSeconds ?? EXPECTED_SECONDS,
     restSeconds: options.expectedRestSeconds ?? EXPECTED_REST_SECONDS,
     rate: options.expectedRate ?? EXPECTED_RATE,
   };
-
-  const baselineRec = records.find((r) => r.stage === "baseline") ?? null;
-  const postRestRec = records.find((r) => r.stage === "post-rest") ?? null;
-  const cleanupRec = records.find((r) => r.stage === "cleanup") ?? null;
-  const { samples, loadEndRec, loadSamples } = collectSeries(records);
-  const minutes = records.filter((r) => r.stage === "minute");
-  const runningCounts = records
-    .filter((r) => r.stage === "sample")
-    .map((r) => r.agents?.byLifecycle?.running)
-    .filter((n) => typeof n === "number");
-  const offProtocolMinutes = minutes.filter(
-    (m) =>
-      m.calls !== expected.rate || MIX_KEYS.some((k) => (m.byKind?.[k] ?? 0) !== EXPECTED_MIX[k]),
-  );
-
+  const r = readRecords(records);
   const baseline =
-    typeof baselineRec?.baseline?.memory?.heapUsed === "number"
-      ? baselineRec.baseline.memory.heapUsed
+    typeof r.baseline?.baseline?.memory?.heapUsed === "number"
+      ? r.baseline.baseline.memory.heapUsed
       : null;
-  const workerHeapBoundBytes =
-    baselineRec?.workerHeapBoundBytes ?? options.workerHeapBoundBytes ?? 768 * MIB;
+  const counters = reconcileCounters(r);
+  const header = r.baseline;
+  const heapBoundBytes = header?.heapSizeLimitBytes ?? header?.workerHeapBoundBytes ?? null;
+  const leak = leakEvidence({
+    loadSamples: r.loadSamples,
+    counters,
+    baseline,
+    heapBoundBytes,
+    expectedSeconds: expected.seconds,
+  });
 
-  const inconclusive = loadShapeProblems(
-    { baselineRec, minutes, runningCounts, offProtocolMinutes },
-    expected,
-  );
-  if (baseline === null && !inconclusive.includes("no baseline record"))
-    inconclusive.push("baseline heapUsed missing");
-  if (!control)
-    inconclusive.push(
-      ...fixedRunLengthProblems({ samples, loadEndRec, loadSamples, postRestRec }, expected),
-    );
+  // A control that shows the leak early must be complete only through the leak point; every other
+  // run must be complete through the full four hours.
+  const windowEnd = control && leak.leakShown ? leak.leakElapsed : expected.seconds;
+  const minutes = minuteProblems(r.minutes, expected, windowEnd);
+  const sampleCheck = sampleProblems(r.samples, r.loadSamples, windowEnd);
 
-  const maxHeap = loadSamples.reduce((m, s) => Math.max(m, s.heapUsed), baseline ?? 0);
   const numbers = buildNumbers({
     baseline,
-    maxHeap,
-    loadSamples,
-    postRestRec,
-    cleanupRec,
-    loadEndRec,
-    samples,
-    minutes,
-    baselineRec,
-    offProtocolMinutes,
-    records,
-    workerHeapBoundBytes,
+    loadSamples: r.loadSamples,
+    loadEnd: r.loadEnd,
+    postRest: r.postRest,
+    counters,
+    header,
+    minutes: r.minutes,
+    samples: r.samples,
+    offProtocol: minutes.offProtocol,
+    maxGap: sampleCheck.maxGap,
     expected,
   });
 
-  const evaluation = decide({ inconclusive, control, numbers });
+  const inconclusive = [
+    ...headerProblems(header, expected),
+    ...minutes.problems,
+    ...sampleCheck.problems,
+    ...phaseKindProblems(control, leak.leakShown, counters.unexplainedDeaths),
+    ...phaseProblems(r.loadEnd, r.postRest, r.samples, expected),
+  ];
+
+  const evaluation = control ? evaluateControl(leak.leakShown, numbers) : evaluateFixed(numbers);
 
   return {
-    verdict: evaluation.verdict,
+    verdict: inconclusive.length > 0 ? "inconclusive" : evaluation.verdict,
     control,
     inconclusive,
-    checks: evaluation.checks,
+    checks: inconclusive.length > 0 ? [] : evaluation.checks,
     numbers,
-    offProtocolMinutes,
+    offProtocolMinutes: minutes.offProtocol,
   };
-}
-
-function decide({ inconclusive, control, numbers }) {
-  if (inconclusive.length > 0) return { verdict: "inconclusive", checks: [] };
-  return control ? evaluateControl(numbers) : evaluateFixed(numbers);
 }
 
 function mib(bytes) {
@@ -321,22 +431,26 @@ function printReport(result, source) {
   out.push(
     `post-rest:      ${mib(n.postRestBytes)} MiB vs last load ${mib(n.lastLoadSampleBytes)} MiB`,
   );
-  out.push(`rpc errors:     ${n.rpcErrors}`);
-  out.push(`worker deaths:  ${n.workerDeaths}${n.reachedHeapBound ? " (heap bound reached)" : ""}`);
+  out.push(`rpc errors:     ${n.rpcErrors} (+${n.streamErrors} stream)`);
   out.push(
-    `calls/minute:   ${n.expectedRate} expected; ${n.minutes} complete minute(s), ${n.offProtocolMinutes} off-protocol`,
+    `worker deaths:  ${n.workerDeaths} (${n.oomDeaths} at the heap limit)${n.reachedHeapBound ? " [heap bound reached]" : ""}`,
+  );
+  out.push(
+    `calls/minute:   ${n.expectedRate} expected; ${n.minutes} minute(s), ${n.offProtocolMinutes} off-protocol`,
   );
   out.push(
     `mix per minute: ${JSON.stringify(n.mixPerMinute)} (expected ${JSON.stringify(EXPECTED_MIX)})`,
   );
-  out.push(`streaming:      ${n.streamingAgents} agent(s) (expected ${EXPECTED_STREAMING_AGENTS})`);
-  out.push(`samples:        ${n.samples}, max gap ${n.maxSampleGapSeconds.toFixed(0)}s`);
+  out.push(`streaming:      ${n.streamingAgents} agent(s) (expected ${EXPECTED_FIXTURE.streamingAgents})`);
+  out.push(`samples:        ${n.samples}, max gap ${n.maxSampleGapSeconds.toFixed(1)}s`);
   out.push("");
   for (const m of result.offProtocolMinutes.slice(0, 20)) {
-    out.push(`  off-protocol minute #${m.index}: ${m.calls} calls ${JSON.stringify(m.byKind)}`);
+    out.push(
+      `  off-protocol minute #${m.index}: ${(m.elapsedEnd - m.elapsedStart).toFixed(1)}s, ${m.calls} calls ${JSON.stringify(m.byKind)}`,
+    );
   }
   for (const c of result.checks) out.push(`${c.ok ? "PASS" : "FAIL"}  ${c.name}: ${c.detail}`);
-  for (const r of result.inconclusive) out.push(`INCONCLUSIVE  ${r}`);
+  for (const p of result.inconclusive) out.push(`INCONCLUSIVE  ${p}`);
   out.push("");
   out.push(`VERDICT: ${result.verdict.toUpperCase()}`);
   out.push(JSON.stringify(result));
