@@ -1,0 +1,189 @@
+name: Console daemon qualification
+
+# The console line (infra-v2 P-000269 H2): the console runs upstream v0.11.2 with the fork's
+# leak fix, released from this line alone. A branch of this workflow qualifies the line on
+# every pull request and push, and publishes a source-qualified release when dispatched with
+# a tag. The release rules live in scripts/console-release-channel.mjs.
+
+on:
+  pull_request:
+    # The console's candidate lane and its trunk, per the release rules below.
+    branches: [console/main, candidate/console-heap-0.11.2]
+  push:
+    branches: [console/main, candidate/console-heap-0.11.2]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Publish a release from the console line (empty for checks only)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  ONNXRUNTIME_NODE_INSTALL: skip
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+jobs:
+  daemon:
+    # The build is compile-bound (TypeScript over the seven packages, then the app's web
+    # export into the server's dist), so it runs natively on build-native with its package
+    # caches (I-000094, ci-runners "Package caches on build-native, automatic"). No Docker
+    # stage exists for this line, so no Dockerfile is involved and no compiler runs in one.
+    runs-on: { group: ci, labels: build-native }
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install verified Node 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --output /tmp/paseo-node.tar.xz https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+          echo 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de  /tmp/paseo-node.tar.xz' | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/paseo-node"
+          tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
+          echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
+      - name: Check the release rules
+        run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs
+      - name: Check the release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/console-release-channel.mjs "$GITHUB_REF" "$RELEASE_TAG" "$(node -p 'require("./packages/server/package.json").version')"
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build daemon and CLI
+        run: npm run build:server
+      - name: Build the bundled web UI
+        # The server tarball ships dist/server/web-ui; the image's install serves it.
+        run: npm run build:daemon-web-ui
+      - name: Check source
+        run: |
+          npm run lint
+          npm run typecheck:server
+          npm run format:check
+      - name: Check the managed-update anchors
+        # runner-images images/repo-pod/paseo-managed-update.mjs edits these two exact anchors
+        # in the built server and fails its image build if either is not found exactly once.
+        # The console's line must keep them, so this job proves the built output still carries
+        # them. Nothing here edits the source the anchors sit in.
+        shell: bash
+        run: |
+          set -euo pipefail
+          server=packages/server/dist/server/server
+          count_cli="$(grep -c 'installLatest(options = {})' "$server/session/daemon/npm-global-cli.js" || true)"
+          test "$count_cli" = 1
+          count_update="$(grep -c 'daemonSelfUpdate: this.daemonRuntimeConfig?.desktopManaged !== true,' "$server/websocket-server.js" || true)"
+          test "$count_update" = 1
+          # The built files must be byte-identical to what upstream published at this commit
+          # apart from the version, which is read from package.json at runtime, not baked in.
+          test "$(grep -c '0\.11\.2' "$server/session/daemon/npm-global-cli.js" || true)" = 0
+          test "$(grep -c '0\.11\.2' "$server/websocket-server.js" || true)" = 0
+      - name: Set the release version
+        # Every workspace package takes the tag's version without the leading "v" before
+        # packing (P-000269 H2). The repo's own sync script rewrites the packages' internal
+        # dependency ranges too, so the seven tarballs resolve each other and never the
+        # registry's base version.
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          node -e 'const fs = require("node:fs"); const p = JSON.parse(fs.readFileSync("package.json", "utf8")); p.version = process.argv[1]; fs.writeFileSync("package.json", `${JSON.stringify(p, null, 2)}\n`);' "$version"
+          node scripts/sync-workspace-versions.mjs
+          test "$(node -p 'require("./packages/server/package.json").version')" = "$version"
+      - name: Pack release packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/paseo-release"
+          for package in highlight relay protocol client plugin server cli; do
+            npm pack --ignore-scripts --workspace="@getpaseo/$package" --pack-destination "$RUNNER_TEMP/paseo-release"
+          done
+          cd "$RUNNER_TEMP/paseo-release"
+          sha256sum *.tgz > SHA256SUMS
+          sha512sum *.tgz > SHA512SUMS
+          printf '%s\n' "$GITHUB_SHA" > SOURCE_COMMIT
+          node --version > NODE_VERSION
+      - name: Install the release packages as the session image does
+        # As runner-images images/repo-pod/install-paseo-release.sh: the seven packages in one
+        # global install, each at the packages' version, the CLI resolving the installed server.
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./packages/server/package.json").version')"
+          image="$RUNNER_TEMP/paseo-image"
+          (cd "$RUNNER_TEMP/paseo-release" && sha256sum --check SHA256SUMS)
+          npm install --global --prefix "$image" --no-audit --no-fund "$RUNNER_TEMP/paseo-release/"*.tgz
+          node --input-type=module - "$image/lib/node_modules" "$version" <<'JS'
+          import assert from "node:assert/strict";
+          import fs from "node:fs";
+          import path from "node:path";
+          import { createRequire } from "node:module";
+          const [root, version] = process.argv.slice(2);
+          for (const name of ["highlight", "relay", "protocol", "client", "plugin", "server", "cli"]) {
+            const pkg = JSON.parse(fs.readFileSync(path.join(root, "@getpaseo", name, "package.json"), "utf8"));
+            assert.equal(pkg.version, version, `@getpaseo/${name}`);
+          }
+          const fromCli = createRequire(path.join(root, "@getpaseo/cli/package.json"));
+          assert.equal(
+            fs.realpathSync(fromCli.resolve("@getpaseo/server")),
+            fs.realpathSync(path.join(root, "@getpaseo/server/dist/server/server/exports.js")),
+          );
+          JS
+          test "$("$image/bin/paseo" --version)" = "$version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paseo-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/paseo-release
+          retention-days: 7
+          if-no-files-found: error
+      - name: Publish source-qualified release
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The trunk publishes a release; the candidate lane, a prerelease (scripts/console-release-channel.mjs).
+          version="$(node -p 'require("./packages/server/package.json").version')"
+          channel="$(node scripts/console-release-channel.mjs "$GITHUB_REF" "$RELEASE_TAG" "$version")"
+          prerelease=()
+          if [ "$channel" = prerelease ]; then prerelease=(--prerelease); fi
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/paseo-release/"* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$RELEASE_TAG" "${prerelease[@]}" --notes 'Source-built daemon packages. Package names and protocol remain compatible with the upstream release. Install all seven packages together; SHA256SUMS and SHA512SUMS bind the assets. SOURCE_COMMIT and NODE_VERSION retain build identity.'
+
+  server-unit:
+    # The server's unit suite, beyond what the build job proves. It runs on build-native too:
+    # the suite builds the workspace stack and drives subprocess-heavy git and agent tests,
+    # and the build set's package caches carry the npm store it needs.
+    runs-on: { group: ci, labels: build-native }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install verified Node 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --output /tmp/paseo-node.tar.xz https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+          echo 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de  /tmp/paseo-node.tar.xz' | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/paseo-node"
+          tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
+          echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build server dependencies
+        run: npm run build:server-deps
+      - name: Run the server unit suite
+        run: npm run test:unit --workspace=@getpaseo/server -- --maxWorkers=6 --exclude "src/server/file-observer/**"
+      - name: Run the file observer suites alone
+        # Upstream's thousand-write stress test times out under the parallel run's load; alone,
+        # with retries, it still has to pass.
+        working-directory: packages/server
+        run: npx vitest run src/server/file-observer --maxWorkers=1 --retry=2

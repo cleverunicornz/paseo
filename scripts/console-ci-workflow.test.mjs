@@ -31,12 +31,10 @@ const step = (name) => {
   return found;
 };
 
-test("pull requests into the console line and its trunk run; pushes only on the trunk", () => {
-  assert.match(
-    workflow,
-    /pull_request:\n(?: {4}#.*\n)* {4}branches: \[console\/main, candidate\/console-heap-0\.11\.2\]/,
-  );
-  assert.match(workflow, /push:\n {4}branches: \[console\/main\]\n/);
+test("pull requests into and pushes to the console line and its trunk both run", () => {
+  const branches = "\\[console\\/main, candidate\\/console-heap-0\\.11\\.2\\]";
+  assert.match(workflow, new RegExp(`pull_request:\\n(?: {4}#.*\\n)* {4}branches: ${branches}`));
+  assert.match(workflow, new RegExp(`push:\\n(?: {4}#.*\\n)* {4}branches: ${branches}\\n`));
 });
 
 test("the release scripts are tested on every run", () => {

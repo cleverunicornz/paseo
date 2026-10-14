@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import test from "node:test";
-import { CONSOLE_CANDIDATE_REF, CONSOLE_TRUNK_REF, resolveConsoleReleaseChannel } from "./console-release-channel.mjs";
+import {
+  CONSOLE_CANDIDATE_REF,
+  CONSOLE_TRUNK_REF,
+  resolveConsoleReleaseChannel,
+} from "./console-release-channel.mjs";
 
 // The console line's packages carry upstream v0.11.2 (infra-v2 P-000269 H2).
 const version = "0.11.2";
@@ -69,8 +73,14 @@ test("the candidate lane refuses every tag that is not v<version>-cvu.N-rc.M", (
 
 test("the lane's own tag is refused on the trunk, and the trunk's on the lane", () => {
   // Every (ref, tag) pair beyond the two allowed ones refuses.
-  assert.throws(() => channel(CONSOLE_TRUNK_REF, "v0.11.2-cvu.1-rc.1"), /The console trunk publishes/);
-  assert.throws(() => channel(CONSOLE_CANDIDATE_REF, "v0.11.2-cvu.1"), /The console candidate lane publishes/);
+  assert.throws(
+    () => channel(CONSOLE_TRUNK_REF, "v0.11.2-cvu.1-rc.1"),
+    /The console trunk publishes/,
+  );
+  assert.throws(
+    () => channel(CONSOLE_CANDIDATE_REF, "v0.11.2-cvu.1"),
+    /The console candidate lane publishes/,
+  );
 });
 
 test("no other ref publishes, whatever the tag", () => {
@@ -98,7 +108,10 @@ test("no other ref publishes, whatever the tag", () => {
 test("the packages' own version gates the tag", () => {
   // A tag naming another version is not a tag for these packages.
   assert.throws(() => channel(CONSOLE_TRUNK_REF, "v0.11.3-cvu.1"), /not "v0\.11\.3-cvu\.1"/);
-  assert.throws(() => channel(CONSOLE_CANDIDATE_REF, "v0.11.3-cvu.1-rc.1"), /not "v0\.11\.3-cvu\.1-rc\.1"/);
+  assert.throws(
+    () => channel(CONSOLE_CANDIDATE_REF, "v0.11.3-cvu.1-rc.1"),
+    /not "v0\.11\.3-cvu\.1-rc\.1"/,
+  );
 });
 
 test("the command line prints the channel, and refuses with the reason and a non-zero exit", () => {
