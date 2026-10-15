@@ -1254,6 +1254,77 @@ test("round 7 finding 1: a run that loses its two subscribed clients is inconclu
   assert.equal(verdictOf(r), "pass");
 });
 
+// --- Round 8: a failure before the baseline, and no exception deciding the exit code --------
+
+// The validator's real-writer series (round 8), verbatim: the worker failed to start (its server
+// bundle absent), and a fixture-creation RPC failed (the driver then stops its worker and cleans
+// up). Neither reaches the baseline.
+const PRE_BASELINE = {
+  "worker startup failure": [
+    '{"time":"2026-10-15T03:45:17.219Z","stage":"worker-exit","elapsed":0,"code":1,"signal":null,"stopping":false,"oom":false,"reason":null}',
+  ],
+  "fixture creation failure": [
+    '{"time":"2026-10-15T03:43:57.959Z","stage":"worker-exit","elapsed":0,"code":0,"signal":null,"stopping":true,"oom":false,"reason":null}',
+    '{"time":"2026-10-15T03:43:57.960Z","stage":"cleanup","root":"/tmp/paseo-heap-soak-PMPMpk","removed":true,"calls":0,"byKind":{"logs":0,"inspect":0,"ls":0,"send":0},"streamChunks":0,"streamErrors":0,"rpcErrors":0,"workerDeaths":0}',
+  ],
+  "empty file": [],
+};
+
+function runCli(lines, { control = false, preload = null } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "heap-soak-test-"));
+  try {
+    const file = path.join(dir, "run.jsonl");
+    fs.writeFileSync(file, lines.map((l) => l + "\n").join(""));
+    const analyzer = fileURLToPath(new URL("./analyze.mjs", import.meta.url));
+    const args = [
+      ...(preload ? ["--import", `data:text/javascript,${encodeURIComponent(preload)}`] : []),
+      analyzer,
+      ...(control ? ["--control"] : []),
+      file,
+    ];
+    return spawnSync(process.execPath, args, { encoding: "utf8" });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("round 8 finding 1: a run that never reached its baseline is inconclusive, never a crash", () => {
+  for (const [name, lines] of Object.entries(PRE_BASELINE)) {
+    for (const control of [false, true]) {
+      const records = lines.map((l) => JSON.parse(l));
+      assertInconclusive(records, /never reached its baseline/, { control });
+      const run = runCli(lines, { control });
+      assert.equal(run.status, 2, `${name}: ${run.stdout}${run.stderr}`);
+      assert.match(run.stdout, /never reached its baseline[\s\S]*VERDICT: INCONCLUSIVE/);
+    }
+  }
+});
+
+test("round 8: an exception inside the analysis is inconclusive, naming the error", () => {
+  // Inside analyze(): a field whose read throws.
+  const r = flat();
+  Object.defineProperty(sampleAt(r, 10).memory, "heapUsed", {
+    enumerable: true,
+    get() {
+      throw new Error("injected analysis fault");
+    },
+  });
+  assertInconclusive(r, /^internal error: injected analysis fault/);
+  // In the CLI process: a fault in the analysis, and a fault while printing the report.
+  const lines = flat().map((x) => JSON.stringify(x));
+  for (const preload of [
+    'Array.prototype.findLast = () => { throw new Error("injected analysis fault"); };',
+    'const s = JSON.stringify; JSON.stringify = (v, ...a) => { if (v && typeof v === "object" && "verdict" in v) throw new Error("injected report fault"); return s(v, ...a); };',
+  ]) {
+    const run = runCli(lines, { preload });
+    assert.equal(run.status, 2, run.stdout + run.stderr);
+    assert.match(
+      run.stdout,
+      /internal error: injected (analysis|report) fault[\s\S]*VERDICT: INCONCLUSIVE/,
+    );
+  }
+});
+
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
 
 test("audit: a header whose control flag contradicts the mode is inconclusive", () => {
