@@ -26,7 +26,6 @@ import {
   getGitCommandMetrics,
   runGitCommand,
   startGitCommandMetrics,
-  stopGitCommandMetrics,
 } from "../utils/run-git-command.js";
 import { deriveProjectKey } from "./project-key.js";
 
@@ -486,7 +485,6 @@ describe("WorkspaceReconciliationService cache", () => {
       await Promise.all([hold, queued]).catch(() => {});
       service.dispose();
       await git.dispose();
-      stopGitCommandMetrics();
       configureGitProcessPolicy(DEFAULT_GIT_PROCESS_POLICY);
     }
   });
