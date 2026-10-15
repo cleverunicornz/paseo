@@ -51,16 +51,62 @@ const scheduledChunks = (t) => 7 * Math.floor((t / 1800) * 2048);
 const zeroKinds = () => ({ logs: 0, inspect: 0, ls: 0, send: 0 });
 const zeroErrors = () => Object.fromEntries(ERROR_KINDS.map((k) => [k, 0]));
 
+const WORKER_PID = 3656801;
+const HEAP_LIMIT = 960 * MIB; // v8 heap_size_limit for --max-old-space-size=768 on Node 24
+const ROOT = "/tmp/paseo-heap-soak-test";
+
+// worker.mjs metrics(): what every forced-GC sample observes, with the real runs' magnitudes.
 function observation(heapMiB) {
+  const heapUsed = Math.round(heapMiB * MIB);
   return {
-    memory: { heapUsed: heapMiB * MIB },
+    pid: WORKER_PID,
+    memory: {
+      rss: heapUsed + 230 * MIB,
+      heapTotal: heapUsed + 140 * MIB,
+      heapUsed,
+      external: 31436930,
+      arrayBuffers: 1074258,
+    },
+    heapStatistics: {
+      total_heap_size: heapUsed + 140 * MIB,
+      total_heap_size_executable: 2523136,
+      total_physical_size: heapUsed + 100 * MIB,
+      total_available_size: 806526144,
+      used_heap_size: heapUsed,
+      heap_size_limit: HEAP_LIMIT,
+      malloced_memory: 1065024,
+      peak_malloced_memory: 20042800,
+      does_zap_garbage: 0,
+      number_of_native_contexts: 1,
+      number_of_detached_contexts: 0,
+      total_global_handles_size: 73728,
+      used_global_handles_size: 65120,
+      external_memory: 31436930,
+    },
     agents: {
       total: 15,
+      subscriptionCount: 3,
       byLifecycle: { running: 7, idle: 8 },
       withActiveForegroundTurn: 7,
-      timelineStats: { totalItems: 10907 },
+      timelineStats: { totalItems: 10907, maxItemsPerAgent: 737 },
     },
+    resident: 15,
+    retainedParentStates: 15,
+    retainedRows: 10907,
+    handles: { PipeWrap: 3, ProcessWrap: 1, TCPServerWrap: 2, TCPSocketWrap: 13, Timeout: 2 },
   };
+}
+
+// Set a record's post-GC heap, keeping its own memory and V8 statistics consistent with it.
+function setHeap(rec, bytes) {
+  const heap = Math.round(bytes);
+  rec.memory.heapUsed = heap;
+  rec.memory.heapTotal = Math.max(rec.memory.heapTotal, heap + 140 * MIB);
+  rec.heapStatistics.used_heap_size = heap;
+  rec.heapStatistics.total_heap_size = Math.max(
+    rec.heapStatistics.total_heap_size,
+    heap + 140 * MIB,
+  );
 }
 
 // A run in soak.mjs's JSONL, built the way the driver records it: calls on their 60/27-second
@@ -125,7 +171,13 @@ function buildRun(overrides = {}) {
       ...structuredClone(final),
       ...observation(o.postRestHeapMiB ?? heapAt(loadEnd)),
     });
-    records.push({ time: wall(restEnd + 0.5), stage: "cleanup", ...structuredClone(final) });
+    records.push({
+      time: wall(restEnd + 0.5),
+      stage: "cleanup",
+      root: ROOT,
+      removed: true,
+      ...structuredClone(final),
+    });
   }
   return records;
 }
@@ -145,6 +197,8 @@ function buildHeader(o) {
   return {
     time: wall(0),
     stage: "baseline",
+    root: ROOT,
+    port: 33863,
     label: o.control ? "A-unfixed" : "B-fixed",
     control: o.control,
     boundaryCopy: false,
@@ -167,7 +221,7 @@ function buildHeader(o) {
       mix: { ...MIX },
     },
     workerHeapBoundBytes: 768 * MIB,
-    heapSizeLimitBytes: 960 * MIB,
+    heapSizeLimitBytes: HEAP_LIMIT,
     baseline: observation(o.baselineMiB),
   };
 }
@@ -238,6 +292,8 @@ function buildDeath(deathAt, total, minutes, loadEnd) {
   records.push({
     time: wall(loadEnd + REST_SLEEP_SECONDS + 15),
     stage: "cleanup",
+    root: ROOT,
+    removed: true,
     ...structuredClone(final),
     rpcErrors: 9,
   });
@@ -299,6 +355,9 @@ function assertInconclusive(records, reason, options) {
     `expected a problem matching ${reason}: ${JSON.stringify(result.inconclusive)}`,
   );
 }
+
+// A schema violation as analyze.mjs reports it: "record N (stage): rule".
+const violation = (stage, rule) => new RegExp(`^record \\d+ \\(${stage}\\): ${rule}`);
 
 // --- The driver's own format: what a real run looks like ------------------------------------
 
@@ -417,7 +476,7 @@ test("round 1 finding 3: missing samples and short phases are inconclusive", () 
 test("round 1 finding 6: samples without an observed running count are inconclusive", () => {
   const r = flat();
   for (const s of samplesOf(r)) delete s.agents;
-  assertInconclusive(r, /480 sample\(s\) without an observed running-agent count/);
+  assertInconclusive(r, violation("sample", "agents is missing"));
 });
 
 test("round 1 finding 7: a control rising 510,000,000 bytes passes", () => {
@@ -427,7 +486,7 @@ test("round 1 finding 7: a control rising 510,000,000 bytes passes", () => {
 test("round 1 finding 8: a control leaking only after four hours is inconclusive", () => {
   const r = buildRun({ control: true });
   one(r, "load-end").elapsed = 18000;
-  one(r, "load-end").memory.heapUsed = 200 * MIB + 800_000_000;
+  setHeap(one(r, "load-end"), 200 * MIB + 800_000_000);
   assertInconclusive(r, /load ran 18000.0s, expected 14400s/, { control: true });
 });
 
@@ -444,6 +503,7 @@ test("round 1 finding 9: a flat control with an unexplained death is inconclusiv
     elapsed: 3600,
     code: 1,
     signal: null,
+    stopping: false,
     oom: false,
     reason: null,
   });
@@ -454,11 +514,12 @@ test("round 1 finding 9: a flat control with an unexplained death is inconclusiv
 
 test("round 1 finding 10: a sample error or death that later counters drop is inconclusive", () => {
   // No event explains the count, and the later records contradict it.
-  for (const field of ["rpcErrors", "workerDeaths"]) {
-    const r = flat();
-    sampleAt(r, 240)[field] = 1;
-    assertInconclusive(r, /counters disagree with the events logged by then/);
-  }
+  let r = flat();
+  sampleAt(r, 240).rpcErrors = 1;
+  assertInconclusive(r, violation("sample", "errorsByKind sums to 0, not rpcErrors 1"));
+  r = flat();
+  sampleAt(r, 240).workerDeaths = 1;
+  assertInconclusive(r, /counters disagree with the events logged by then/);
 });
 
 test("a fixed run with a recorded RPC error fails", () => {
@@ -485,7 +546,7 @@ test("round 2 finding 1: minute buckets without start or end times are inconclus
     delete m.elapsedStart;
     delete m.elapsedEnd;
   }
-  assertInconclusive(r, /240 minute bucket\(s\) without an index, start and end times/);
+  assertInconclusive(r, violation("minute", "elapsedStart is missing"));
 });
 
 // --- Round 2 finding 2 (analyze.mjs:155): a duplicate must not hide a missing sample ---------
@@ -504,13 +565,13 @@ test("round 2 finding 2: a missing initial sample replaced by a duplicate is inc
 test("round 2 finding 3: samples with empty per-kind counts are inconclusive", () => {
   const r = flat();
   for (const s of samplesOf(r)) s.byKind = {};
-  assertInconclusive(r, /480 sample\(s\) without cumulative counts by kind that sum to its calls/);
+  assertInconclusive(r, violation("sample", "byKind.logs is missing"));
 });
 
 test("round 2 finding 3: zero per-kind counts against 6,480 calls in minutes are inconclusive", () => {
   const r = flat();
   for (const s of samplesOf(r)) s.byKind = zeroKinds();
-  assertInconclusive(r, /sample\(s\) whose cumulative calls disagree with the minutes/);
+  assertInconclusive(r, violation("sample", "byKind sums to 0, not calls 1"));
 });
 
 test("round 2 finding 3: zero delivered stream chunks are inconclusive", () => {
@@ -526,10 +587,7 @@ test("round 2 finding 3: absent error and death counters are inconclusive", () =
     delete x.streamErrors;
     delete x.workerDeaths;
   }
-  assertInconclusive(
-    r,
-    /480 sample\(s\) without RPC error, stream error and worker death counters/,
-  );
+  assertInconclusive(r, violation("sample", "streamErrors is missing"));
 });
 
 // --- Round 2 finding 4 (analyze.mjs:66): a sample's stream error must survive ----------------
@@ -541,7 +599,7 @@ test("round 2 finding 4: a sample's stream error is never dropped", () => {
   assert.equal(result.numbers.streamErrors, 1);
   const r = flat();
   sampleAt(r, 240).streamErrors = 1;
-  assertInconclusive(r, /counters disagree with the events logged by then/);
+  assertInconclusive(r, violation("sample", "errorsByKind.stream 0 != streamErrors 1"));
 });
 
 // --- Round 2 finding 5 (analyze.mjs:224): only a timed heap-limit abort qualifies -----------
@@ -554,12 +612,22 @@ test("round 2 finding 5: an unrelated SIGABRT does not qualify a flat control", 
     elapsed: 600.5,
     code: null,
     signal: "SIGABRT",
+    stopping: false,
     oom: false,
-    reason: "intentional process.abort()",
+    reason: null,
   });
   assertInconclusive(r, /1 worker death\(s\) that are not a timed heap-limit abort/, {
     control: true,
   });
+  // A reason that is not the V8 banner is not a heap-limit abort either: the record is malformed.
+  r.at(-1).reason = "intentional process.abort()";
+  assertInconclusive(
+    r,
+    violation("worker-exit", "reason must be null or the V8 heap-limit banner"),
+    {
+      control: true,
+    },
+  );
 });
 
 test("round 2 finding 5: an untimed heap-limit abort with no load does not qualify", () => {
@@ -571,9 +639,7 @@ test("round 2 finding 5: an untimed heap-limit abort with no load does not quali
     oom: true,
     reason: "Reached heap limit",
   });
-  assertInconclusive(r, /1 worker death\(s\) that are not a timed heap-limit abort/, {
-    control: true,
-  });
+  assertInconclusive(r, violation("worker-exit", "time is missing"), { control: true });
 });
 
 test("round 2 finding 5: a timed heap-limit abort without the load before it does not qualify", () => {
@@ -654,8 +720,7 @@ test("rest on the wall clock: an absent or unparseable time on load-end or post-
     const r = flat();
     if (value === undefined) delete one(r, stage).time;
     else one(r, stage).time = value;
-    assertInconclusive(r, /no parseable time: the rest is not observed/);
-    assertInconclusive(r, /1 record\(s\) without a parseable time/);
+    assertInconclusive(r, violation(stage, "time (is missing|must be an ISO-8601 UTC time)"));
   }
 });
 
@@ -678,7 +743,7 @@ test("rest on the wall clock: elapsed and time that disagree by a sample period 
 // A control flat through its samples whose only leak evidence is the load-end sample.
 function controlLeakingAtLoadEnd() {
   const r = buildRun({ control: true, postRestHeapMiB: 200 });
-  one(r, "load-end").memory.heapUsed = 200 * MIB + 510_000_000;
+  setHeap(one(r, "load-end"), 200 * MIB + 510_000_000);
   return r;
 }
 
@@ -691,8 +756,12 @@ test("round 3 finding 2: a control read failure after the last sample, before th
 
 test("round 3 finding 2: a control error in the end counters with no event counts", () => {
   const r = controlLeakingAtLoadEnd();
-  for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).rpcErrors = 1;
+  for (const stage of ["post-rest", "cleanup"]) one(r, stage).rpcErrors = 1;
   assertInconclusive(r, /counters disagree with the events logged by then/, { control: true });
+  one(r, "load-end").rpcErrors = 1;
+  assertInconclusive(r, violation("load-end", "errorsByKind sums to 0, not rpcErrors 1"), {
+    control: true,
+  });
 });
 
 test("round 3 finding 2: before a heap-limit abort, only the abort's own failures are excused", () => {
@@ -728,7 +797,7 @@ test("round 3 finding 3: a control's delivery must reach its heap-limit abort", 
 test("round 3 finding 3: a control leak point between samples needs the delivered count", () => {
   const r = controlLeakingAtLoadEnd();
   for (const stage of ["load-end", "post-rest", "cleanup"]) delete one(r, stage).streamChunks;
-  assertInconclusive(r, /no delivered stream-chunk count at the load end/, { control: true });
+  assertInconclusive(r, violation("load-end", "streamChunks is missing"), { control: true });
 });
 
 // --- Round 4 finding 1 (analyze.mjs:519): every clock pair agrees; the rest holds on both ----
@@ -771,8 +840,8 @@ test("round 4 finding 1: any record logged off its own elapsed moment is inconcl
     [(r) => shiftTime(sampleAt(r, 100), 30), /sample: 1 record\(s\) logged 30.7s/],
     [(r) => shiftTime(minutesOf(r)[10], -1), /minute: 1 record\(s\) logged -0.9s/],
     [(r) => shiftTime(minutesOf(r).at(-1), 1), /last minute: 1 record\(s\) logged 1.0s/],
-    [(r) => delete minutesOf(r)[10].time, /1 record\(s\) without a parseable time/],
-    [(r) => delete r[0].time, /the baseline has no parseable time/],
+    [(r) => delete minutesOf(r)[10].time, violation("minute", "time is missing")],
+    [(r) => delete r[0].time, violation("baseline", "time is missing")],
     [(r) => shiftTime(one(r, "cleanup"), -400), /the cleanup record is not logged last/],
   ]) {
     const r = flat();
@@ -800,7 +869,7 @@ test("round 4 finding 1: sample minute counts and the last bucket agree with the
   );
   r = flat();
   delete sampleAt(r, 100).minutes;
-  assertInconclusive(r, /1 sample\(s\) without a closed-minute count/);
+  assertInconclusive(r, violation("sample", "minutes is missing"));
   r = flat();
   minutesOf(r).at(-1).elapsedEnd -= 1;
   assertInconclusive(r, /the last minute bucket ends at 14399.05s, not at load-end 14400.05s/);
@@ -837,16 +906,20 @@ test("round 4 finding 2: a failure logged after the heap-limit exit is excused, 
 test("round 4 finding 3: an end stream-error counter with no event is inconclusive", () => {
   const r = controlLeakingAtLoadEnd();
   for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).streamErrors = 1;
-  assertInconclusive(r, /counters disagree with the events logged by then/, { control: true });
+  assertInconclusive(r, violation("load-end", "errorsByKind.stream 0 != streamErrors 1"), {
+    control: true,
+  });
 });
 
 test("round 4 finding 3: a by-kind error counter with no event is inconclusive", () => {
   const r = controlLeakingAtLoadEnd();
   sampleAt(r, 10).errorsByKind.sample = 1;
-  assertInconclusive(r, /counters disagree with the events logged by then/, { control: true });
+  assertInconclusive(r, violation("sample", "errorsByKind sums to 1, not rpcErrors 0"), {
+    control: true,
+  });
   const s = flat();
   delete sampleAt(s, 10).errorsByKind;
-  assertInconclusive(s, /1 sample\(s\) without errors by kind/);
+  assertInconclusive(s, violation("sample", "errorsByKind is missing"));
 });
 
 test("round 4 finding 3: a recorded error of any kind before the leak point disqualifies a control", () => {
@@ -854,6 +927,137 @@ test("round 4 finding 3: a recorded error of any kind before the leak point disq
     const r = injectError(leakingControl(), 600.5, kind);
     assertInconclusive(r, /before the leak point/, { control: true });
   }
+});
+
+// --- Round 5: a strict schema per record type runs before any analysis ---------------------
+//
+// schema.mjs holds one schema per record type soak.mjs writes, derived from its writer code:
+// required fields, exact types, counts as integers >= 0, enumerations, no unknown fields or record
+// types, and each type's intra-record invariants. A violation names the record and the rule.
+
+test("schema: the driver-format runs conform (fixed, leaking control, aborting control)", () => {
+  for (const [r, control] of [
+    [flat(), false],
+    [leakingControl(), true],
+    [abortControl(), true],
+  ]) {
+    assert.deepEqual(analyze(r, { control }).inconclusive, []);
+  }
+});
+
+test("round 5 finding 1: an invalid final minute count or error map is inconclusive", () => {
+  for (const bad of [-1, "240", 1.5, null]) {
+    const r = flat();
+    one(r, "load-end").minutes = bad;
+    assertInconclusive(r, violation("load-end", "minutes must be an integer >= 0"));
+  }
+  for (const bad of [false, "0", [], null, { logs: 0 }]) {
+    const r = flat();
+    one(r, "load-end").errorsByKind = bad;
+    assertInconclusive(r, violation("load-end", "errorsByKind"));
+  }
+});
+
+test("round 5 finding 2: a header heap limit that contradicts the captured V8 limit is inconclusive", () => {
+  const r = buildRun({ control: true });
+  assert.equal(verdictOf(r, { control: true }), "fail");
+  r[0].heapSizeLimitBytes = 200 * MIB;
+  assertInconclusive(
+    r,
+    violation(
+      "baseline",
+      `heapSizeLimitBytes ${200 * MIB} != baseline.heapStatistics.heap_size_limit ${HEAP_LIMIT}`,
+    ),
+    { control: true },
+  );
+});
+
+test("round 5 finding 3: a sample whose agent counts contradict each other is inconclusive", () => {
+  let r = flat();
+  sampleAt(r, 100).agents.total = 6;
+  assertInconclusive(r, violation("sample", "agents.total 6 != running 7 \\+ idle 8"));
+  r = flat();
+  Object.assign(sampleAt(r, 100).agents, { total: 14, byLifecycle: { running: 7, idle: 7 } });
+  sampleAt(r, 100).resident = 14;
+  assertInconclusive(r, violation("sample", "agents.total 14 != the fixture's 15"));
+});
+
+test("round 5 finding 4: post-rest and cleanup carry every redundant counter", () => {
+  for (const stage of ["post-rest", "cleanup"]) {
+    for (const field of [
+      "calls",
+      "byKind",
+      "streamChunks",
+      "rpcErrors",
+      "streamErrors",
+      "workerDeaths",
+    ]) {
+      const r = flat();
+      delete one(r, stage)[field];
+      assertInconclusive(r, violation(stage, `${field} is missing`));
+    }
+  }
+});
+
+test("schema: one violation per record type is inconclusive, naming the record and the rule", () => {
+  const fixed = [
+    ["baseline", (r) => (r[0].port = "33863"), 'port must be a TCP port \\(got "33863"\\)'],
+    [
+      "baseline",
+      (r) => delete r[0].baseline.heapStatistics.heap_size_limit,
+      "baseline.heapStatistics.heap_size_limit is missing",
+    ],
+    ["sample", (r) => (sampleAt(r, 5).note = "x"), "note is not a field of this record type"],
+    ["minute", (r) => (minutesOf(r)[5].calls = 26), "byKind sums to 27, not calls 26"],
+    ["load-end", (r) => delete one(r, "load-end").elapsed, "elapsed is missing"],
+    [
+      "post-rest",
+      (r) => (one(r, "post-rest").memory.heapUsed = one(r, "post-rest").memory.heapTotal + 1),
+      "memory.heapUsed exceeds heapTotal",
+    ],
+    ["cleanup", (r) => (one(r, "cleanup").removed = "yes"), "removed must be a boolean"],
+    [
+      "snapshot",
+      (r) => r.push({ time: wall(14800), stage: "snapshot", file: 42 }),
+      "file must be a string or null \\(got 42\\)",
+    ],
+    ["bogus", (r) => r.push({ time: wall(100), stage: "bogus" }), 'unknown record type "bogus"'],
+    ["\\?", (r) => r.push(42), "not a JSON object"],
+  ];
+  for (const [stage, mutate, rule] of fixed) {
+    const r = flat();
+    mutate(r);
+    assertInconclusive(r, violation(stage, rule));
+  }
+  const errorAt = (r) => r.find((x) => x.stage === "rpc-error");
+  const exitOf = (r) => one(r, "worker-exit");
+  const events = [
+    ["rpc-error", (r) => (errorAt(r).kind = "bogus"), "kind must be one of logs, inspect, ls"],
+    ["rpc-error", (r) => delete errorAt(r).message, "message is missing"], // a stream error
+    ["worker-exit", (r) => (exitOf(r).signal = null), "exactly one of code and signal must be set"],
+    [
+      "worker-exit",
+      (r) => (exitOf(r).reason = null),
+      "oom must be true exactly when reason is set",
+    ],
+  ];
+  for (const [stage, mutate, rule] of events) {
+    const r = abortControl();
+    mutate(r);
+    assertInconclusive(r, violation(stage, rule), { control: true });
+  }
+});
+
+test("schema: every worker observation comes from the baseline's worker, limit and home", () => {
+  let r = flat();
+  sampleAt(r, 50).pid = 999;
+  assertInconclusive(r, violation("sample", "pid 999 != the baseline worker's 3656801"));
+  r = flat();
+  sampleAt(r, 50).heapStatistics.heap_size_limit = 200 * MIB;
+  assertInconclusive(r, violation("sample", `heap_size_limit ${200 * MIB} != the header's`));
+  r = flat();
+  one(r, "cleanup").root = "/tmp/other";
+  assertInconclusive(r, violation("cleanup", "root /tmp/other != the header's"));
 });
 
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
@@ -865,13 +1069,20 @@ test("audit: a header whose control flag contradicts the mode is inconclusive", 
 
 test("audit: absent run identity in the header is inconclusive", () => {
   for (const [drop, reason] of [
-    [(h) => delete h.boundaryCopy, /boundaryCopy undefined/],
-    [(h) => delete h.readStreaming, /readStreaming undefined is not recorded/],
-    [(h) => delete h.heapSizeLimitBytes, /heap_size_limit is not recorded/],
-    [(h) => delete h.label, /no run label/],
-    [(h) => delete h.baseline.agents, /the baseline does not observe 15 agents/],
-    [(h) => (h.baseline.agents.byLifecycle.running = 6), /the baseline does not observe 15 agents/],
-    [(h) => (h.baseline.agents.timelineStats.totalItems = 100), /observes 100 timeline rows/],
+    [(h) => delete h.boundaryCopy, violation("baseline", "boundaryCopy is missing")],
+    [(h) => delete h.readStreaming, violation("baseline", "readStreaming is missing")],
+    [(h) => delete h.heapSizeLimitBytes, violation("baseline", "heapSizeLimitBytes is missing")],
+    [(h) => delete h.label, violation("baseline", "label is missing")],
+    [(h) => (h.label = null), /no run label/],
+    [(h) => delete h.baseline.agents, violation("baseline", "baseline.agents is missing")],
+    [
+      (h) => (h.baseline.agents.byLifecycle.running = 6),
+      violation("baseline", "baseline.agents.total 15 != running 6 \\+ idle 8"),
+    ],
+    [
+      (h) => (h.baseline.agents.timelineStats = { totalItems: 100, maxItemsPerAgent: 100 }),
+      /observes 100 timeline rows/,
+    ],
   ]) {
     const r = flat();
     drop(r[0]);
@@ -899,7 +1110,7 @@ test("audit: a missing load-end, post-rest or cleanup record is inconclusive", (
 test("audit: a sample without a numeric heapUsed is not silently dropped", () => {
   const r = flat();
   delete sampleAt(r, 240).memory;
-  assertInconclusive(r, /1 sample record\(s\) without a numeric elapsed or heapUsed/);
+  assertInconclusive(r, violation("sample", "memory is missing"));
 });
 
 test("audit: an extra sample off its 30-second slot is inconclusive", () => {
@@ -924,21 +1135,21 @@ test("audit: a minute beyond the four hours is inconclusive", () => {
 test("audit: a minute index far past the load is malformed and does not stall the analyzer", () => {
   const r = flat();
   minutesOf(r)[239].index = 1e12;
-  assertInconclusive(r, /1 minute bucket\(s\) without an index/);
+  assertInconclusive(r, violation("minute", "index must be an integer 0..240"));
 });
 
 test("audit: a full run's load-end without its minutes or errors by kind is inconclusive", () => {
   for (const field of ["minutes", "errorsByKind"]) {
     const r = flat();
     delete one(r, "load-end")[field];
-    assertInconclusive(r, new RegExp(`load-end without ${field}`));
+    assertInconclusive(r, violation("load-end", `${field} is missing`));
   }
 });
 
 test("audit: a counter that is present but not a count is inconclusive", () => {
   const r = flat();
   one(r, "load-end").rpcErrors = "0";
-  assertInconclusive(r, /load-end rpcErrors not a count/);
+  assertInconclusive(r, violation("load-end", 'rpcErrors must be an integer >= 0 \\(got "0"\\)'));
 });
 
 test("audit: a decreasing cumulative call count is inconclusive", () => {
@@ -982,13 +1193,19 @@ test("audit: a worker exit marked as the harness's own stop mid-run is inconclus
     code: null,
     signal: "SIGTERM",
     stopping: true,
+    oom: false,
+    reason: null,
   });
   assertInconclusive(r, /marked as the harness's stop before the run ended/);
 });
 
 test("audit: a control with an RPC error before its leak point is inconclusive", () => {
   const r = leakingControl();
-  for (const s of samplesOf(r)) if (s.elapsed > 300) s.rpcErrors = 1;
+  for (const s of samplesOf(r)) {
+    if (s.elapsed <= 300) continue;
+    s.rpcErrors = 1;
+    s.errorsByKind.logs = 1;
+  }
   assertInconclusive(r, /before the leak point/, { control: true });
 });
 
