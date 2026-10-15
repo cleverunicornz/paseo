@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1323,6 +1323,68 @@ test("round 8: an exception inside the analysis is inconclusive, naming the erro
       /internal error: injected (analysis|report) fault[\s\S]*VERDICT: INCONCLUSIVE/,
     );
   }
+});
+
+// --- Round 9: the verdict counts only when its report is written in full --------------------
+
+// Run the CLI on a PASS run with stdout as given; resolve with its exit code and stderr.
+function cliWithStdout(stdout, { preload = null, destroyReader = false } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "heap-soak-test-"));
+  const file = path.join(dir, "run.jsonl");
+  fs.writeFileSync(
+    file,
+    flat()
+      .map((x) => JSON.stringify(x) + "\n")
+      .join(""),
+  );
+  const analyzer = fileURLToPath(new URL("./analyze.mjs", import.meta.url));
+  const args = [
+    ...(preload ? ["--import", `data:text/javascript,${encodeURIComponent(preload)}`] : []),
+    analyzer,
+    file,
+  ];
+  const child = spawn(process.execPath, args, { stdio: ["ignore", stdout, "pipe"] });
+  if (destroyReader) child.stdout.destroy(); // the reader is gone before the report is written
+  let stderr = "";
+  child.stderr.on("data", (d) => (stderr += d));
+  return new Promise((resolve) => {
+    child.on("close", (code) => {
+      fs.rmSync(dir, { recursive: true, force: true });
+      resolve({ code, stderr });
+    });
+  });
+}
+
+test("round 9: a PASS run whose report is written in full exits 0", async () => {
+  const { code } = await cliWithStdout("pipe");
+  assert.equal(code, 0);
+});
+
+test("round 9 finding 1: a report that cannot be written is inconclusive (exit 2)", async (t) => {
+  // A full device: the write fails with ENOSPC.
+  if (fs.existsSync("/dev/full")) {
+    const full = fs.openSync("/dev/full", "w");
+    try {
+      const { code, stderr } = await cliWithStdout(full);
+      assert.equal(code, 2, stderr);
+      assert.match(stderr, /could not be written.*ENOSPC[\s\S]*INCONCLUSIVE/);
+    } finally {
+      fs.closeSync(full);
+    }
+  } else {
+    t.diagnostic("no /dev/full on this host: the ENOSPC case is not run");
+  }
+  // A closed pipe: the write fails with EPIPE.
+  const closed = await cliWithStdout("pipe", { destroyReader: true });
+  assert.equal(closed.code, 2, closed.stderr);
+  assert.match(closed.stderr, /could not be written.*EPIPE[\s\S]*INCONCLUSIVE/);
+  // A forced, asynchronous write error.
+  const forced = await cliWithStdout("pipe", {
+    preload:
+      'process.stdout._write = (chunk, encoding, callback) => setImmediate(() => callback(Object.assign(new Error("forced write error"), { code: "EIO" })));',
+  });
+  assert.equal(forced.code, 2, forced.stderr);
+  assert.match(forced.stderr, /could not be written.*forced write error[\s\S]*INCONCLUSIVE/);
 });
 
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
