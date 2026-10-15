@@ -23,6 +23,15 @@ function jobSteps(source, jobName) {
   return steps;
 }
 
+/** The `  <job>:` block of one job, with its `runs-on`, `permissions` and `if`. */
+function jobBody(source, jobName) {
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => line === `  ${jobName}:`);
+  assert.ok(start >= 0, `job ${jobName}`);
+  const end = lines.findIndex((line, index) => index > start && /^ {2}[a-z0-9-]+:$/.test(line));
+  return lines.slice(start, end < 0 ? undefined : end).join("\n");
+}
+
 const steps = jobSteps(workflow, "daemon");
 const stepIndex = (name) => steps.findIndex((step) => step.name === name);
 const step = (name) => {
@@ -30,6 +39,11 @@ const step = (name) => {
   assert.ok(found, `step ${name}`);
   return found;
 };
+
+/** One step's text with runs of whitespace collapsed, for a stable command match. */
+function flat(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
 
 test("pull requests into and pushes to the console line and its trunk both run", () => {
   const branches = "\\[console\\/main, candidate\\/console-heap-0\\.11\\.2\\]";
@@ -52,11 +66,40 @@ test("a dispatched tag is checked against the release rule before anything is bu
     check.text,
     /if: github\.event_name == 'workflow_dispatch' && inputs\.release_tag != ''/,
   );
+  // The guard takes the repository, the ref, the tag and the packages' base version.
   assert.match(
-    check.text,
-    /node scripts\/console-release-channel\.mjs "\$GITHUB_REF" "\$RELEASE_TAG"/,
+    flat(check.text),
+    /node scripts\/console-release-channel\.mjs guard \\ "\$GITHUB_REPOSITORY" "\$GITHUB_REF" "\$RELEASE_TAG" \\ "\$\(node -p 'require\("\.\/packages\/server\/package\.json"\)\.version'\)"/,
   );
   assert.ok(stepIndex("Check the release tag") < stepIndex("Install dependencies"));
+  assert.ok(stepIndex("Check the release tag") < stepIndex("Build daemon and CLI"));
+});
+
+test("only the publish job carries the write token, and only after the guard", () => {
+  // Qualification is read-only, at the workflow level and on the qualifying jobs.
+  assert.match(workflow, /\npermissions:\n {2}contents: read\n/);
+  assert.match(jobBody(workflow, "daemon"), /\n {4}permissions:\n {6}contents: read\n/);
+  assert.match(jobBody(workflow, "server-unit"), /\n {4}permissions:\n {6}contents: read\n/);
+  // The write token is the publish job's alone.
+  assert.match(jobBody(workflow, "publish"), /\n {4}permissions:\n {6}contents: write\n/);
+  const writes = [...workflow.matchAll(/contents: write/g)].length;
+  assert.equal(writes, 1, "one contents: write in the whole workflow");
+  // It runs only on a dispatch with a tag, and only after the build it republishes.
+  const publish = jobBody(workflow, "publish");
+  assert.match(
+    publish,
+    /if: github\.event_name == 'workflow_dispatch' && inputs\.release_tag != ''/,
+  );
+  assert.match(publish, /needs: daemon/);
+  assert.match(publish, /gh release create/);
+});
+
+test("the daemon job never publishes; the publish job only publishes", () => {
+  // The release command lives in the publish job, not in the build job.
+  assert.doesNotMatch(workflow.split("  publish:")[0], /gh release create/);
+  const publishSteps = jobSteps(workflow, "publish");
+  const publishes = publishSteps.filter((entry) => /gh release create/.test(entry.text));
+  assert.equal(publishes.length, 1);
 });
 
 test("the same seven packages and checksum files are packed for every release", () => {
@@ -67,26 +110,20 @@ test("the same seven packages and checksum files are packed for every release", 
   }
 });
 
-test("a candidate lane publishes a prerelease; the trunk publishes a release", () => {
-  const publish = step("Publish source-qualified release");
+test("the version rewrite takes the tag's version, and checks it against the tag", () => {
+  const set = step("Set the release version");
+  // The version comes from the tag, never from the packages, which still carry the base.
   assert.match(
-    publish.text,
-    /if: github\.event_name == 'workflow_dispatch' && inputs\.release_tag != ''/,
+    set.text,
+    /version="\$\(node scripts\/console-release-channel\.mjs version "\$GITHUB_REF" "\$RELEASE_TAG"\)"/,
   );
-  assert.doesNotMatch(publish.text, /test "\$GITHUB_REF" = refs\/heads\/internal\/main/);
+  assert.match(set.text, /node scripts\/sync-workspace-versions\.mjs/);
+  // After the rewrite the packed version is checked against the tag's version.
   assert.match(
-    publish.text,
-    /channel="\$\(node scripts\/console-release-channel\.mjs "\$GITHUB_REF" "\$RELEASE_TAG" "\$version"\)"/,
+    flat(set.text),
+    /node scripts\/console-release-channel\.mjs packed-version \\ "\$RELEASE_TAG" "\$\(node -p 'require\("\.\/packages\/server\/package\.json"\)\.version'\)"/,
   );
-  assert.match(
-    publish.text,
-    /if \[ "\$channel" = prerelease \]; then prerelease=\(--prerelease\); fi/,
-  );
-  assert.match(
-    publish.text,
-    /gh release create "\$RELEASE_TAG" "\$RUNNER_TEMP\/paseo-release\/"\* --repo "\$GITHUB_REPOSITORY" --target "\$GITHUB_SHA" --title "\$RELEASE_TAG" "\$\{prerelease\[@\]\}"/,
-  );
-  assert.ok(stepIndex("Pack release packages") < stepIndex("Publish source-qualified release"));
+  assert.ok(stepIndex("Set the release version") < stepIndex("Pack release packages"));
 });
 
 test("the packed release installs the way the session image installs it, before anything is published", () => {
@@ -97,16 +134,13 @@ test("the packed release installs the way the session image installs it, before 
     stepIndex("Pack release packages") <
       stepIndex("Install the release packages as the session image does"),
   );
-  assert.ok(
-    stepIndex("Install the release packages as the session image does") <
-      stepIndex("Publish source-qualified release"),
-  );
 });
 
-test("the managed-update anchors the image build edits survive the build", () => {
-  // runner-images images/repo-pod/paseo-managed-update.mjs edits these exact anchors in the
-  // built server and fails its image build if either is not found once. This job proves the
-  // built output still carries them, on the runner that builds the release.
+test("the managed-update anchors are checked against upstream's own bytes", () => {
+  // runner-images images/repo-pod/paseo-managed-update.mjs edits two exact anchors in the
+  // built server and fails its image build if either is not found once, or if the CLI body
+  // around its anchor has moved. So this job compares both built files to the upstream
+  // tarball the runner-images pin names, not just the anchor strings.
   const anchors = step("Check the managed-update anchors");
   assert.ok(stepIndex("Build daemon and CLI") < stepIndex("Check the managed-update anchors"));
   for (const anchor of [
@@ -117,14 +151,30 @@ test("the managed-update anchors the image build edits survive the build", () =>
   ]) {
     assert.ok(anchors.text.includes(anchor), `anchor ${anchor}`);
   }
+  // It fetches upstream's tarball, checks its pinned sha256, and compares both files.
+  assert.match(anchors.text, /registry\.npmjs\.org\/@getpaseo\/server\/-\/server-0\.11\.2\.tgz/);
+  assert.match(anchors.text, /7a727fcbb8f96ff044d4a60526af8b0f6adce2c827dc74b4bd75677e97798a50/);
+  assert.match(anchors.text, /sha256sum --check/);
+  assert.match(
+    flat(anchors.text),
+    /for file in session\/daemon\/npm-global-cli\.js websocket-server\.js; do cmp "\$upstream\/package\/dist\/server\/server\/\$file" "\$server\/\$file"/,
+  );
 });
 
-test("the server's unit suite runs unconditionally, and no Dockerfile compiles", () => {
+test("the server's unit suite runs on the smallest test set, and no Dockerfile compiles", () => {
   const unit = jobSteps(workflow, "server-unit");
   const run = unit.find((entry) => entry.name === "Run the server unit suite");
   assert.ok(run, "step Run the server unit suite");
   assert.match(run.text, /npm run test:unit --workspace=@getpaseo\/server/);
   assert.doesNotMatch(run.text, /\n {8}if:/);
+  // The ladder's first rung: the test sets are automation-test-*, never build-native.
+  assert.match(
+    jobBody(workflow, "server-unit"),
+    /runs-on: \{ group: ci, labels: automation-test-s \}/,
+  );
+  assert.doesNotMatch(jobBody(workflow, "server-unit"), /build-native/);
+  // The whole workflow runs no test job on a build set.
+  assert.doesNotMatch(jobBody(workflow, "daemon"), /automation-test/);
 });
 
 test("no Dockerfile in the change compiles anything", () => {
