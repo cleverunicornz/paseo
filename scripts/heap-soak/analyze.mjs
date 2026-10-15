@@ -33,10 +33,15 @@
 //   a full run has one load-end within 2 s of 14,400 s with its heap and counters, and one
 //     post-rest 300 s (within 2 s) after it, by the two records' wall-clock `time` fields (the
 //     load-end sample's own GC time is not rest); every run has one cleanup record;
-//   a control has no RPC error up to its leak point (only failures its worker's own exit caused
-//     are excused) and no death other than a timed heap-limit abort before it.
-// Error and death counters are reconciled by their maximum over every record and event, so a
-// later zero never erases an observed error: an observed error fails a fixed run.
+//   a control has no RPC error or non-zero error counter of any kind up to its leak point (only
+//     failures logged after its heap-limit abort and its last good sample are excused) and no
+//     death other than a timed heap-limit abort before it.
+// Every redundant pair in the record must agree within its stated tolerance; any disagreement is
+// inconclusive. Each record's wall-clock `time` agrees with its `elapsed` (clockProblems); every
+// error and death counter equals the events logged by then (counterProblems); the samples'
+// cumulative calls, calls by kind and closed minutes agree with the minute buckets, and the end
+// records' totals with both. README.md lists every field read and the check that guards it. A
+// recorded, consistent error fails a fixed run.
 
 import fs from "node:fs";
 
@@ -66,13 +71,25 @@ const SAMPLE_PERIOD_SECONDS = 30;
 // drive the per-index loops).
 const MAX_MINUTE_INDEX = EXPECTED_SECONDS / 60;
 const TOLERANCE_SECONDS = 2;
-// `time` has millisecond resolution; `elapsed` is derived from the same clock.
-const CLOCK_RESOLUTION_SECONDS = 0.01;
+// The driver stamps every record with the wall clock (`time`) as it logs it, and takes `elapsed`
+// from the same Date.now(), starting as the baseline is logged. A record whose `elapsed` is taken
+// as it is logged (worker-exit, post-rest, the last minute) shows both within milliseconds (0 ms on
+// the real control); 0.5 s allows for an event-loop stall in the driver.
+const CLOCK_TOLERANCE_SECONDS = 0.5;
 const HEAP_LIMIT_RE = /Reached heap limit|heap out of memory|Allocation failed/i;
-// The driver's own RPC failures once its worker has exited: "worker exit <code>" for the RPCs
-// pending at the exit, "worker dead" for every RPC after it.
-const WORKER_EXIT_FAILURE_RE = /^worker (dead|exit\b)/;
 const ERROR_COUNTERS = ["rpcErrors", "streamErrors", "workerDeaths"];
+// The driver's errorsByKind keys: the four calls, a stream chunk, a forced-GC sample, other.
+const ERROR_KINDS = ["logs", "inspect", "ls", "send", "stream", "sample", "other"];
+const LOGGED_STAGES = new Set([
+  "baseline",
+  "sample",
+  "minute",
+  "rpc-error",
+  "worker-exit",
+  "load-end",
+  "post-rest",
+  "cleanup",
+]);
 const RECORD_COUNTERS = ["calls", "streamChunks", ...ERROR_COUNTERS];
 const SINGLE_STAGES = ["baseline", "load-end", "post-rest", "cleanup"];
 
@@ -90,6 +107,8 @@ const heapOf = (rec) => {
 };
 const kindsValid = (byKind) => MIX_KEYS.every((k) => isCount(byKind?.[k]));
 const kindsTotal = (byKind) => MIX_KEYS.reduce((n, k) => n + byKind[k], 0);
+const errorKindsValid = (byKind) => ERROR_KINDS.every((k) => isCount(byKind?.[k]));
+const short = (value) => Number(value.toFixed(3));
 // The driver streams each agent to floor(elapsed / period * 2048) chunks before it samples.
 const scheduledChunks = (elapsed) =>
   EXPECTED_FIXTURE.streamingAgents *
@@ -161,6 +180,14 @@ function readMinutes(minuteRecords) {
   }
   valid.sort((a, b) => a.index - b.index);
   return { valid, malformed };
+}
+
+// The bucket with the highest index: the one the driver closes at load end.
+function lastMinuteRecord(minuteRecords) {
+  return minuteRecords.reduce(
+    (last, m) => (Number.isInteger(m.index) && (last === null || m.index > last.index) ? m : last),
+    null,
+  );
 }
 
 // Cumulative calls (total and by kind) before each minute index, from the minute buckets.
@@ -302,6 +329,8 @@ const SAMPLE_INSTRUMENTS = [
     (s) => !kindsValid(s.byKind) || kindsTotal(s.byKind) !== s.calls,
   ],
   ["without a delivered stream-chunk count", (s) => !isCount(s.streamChunks)],
+  ["without a closed-minute count", (s) => !isCount(s.minutes)],
+  ["without errors by kind", (s) => !errorKindsValid(s.errorsByKind)],
   [
     "without RPC error, stream error and worker death counters",
     (s) => !ERROR_COUNTERS.every((f) => isCount(s[f])),
@@ -324,21 +353,35 @@ function sampleLoadProblems(series, totals) {
   let outsideMinutes = 0;
   let decreasing = 0;
   let offSchedule = 0;
+  let wrongMinutes = 0;
   let prev = null;
   for (const { rec, elapsed } of series) {
     if (!isCount(rec.calls) || !kindsValid(rec.byKind) || !isCount(rec.streamChunks)) continue;
     if (!withinMinutes(rec, elapsed, totals)) outsideMinutes++;
     if (prev && decreased(prev, rec)) decreasing++;
     if (!chunksOnSchedule(rec, elapsed)) offSchedule++;
+    if (isCount(rec.minutes) && rec.minutes !== closedMinutes(rec.calls, totals)) wrongMinutes++;
     prev = rec;
   }
   const problems = [];
+  if (wrongMinutes > 0)
+    problems.push(
+      `${wrongMinutes} sample(s) whose closed-minute count disagrees with the minute buckets`,
+    );
   if (outsideMinutes > 0)
     problems.push(`${outsideMinutes} sample(s) whose cumulative calls disagree with the minutes`);
   if (decreasing > 0) problems.push(`${decreasing} sample(s) with a decreasing cumulative count`);
   if (offSchedule > 0)
     problems.push(`${offSchedule} sample(s) whose delivered stream chunks are off the schedule`);
   return problems;
+}
+
+// The driver closes a minute's bucket when a call lands in a later minute, so a sample's closed
+// count is the index of the bucket that holds its last call (0 before any call).
+function closedMinutes(calls, totals) {
+  let index = 0;
+  while (index + 1 < totals.before.length && totals.before[index + 1].calls < calls) index++;
+  return index;
 }
 
 function withinMinutes(rec, elapsed, totals) {
@@ -411,7 +454,7 @@ function minuteOnProtocol(m) {
 // minute buckets' (no load after the load end); load-end's delivered chunks lie between the last
 // sample's and the schedule at load end, and the later records repeat them. No sample follows the
 // load end.
-function recordProblems({ loadEnd, postRest, cleanup }, totals, series, minuteCount) {
+function recordProblems({ loadEnd, postRest, cleanup }, totals, series, minutes) {
   const problems = [];
   const named = [
     ["load-end", loadEnd],
@@ -428,14 +471,28 @@ function recordProblems({ loadEnd, postRest, cleanup }, totals, series, minuteCo
       problems.push(`${name} calls by kind disagree with the minute buckets`);
   }
   if (loadEnd)
-    problems.push(...loadEndCounterProblems(loadEnd, postRest, cleanup, series, minuteCount));
+    problems.push(
+      ...loadEndCounterProblems(
+        loadEnd,
+        postRest,
+        cleanup,
+        series,
+        minutes.count,
+        minutes.valid.at(-1),
+      ),
+    );
   return problems;
 }
 
-function loadEndCounterProblems(loadEnd, postRest, cleanup, series, minuteCount) {
+function loadEndCounterProblems(loadEnd, postRest, cleanup, series, minuteCount, lastMinute) {
   const problems = [];
   if (isCount(loadEnd.minutes) && loadEnd.minutes !== minuteCount)
     problems.push(`load-end minutes ${loadEnd.minutes} != ${minuteCount} minute bucket(s)`);
+  // The driver closes the last bucket with the very value it records as load-end's elapsed.
+  if (lastMinute && lastMinute.elapsedEnd !== loadEnd.elapsed)
+    problems.push(
+      `the last minute bucket ends at ${short(lastMinute.elapsedEnd)}s, not at load-end ${loadEnd.elapsed}s`,
+    );
   const end = isTime(loadEnd.elapsed) ? loadEnd.elapsed : null;
   const after = end === null ? 0 : series.filter((s) => s.elapsed > end).length;
   if (after > 0) problems.push(`${after} sample(s) after load-end`);
@@ -468,12 +525,12 @@ function stopProblems({ workerExits, loadEnd, postRest }) {
 }
 
 // A full run carries its load end (its time, heap and counters) and its rest.
-function phaseProblems({ loadEnd, postRest }) {
+function phaseProblems({ loadEnd, postRest, header }) {
   const problems = [];
   if (loadEnd) problems.push(...loadEndProblems(loadEnd));
   else problems.push("no load-end record: the load's end and last heap are not observed");
   if (!postRest) problems.push("no post-rest record (run cut short)");
-  else if (loadEnd) problems.push(...restProblems(loadEnd, postRest));
+  else if (loadEnd) problems.push(...restProblems(loadEnd, postRest, wallSeconds(header)));
   return problems;
 }
 
@@ -488,42 +545,164 @@ function loadEndProblems(loadEnd) {
   return problems;
 }
 
-// The rest is the driver's 300-second sleep, measured on the records' wall clock: from the
-// load-end record, logged after its forced-GC sample, to the post-rest record, logged after its own
-// (0.7 s at the median on the real runs; the driver does not record that sample's start). The
-// elapsed difference minus that wall-clock rest is the load-end sample's own time: measurement, not
-// rest. Like every forced-GC sample it lies within one 30-second sample period; outside that, the
-// records' elapsed and time fields contradict each other.
-function restSpan(loadEnd, postRest) {
+// The rest is the driver's 300-second sleep. It must hold on both clocks, within 2 s:
+//   wall clock: from the load-end record (logged after its forced-GC sample) to the post-rest
+//     record (logged after its own; the driver records no start for that sample);
+//   elapsed clock: post-rest minus load-end elapsed, less the load-end sample's own duration as
+//     its record measures it against the baseline's origin (measurement, not rest).
+// The two differ only by post-rest's own clock offset, which the clock check bounds.
+function restSpan(loadEnd, postRest, origin) {
   const start = wallSeconds(loadEnd);
   const end = wallSeconds(postRest);
   if (start === null || end === null) return null;
-  const rest = end - start;
-  const elapsed =
-    isTime(postRest?.elapsed) && isTime(loadEnd?.elapsed)
-      ? postRest.elapsed - loadEnd.elapsed
-      : null;
-  return { rest, elapsed, loadEndSample: elapsed === null ? null : elapsed - rest };
+  const valid = origin !== null && isTime(postRest?.elapsed) && isTime(loadEnd?.elapsed);
+  const loadEndSample = valid ? start - origin - loadEnd.elapsed : null;
+  return {
+    rest: end - start,
+    elapsed: valid ? postRest.elapsed - loadEnd.elapsed : null,
+    loadEndSample,
+    elapsedRest: valid ? postRest.elapsed - loadEnd.elapsed - loadEndSample : null,
+  };
 }
 
-function restProblems(loadEnd, postRest) {
+function restProblems(loadEnd, postRest, origin) {
   const problems = [];
   if (!isTime(postRest.elapsed) || !isTime(loadEnd.elapsed))
     problems.push("post-rest or load-end has no elapsed time");
-  const span = restSpan(loadEnd, postRest);
+  const span = restSpan(loadEnd, postRest, origin);
   if (span === null) {
     problems.push("load-end or post-rest has no parseable time: the rest is not observed");
   } else {
     if (Math.abs(span.rest - EXPECTED_REST_SECONDS) > TOLERANCE_SECONDS)
       problems.push(`rest ran ${span.rest.toFixed(1)}s, expected ${EXPECTED_REST_SECONDS}s`);
-    const sample = span.loadEndSample;
-    if (sample !== null && (sample < -CLOCK_RESOLUTION_SECONDS || sample >= SAMPLE_PERIOD_SECONDS))
+    const elapsedRest = span.elapsedRest;
+    if (elapsedRest !== null && Math.abs(elapsedRest - EXPECTED_REST_SECONDS) > TOLERANCE_SECONDS)
       problems.push(
-        `the load-end sample took ${sample.toFixed(1)}s by its elapsed and time fields (expected 0 to ${SAMPLE_PERIOD_SECONDS} s)`,
+        `elapsed rest ran ${elapsedRest.toFixed(1)}s (less the ${span.loadEndSample.toFixed(1)}s load-end sample), expected ${EXPECTED_REST_SECONDS}s`,
       );
   }
   if (heapOf(postRest) === null) problems.push("post-rest has no heapUsed");
   return problems;
+}
+
+// Every record's `time` agrees with the moment it records: with the baseline's time as origin, a
+// record is logged `time - origin - moment` seconds after that moment, within its band:
+//   worker-exit, post-rest and the last minute (closed at load end) take `elapsed` as they are
+//     logged: within 0.5 s;
+//   a periodic sample is logged after its stream, call and forced GC, and a minute bucket after the
+//     call that closes it: within one 30-second sample period;
+//   load-end is logged after its forced GC, the same sample the periodic ones take without their
+//     stream and call work: no later than the run's slowest periodic sample, plus 0.5 s;
+//   an RPC failure is logged at or after its dispatch (it may be in flight until the worker dies).
+// The cleanup record is logged last.
+function clockProblems(records, r, lastMinute) {
+  const problems = [];
+  const untimed = records.filter(
+    (x) => LOGGED_STAGES.has(x?.stage) && wallSeconds(x) === null,
+  ).length;
+  if (untimed > 0) problems.push(`${untimed} record(s) without a parseable time`);
+  const origin = wallSeconds(r.header);
+  if (origin === null)
+    return [...problems, "the baseline has no parseable time: the clock has no origin"];
+  const offset = (rec, moment) => {
+    const t = wallSeconds(rec);
+    return t === null || !isTime(moment) ? null : t - origin - moment;
+  };
+  const sampleOffsets = r.sampleRecords.map((x) => offset(x, x.elapsed)).filter((d) => d !== null);
+  const slowest = Math.max(0, ...sampleOffsets);
+  const C = CLOCK_TOLERANCE_SECONDS;
+  const closedAtEnd = (m) => r.loadEnd !== null && m === lastMinute;
+  const bands = [
+    ["sample", r.sampleRecords, "elapsed", -C, SAMPLE_PERIOD_SECONDS],
+    [
+      "minute",
+      r.minuteRecords.filter((m) => !closedAtEnd(m)),
+      "elapsedEnd",
+      -C,
+      SAMPLE_PERIOD_SECONDS,
+    ],
+    ["last minute", r.minuteRecords.filter(closedAtEnd), "elapsedEnd", -C, C],
+    ["worker-exit", r.workerExits, "elapsed", -C, C],
+    ["post-rest", r.singles["post-rest"], "elapsed", -C, C],
+    ["load-end", r.singles["load-end"], "elapsed", -C, Infinity],
+    ["rpc-error", r.rpcErrorEvents, "elapsed", -C, Infinity],
+  ];
+  for (const [name, list, field, lo, hi] of bands) {
+    const off = list
+      .map((x) => offset(x, x[field]))
+      .filter((d) => d !== null && (d < lo || d > hi));
+    if (off.length > 0)
+      problems.push(
+        `${name}: ${off.length} record(s) logged ${off[0].toFixed(1)}s from their elapsed moment (allowed ${lo} to ${hi} s)`,
+      );
+  }
+  for (const end of r.singles["load-end"]) {
+    const d = offset(end, end.elapsed);
+    if (d !== null && d > slowest + C)
+      problems.push(
+        `the load-end sample took ${d.toFixed(1)}s, longer than the slowest periodic sample (${slowest.toFixed(1)}s) + ${C} s`,
+      );
+  }
+  const cleanupTime = wallSeconds(r.cleanup);
+  const latest = Math.max(
+    ...records.filter((x) => x?.stage !== "cleanup").map((x) => wallSeconds(x) ?? -Infinity),
+  );
+  if (cleanupTime !== null && cleanupTime < latest)
+    problems.push("the cleanup record is not logged last");
+  return problems;
+}
+
+// Every error counter on every record that carries it equals the events logged by then: rpcErrors
+// the RPC failures, streamErrors the stream failures, errorsByKind each kind's failures, and
+// workerDeaths the worker exits that were not the harness's own stop. A counter with no event, or
+// an event no later counter records, is a contradiction.
+function counterProblems(r) {
+  const events = r.rpcErrorEvents.map((e) => ({ t: wallSeconds(e), kind: e.kind }));
+  const exits = r.workerExits.filter((e) => e.stopping !== true).map(wallSeconds);
+  const recs = [
+    ...r.sampleRecords,
+    ...r.singles["load-end"],
+    ...r.singles["post-rest"],
+    ...r.singles.cleanup,
+  ];
+  let off = 0;
+  let first = null;
+  for (const rec of recs) {
+    const t = wallSeconds(rec);
+    if (t === null) continue;
+    const before = events.filter((e) => e.t !== null && e.t <= t);
+    const mismatch = counterMismatch(rec, before, exits.filter((x) => x !== null && x <= t).length);
+    if (!mismatch) continue;
+    off++;
+    first ??= `${rec.stage} at ${rec.elapsed}s: ${mismatch}`;
+  }
+  return off > 0
+    ? [
+        `${off} record(s) whose error or death counters disagree with the events logged by then (first: ${first})`,
+      ]
+    : [];
+}
+
+function counterMismatch(rec, before, deaths) {
+  const expected = [
+    ["rpcErrors", before.length],
+    ["streamErrors", before.filter((e) => e.kind === "stream").length],
+    ["workerDeaths", deaths],
+  ];
+  if (rec.errorsByKind && typeof rec.errorsByKind === "object") {
+    const kinds = new Set([...Object.keys(rec.errorsByKind), ...before.map((e) => String(e.kind))]);
+    for (const k of kinds)
+      expected.push([`errorsByKind.${k}`, before.filter((e) => String(e.kind) === k).length]);
+  }
+  for (const [field, n] of expected) {
+    const value = field.startsWith("errorsByKind.")
+      ? (rec.errorsByKind[field.slice(13)] ?? 0)
+      : rec[field];
+    if (field.startsWith("errorsByKind.") || isCount(value)) {
+      if (value !== n) return `${field} ${value}, ${n} event(s)`;
+    }
+  }
+  return null;
 }
 
 // Cumulative error and death counters are never erased by a later, smaller one: take the maximum
@@ -573,33 +752,41 @@ function leakEvidence({ series, loadEnd, baseline, heapLimit, oomDeaths }) {
   return { leakShown, leakElapsed: leakShown ? elapsed : null };
 }
 
-// Up to its leak point, the control's load must have been delivered. Every error counts: one
-// recorded by a sample in the window, an event at or before the leak point (or untimed), and an end
-// counter with no event of its own (untimed). The only failures excused are those the worker's exit
-// itself caused, shown by the driver's own message, after the last successful sample, in a run
-// whose worker exited. No death other than a timed heap-limit abort may come at or before the
-// window's end.
+// A failure is excused only when the worker's heap-limit abort caused it: logged at or after a
+// recorded heap-limit worker-exit, after the last good sample was logged, and dispatched no earlier
+// than that sample. Its message plays no part.
+function excusedByAbort(workerExits, series) {
+  const abortTimes = workerExits
+    .filter((e) => e.stopping !== true && isHeapLimitAbort(e))
+    .map(wallSeconds)
+    .filter((t) => t !== null);
+  if (abortTimes.length === 0) return () => false;
+  const abortAt = Math.min(...abortTimes);
+  const last = series.at(-1);
+  const lastLogged = last ? (wallSeconds(last.rec) ?? Infinity) : -Infinity;
+  const lastElapsed = last?.elapsed ?? -Infinity;
+  return (e) => {
+    const t = wallSeconds(e);
+    return (
+      t !== null && t >= abortAt && t > lastLogged && isTime(e.elapsed) && e.elapsed >= lastElapsed
+    );
+  };
+}
+
+// Up to its leak point, the control's load must have been delivered: any failure dispatched by
+// then that its abort did not cause, and any non-zero error or death counter of any kind on a
+// sample in the window, disqualifies it. (Every counter equals its events: counterProblems.) No
+// death other than a timed heap-limit abort may come at or before the window's end.
 function controlProblems({ series, counters, rpcErrorEvents, workerExits, windowEnd }) {
   const problems = [];
-  const lastSample = series.at(-1)?.elapsed ?? -Infinity;
-  const exited = workerExits.some((e) => e.stopping !== true);
-  const causedByExit = (e) =>
-    exited &&
-    typeof e.message === "string" &&
-    WORKER_EXIT_FAILURE_RE.test(e.message) &&
-    isTime(e.elapsed) &&
-    e.elapsed > lastSample;
-  const timed = rpcErrorEvents.filter(
-    (e) => !causedByExit(e) && (!isTime(e.elapsed) || e.elapsed <= windowEnd),
+  const excused = excusedByAbort(workerExits, series);
+  const dispatched = rpcErrorEvents.filter(
+    (e) => !excused(e) && (!isTime(e.elapsed) || e.elapsed <= windowEnd),
   ).length;
-  const untimed = counters.errors - rpcErrorEvents.length;
   const counted = series
     .filter((s) => s.elapsed <= windowEnd)
-    .reduce(
-      (m, { rec }) => Math.max(m, ...ERROR_COUNTERS.map((f) => (isCount(rec[f]) ? rec[f] : 0))),
-      0,
-    );
-  const errors = Math.max(timed + untimed, counted);
+    .reduce((m, { rec }) => Math.max(m, ...errorCounts(rec)), 0);
+  const errors = Math.max(dispatched, counted);
   if (errors > 0)
     problems.push(
       `${errors} RPC error(s) or death(s) before the leak point: the load was not delivered as stated`,
@@ -611,6 +798,14 @@ function controlProblems({ series, counters, rpcErrorEvents, workerExits, window
   if (unexplained > 0)
     problems.push(`${unexplained} worker death(s) that are not a timed heap-limit abort`);
   return problems;
+}
+
+// Every error and death counter a record carries, by kind as well.
+function errorCounts(rec) {
+  const byKind = rec.errorsByKind && typeof rec.errorsByKind === "object" ? rec.errorsByKind : {};
+  return [...ERROR_COUNTERS.map((f) => rec[f]), ...Object.values(byKind)].map((v) =>
+    isCount(v) ? v : 0,
+  );
 }
 
 // The stream schedule holds through the end of the judged window, not only at the last 30 s
@@ -661,7 +856,7 @@ function buildNumbers(ctx) {
     maxAboveBaselineBytes: baseline === null ? null : maxHeap - baseline,
     lastLoadSampleBytes: loadSamples.at(-1)?.heapUsed ?? null,
     postRestBytes: heapOf(postRest),
-    ...restNumbers(loadEnd, postRest),
+    ...restNumbers(loadEnd, postRest, wallSeconds(header)),
     slopeBytesPerHour: leastSquaresSlopePerHour(tail),
     tailSamples: tail.length,
     rpcErrors: counters.errors,
@@ -684,8 +879,8 @@ function buildNumbers(ctx) {
   };
 }
 
-function restNumbers(loadEnd, postRest) {
-  const span = loadEnd && postRest ? restSpan(loadEnd, postRest) : null;
+function restNumbers(loadEnd, postRest, origin) {
+  const span = loadEnd && postRest ? restSpan(loadEnd, postRest, origin) : null;
   return { restSeconds: span?.rest ?? null, restElapsedSeconds: span?.elapsed ?? null };
 }
 
@@ -784,7 +979,9 @@ export function analyze(records, options = {}) {
     ...slotProblems(series, malformed, windowEnd, full),
     ...instrumentProblems(series),
     ...sampleLoadProblems(series, totals),
-    ...recordProblems(r, totals, series, r.minuteRecords.length),
+    ...recordProblems(r, totals, series, { count: r.minuteRecords.length, valid: minutes.valid }),
+    ...clockProblems(records, r, lastMinuteRecord(r.minuteRecords)),
+    ...counterProblems(r),
     ...stopProblems(r),
     ...deliveryProblems(r.loadEnd, series, windowEnd, full),
     ...(full ? phaseProblems(r) : []),
