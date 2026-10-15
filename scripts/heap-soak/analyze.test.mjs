@@ -14,15 +14,18 @@ const RATE = 27;
 const MIX = { logs: 15, inspect: 9, ls: 2, send: 1 };
 // The offsets a real run shows (the 2026-10-14 23:48Z runs): a sample lands a few milliseconds
 // after its 30-second slot, a call a few milliseconds after its schedule, the load ends just past
-// 14,400 s, and each forced-GC sample takes about 0.7 s (its record's wall-clock `time` follows its
-// `elapsed` by that much). The driver logs load-end after its forced-GC sample, sleeps the
-// 300-second rest, then takes the post-rest sample and logs it.
+// 14,400 s. The driver stamps every record with the wall clock (`time`) as it logs it, on the same
+// clock as `elapsed`, which starts as the baseline is logged: a forced-GC sample is logged about
+// 0.7 s after its `elapsed` (its stream, call and GC), a minute bucket when the next minute's first
+// call has run, load-end after its forced-GC sample, then the 300-second rest, then post-rest.
 const SAMPLE_OFFSET = 0.011;
 const CALL_OFFSET = 0.004;
+const CALL_SECONDS = 0.1;
 const LOAD_END_OFFSET = 0.05;
 const GC_SAMPLE_SECONDS = 0.7;
 const REST_SLEEP_SECONDS = 300;
 const LOAD_START_MS = Date.UTC(2026, 9, 14, 23, 48, 25, 478);
+const ERROR_KINDS = ["logs", "inspect", "ls", "send", "stream", "sample", "other"];
 // A record's wall-clock `time` at this many seconds after the load started.
 const wall = (seconds) => new Date(LOAD_START_MS + Math.round(seconds * 1000)).toISOString();
 
@@ -33,6 +36,7 @@ const DEFAULTS = {
   control: false,
   readStreaming: false,
   deathAt: null, // the worker's heap-limit abort at this elapsed second (a control's OOM)
+  sampleSeconds: () => GC_SAMPLE_SECONDS, // (elapsed) => how long that forced-GC sample took
 };
 
 function callKind(n) {
@@ -45,6 +49,7 @@ function callKind(n) {
 
 const scheduledChunks = (t) => 7 * Math.floor((t / 1800) * 2048);
 const zeroKinds = () => ({ logs: 0, inspect: 0, ls: 0, send: 0 });
+const zeroErrors = () => Object.fromEntries(ERROR_KINDS.map((k) => [k, 0]));
 
 function observation(heapMiB) {
   return {
@@ -60,9 +65,11 @@ function observation(heapMiB) {
 
 // A run in soak.mjs's JSONL, built the way the driver records it: calls on their 60/27-second
 // schedule in the fixed 15/9/2/1 order, wall-clock minute buckets (the last one closed at load
-// end), a forced-GC sample every 30 seconds carrying every cumulative counter, load-end,
-// post-rest and cleanup. With `deathAt`, the worker aborts at its heap limit as the unfixed
-// control did: the in-flight stream RPCs and the load-end sample fail, and there is no post-rest.
+// end), a forced-GC sample every 30 seconds carrying every cumulative counter (calls, calls by
+// kind, closed minutes, stream chunks, errors, errors by kind, deaths), load-end, post-rest and
+// cleanup. With `deathAt`, the worker aborts at its heap limit as the unfixed control did: the
+// in-flight stream RPCs, the load-end sample and the post-rest sample fail, and there is no
+// post-rest record.
 function buildRun(overrides = {}) {
   const o = { ...DEFAULTS, ...overrides };
   const heapAt = o.heapAt ?? (() => o.baselineMiB);
@@ -84,10 +91,12 @@ function buildRun(overrides = {}) {
       next++;
     }
     records.push({
-      time: wall(t + GC_SAMPLE_SECONDS),
+      time: wall(t + o.sampleSeconds(t)),
       stage: "sample",
       elapsed: t,
       ...counters(counted, scheduledChunks(t), 0),
+      minutes: next === 0 ? 0 : Math.floor(calls[next - 1].elapsed / 60),
+      errorsByKind: zeroErrors(),
       ...observation(heapAt(t)),
     });
   }
@@ -105,6 +114,7 @@ function buildRun(overrides = {}) {
       elapsed: loadEnd,
       ...structuredClone(final),
       minutes: minutes.length,
+      errorsByKind: zeroErrors(),
       ...observation(heapAt(SECONDS)),
     });
     const restEnd = loadEnd + GC_SAMPLE_SECONDS + REST_SLEEP_SECONDS + GC_SAMPLE_SECONDS;
@@ -115,12 +125,7 @@ function buildRun(overrides = {}) {
       ...structuredClone(final),
       ...observation(o.postRestHeapMiB ?? heapAt(SECONDS)),
     });
-    records.push({
-      time: wall(restEnd + 0.5),
-      stage: "cleanup",
-      removed: true,
-      ...structuredClone(final),
-    });
+    records.push({ time: wall(restEnd + 0.5), stage: "cleanup", ...structuredClone(final) });
   }
   return records;
 }
@@ -174,7 +179,8 @@ function buildMinutes(calls, loadEnd) {
     while (buckets.length <= index) {
       const i = buckets.length;
       buckets.push({
-        time: wall((i + 1) * 60 + CALL_OFFSET), // closed when the next minute's first call lands
+        // closed once the next minute's first call has run
+        time: wall((i + 1) * 60 + CALL_OFFSET + CALL_SECONDS),
         stage: "minute",
         index: i,
         elapsedStart: i * 60,
@@ -191,6 +197,10 @@ function buildMinutes(calls, loadEnd) {
   return buckets;
 }
 
+// The real control's death path (2026-10-15T00:10:42Z): the exit is logged; the exit handler then
+// rejects the pending stream RPC and every later RPC fails at once; the loop ends, the load-end
+// sample fails, and after the rest so does the post-rest sample. Every failure is an event, and
+// every later record counts it.
 function buildDeath(deathAt, total, minutes, loadEnd) {
   const records = [
     {
@@ -204,38 +214,32 @@ function buildDeath(deathAt, total, minutes, loadEnd) {
       reason: "Reached heap limit",
     },
   ];
-  // As the driver records it: the exit handler rejects the pending stream RPC ("worker exit
-  // null"); every later RPC fails at once ("worker dead").
   for (let i = 0; i < 7; i++) {
     const message = i === 0 ? "worker exit null" : "worker dead";
-    const exitTime = wall(deathAt);
-    records.push({
-      time: exitTime,
-      stage: "rpc-error",
-      elapsed: deathAt - 0.16,
-      kind: "stream",
-      message,
-    });
+    const stream = { stage: "rpc-error", elapsed: deathAt - 0.16, kind: "stream", message };
+    records.push({ time: wall(deathAt + 0.001), ...stream });
   }
-  const time = wall(loadEnd);
-  records.push({
-    time,
-    stage: "rpc-error",
-    elapsed: loadEnd,
-    kind: "sample",
-    message: "worker dead",
-  });
+  const sampleFailure = { stage: "rpc-error", elapsed: loadEnd, kind: "sample" };
+  records.push({ time: wall(loadEnd), ...sampleFailure, message: "worker dead" });
   const final = {
     ...counters(total, scheduledChunks(deathAt - 0.3), 7),
     rpcErrors: 8,
     workerDeaths: 1,
   };
-  records.push({ time, stage: "load-end", elapsed: loadEnd, ...structuredClone(final), minutes });
+  records.push({
+    time: wall(loadEnd),
+    stage: "load-end",
+    elapsed: loadEnd,
+    ...structuredClone(final),
+    minutes,
+  });
+  const restFailure = { stage: "rpc-error", elapsed: loadEnd + 300.086, kind: "other" };
+  records.push({ time: wall(loadEnd + 300.086), ...restFailure, message: "worker dead" });
   records.push({
     time: wall(loadEnd + REST_SLEEP_SECONDS + 15),
     stage: "cleanup",
-    removed: true,
     ...structuredClone(final),
+    rpcErrors: 9,
   });
   return records;
 }
@@ -244,14 +248,32 @@ const samplesOf = (r) => r.filter((x) => x.stage === "sample");
 const minutesOf = (r) => r.filter((x) => x.stage === "minute");
 const sampleAt = (r, slot) => samplesOf(r).find((x) => Math.floor(x.elapsed / 30) === slot);
 const one = (r, stage) => r.find((x) => x.stage === stage);
+const COUNTED = new Set(["sample", "load-end", "post-rest", "cleanup"]);
+
+// Record an RPC failure as the driver does: an event dispatched at `elapsed` and logged at
+// `loggedAt`, counted by every later record (rpcErrors, streamErrors for a stream, errorsByKind).
+function injectError(r, elapsed, kind, message = "injected", loggedAt = elapsed + CALL_SECONDS) {
+  const time = wall(loggedAt);
+  r.push({ time, stage: "rpc-error", elapsed, kind, message });
+  for (const x of r) {
+    if (!COUNTED.has(x.stage) || Date.parse(x.time) < Date.parse(time)) continue;
+    x.rpcErrors += 1;
+    if (kind === "stream") x.streamErrors += 1;
+    if (x.errorsByKind) x.errorsByKind[kind] += 1;
+  }
+  return r;
+}
+
 // Set the rest as the driver would record it: the load-end record logged `loadEndSample` seconds
 // after the load end (its forced-GC sample), the post-rest record `rest` seconds after that.
 function withRest(r, rest, loadEndSample = GC_SAMPLE_SECONDS) {
   const end = one(r, "load-end");
   const post = one(r, "post-rest");
+  const cleanup = one(r, "cleanup");
   end.time = wall(end.elapsed + loadEndSample);
   post.elapsed = end.elapsed + loadEndSample + rest;
   post.time = wall(post.elapsed);
+  cleanup.time = wall(post.elapsed + 0.5);
   return r;
 }
 const flat = () => buildRun({ postRestHeapMiB: 199 });
@@ -294,6 +316,7 @@ test("a sample one call behind its schedule still passes (the real 120 s sample)
   const s = sampleAt(r, 4);
   s.calls -= 1;
   s.byKind.logs -= 1;
+  s.minutes = 1; // its last call is then minute 1's last
   assert.equal(verdictOf(r), "pass");
 });
 
@@ -415,18 +438,34 @@ test("round 1 finding 9: 95% of the requested bound is not the bound", () => {
 
 test("round 1 finding 9: a flat control with an unexplained death is inconclusive", () => {
   const r = buildRun({ control: true });
-  r.push({ stage: "worker-exit", elapsed: 3600, code: 1, signal: null, oom: false, reason: null });
+  r.push({
+    time: wall(3600),
+    stage: "worker-exit",
+    elapsed: 3600,
+    code: 1,
+    signal: null,
+    oom: false,
+    reason: null,
+  });
   assertInconclusive(r, /1 worker death\(s\) that are not a timed heap-limit abort/, {
     control: true,
   });
 });
 
-test("round 1 finding 10: a sample error or death hidden by zero final counters fails", () => {
+test("round 1 finding 10: a sample error or death that later counters drop is inconclusive", () => {
+  // No event explains the count, and the later records contradict it.
   for (const field of ["rpcErrors", "workerDeaths"]) {
     const r = flat();
     sampleAt(r, 240)[field] = 1;
-    assert.equal(verdictOf(r), "fail", field);
+    assertInconclusive(r, /counters disagree with the events logged by then/);
   }
+});
+
+test("a fixed run with a recorded RPC error fails", () => {
+  const result = analyze(injectError(flat(), 7200.011, "logs", "socket hang up"));
+  assert.deepEqual(result.inconclusive, []);
+  assert.equal(result.verdict, "fail");
+  assert.equal(result.numbers.rpcErrors, 1);
 });
 
 // --- Round 2 finding 1 (analyze.mjs:129): minute buckets must be timed and consecutive ------
@@ -495,12 +534,14 @@ test("round 2 finding 3: absent error and death counters are inconclusive", () =
 
 // --- Round 2 finding 4 (analyze.mjs:66): a sample's stream error must survive ----------------
 
-test("round 2 finding 4: a sample's stream error hidden by zero final counters fails", () => {
-  const r = flat();
-  sampleAt(r, 240).streamErrors = 1;
-  const result = analyze(r);
+test("round 2 finding 4: a sample's stream error is never dropped", () => {
+  // Recorded with its event, it fails the run; counted with no event, the run is inconclusive.
+  const result = analyze(injectError(flat(), 7200.011, "stream", "worker dead"));
   assert.equal(result.verdict, "fail");
   assert.equal(result.numbers.streamErrors, 1);
+  const r = flat();
+  sampleAt(r, 240).streamErrors = 1;
+  assertInconclusive(r, /counters disagree with the events logged by then/);
 });
 
 // --- Round 2 finding 5 (analyze.mjs:224): only a timed heap-limit abort qualifies -----------
@@ -508,6 +549,7 @@ test("round 2 finding 4: a sample's stream error hidden by zero final counters f
 test("round 2 finding 5: an unrelated SIGABRT does not qualify a flat control", () => {
   const r = buildRun({ control: true });
   r.push({
+    time: wall(600.5),
     stage: "worker-exit",
     elapsed: 600.5,
     code: null,
@@ -591,7 +633,12 @@ test("rest on the wall clock: a 303-second rest is inconclusive", () => {
 });
 
 test("rest on the wall clock: a 301.4-second rest after 2.7 s of GC sample time passes", () => {
-  const result = analyze(withRest(flat(), 301.4, 2.7));
+  // The run's own forced-GC samples reach 2.7 s (the real runs' slowest is 2.68 s).
+  const r = buildRun({
+    postRestHeapMiB: 199,
+    sampleSeconds: (t) => (Math.floor(t / 30) === 240 ? 2.7 : GC_SAMPLE_SECONDS),
+  });
+  const result = analyze(withRest(r, 301.4, 2.7));
   assert.equal(result.verdict, "pass", JSON.stringify(result.inconclusive));
   assert.equal(result.numbers.restSeconds.toFixed(1), "301.4");
   assert.equal(result.numbers.restElapsedSeconds.toFixed(1), "304.1");
@@ -608,6 +655,7 @@ test("rest on the wall clock: an absent or unparseable time on load-end or post-
     if (value === undefined) delete one(r, stage).time;
     else one(r, stage).time = value;
     assertInconclusive(r, /no parseable time: the rest is not observed/);
+    assertInconclusive(r, /1 record\(s\) without a parseable time/);
   }
 });
 
@@ -616,9 +664,13 @@ test("rest on the wall clock: elapsed and time that disagree by a sample period 
   // load-end record; the load-end sample would have taken 30 s.
   const r = withRest(flat(), 300, 0);
   one(r, "post-rest").elapsed += 30;
-  assertInconclusive(r, /the load-end sample took 30.0s by its elapsed and time/);
+  assertInconclusive(r, /elapsed rest ran 330.0s \(less the 0.0s load-end sample\), expected 300s/);
+  assertInconclusive(r, /post-rest: 1 record\(s\) logged -30.0s from their elapsed moment/);
   // And a load-end record logged before the load end it records.
-  assertInconclusive(withRest(flat(), 300, -1), /the load-end sample took -1.0s by its elapsed/);
+  assertInconclusive(
+    withRest(flat(), 300, -1),
+    /load-end: 1 record\(s\) logged -1.0s from their elapsed moment/,
+  );
 });
 
 // --- Round 3 finding 2 (analyze.mjs:550): every control error up to the leak point counts ---
@@ -633,31 +685,25 @@ function controlLeakingAtLoadEnd() {
 test("round 3 finding 2: a control read failure after the last sample, before the leak, counts", () => {
   const r = controlLeakingAtLoadEnd();
   assert.equal(verdictOf(r, { control: true }), "pass");
-  for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).rpcErrors = 1;
-  r.push({ stage: "rpc-error", elapsed: 14390, kind: "inspect", message: "socket hang up" });
+  injectError(r, 14390, "inspect", "socket hang up");
   assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
 });
 
 test("round 3 finding 2: a control error in the end counters with no event counts", () => {
   const r = controlLeakingAtLoadEnd();
   for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).rpcErrors = 1;
-  assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
+  assertInconclusive(r, /counters disagree with the events logged by then/, { control: true });
 });
 
 test("round 3 finding 2: before a heap-limit abort, only the abort's own failures are excused", () => {
   const r = buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
-  r.push({ stage: "rpc-error", elapsed: 1332.2, kind: "logs", message: "socket hang up" });
-  for (const stage of ["load-end", "cleanup"]) one(r, stage).rpcErrors += 1;
+  injectError(r, 1332.2, "logs", "socket hang up");
   assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
 });
 
 test("round 3 finding 2: a 'worker dead' failure before the last sample is not excused", () => {
   const r = buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
-  r.push({ stage: "rpc-error", elapsed: 600.2, kind: "stream", message: "worker dead" });
-  for (const stage of ["load-end", "cleanup"]) {
-    one(r, stage).rpcErrors += 1;
-    one(r, stage).streamErrors += 1;
-  }
+  injectError(r, 600.2, "stream", "worker dead");
   assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
 });
 
@@ -683,6 +729,131 @@ test("round 3 finding 3: a control leak point between samples needs the delivere
   const r = controlLeakingAtLoadEnd();
   for (const stage of ["load-end", "post-rest", "cleanup"]) delete one(r, stage).streamChunks;
   assertInconclusive(r, /no delivered stream-chunk count at the load end/, { control: true });
+});
+
+// --- Round 4 finding 1 (analyze.mjs:519): every clock pair agrees; the rest holds on both ----
+//
+// Every record carries the driver's wall-clock `time` beside its `elapsed`. With the baseline's
+// time as origin, a record is logged `time - origin - elapsed` seconds after the moment it records:
+// at once for worker-exit, post-rest and the last minute (closed at load end); within a sample
+// period for samples and minutes; within the run's slowest periodic sample for load-end; never
+// before its moment for an RPC failure. Cleanup is logged last.
+
+const shiftTime = (rec, seconds) => {
+  rec.time = new Date(Date.parse(rec.time) + seconds * 1000).toISOString();
+};
+
+test("round 4 finding 1: a 320 s rest with post-rest time moved back 20 s is inconclusive", () => {
+  const r = withRest(flat(), 320);
+  assertInconclusive(r, /rest ran 320.0s, expected 300s/);
+  shiftTime(one(r, "post-rest"), -20);
+  assertInconclusive(r, /post-rest: 1 record\(s\) logged -20.0s from their elapsed moment/);
+  assertInconclusive(r, /elapsed rest ran 320.0s \(less the 0.7s load-end sample\)/);
+});
+
+test("round 4 finding 1: post-rest elapsed moved 20 s later alone is inconclusive", () => {
+  const r = flat();
+  one(r, "post-rest").elapsed += 20;
+  assertInconclusive(r, /post-rest: 1 record\(s\) logged -20.0s from their elapsed moment/);
+  assertInconclusive(r, /elapsed rest ran 320.7s/);
+});
+
+test("round 4 finding 1: a load-end sample slower than every periodic sample is inconclusive", () => {
+  // A 320 s rest made to read 300.3 s on both clocks by moving only load-end's time.
+  const r = withRest(flat(), 320);
+  shiftTime(one(r, "load-end"), 19.7);
+  assertInconclusive(r, /load-end sample took 20.4s, longer than the slowest periodic sample/);
+});
+
+test("round 4 finding 1: any record logged off its own elapsed moment is inconclusive", () => {
+  for (const [mutate, reason, options] of [
+    [(r) => shiftTime(sampleAt(r, 100), -1.7), /sample: 1 record\(s\) logged -1.0s/],
+    [(r) => shiftTime(sampleAt(r, 100), 30), /sample: 1 record\(s\) logged 30.7s/],
+    [(r) => shiftTime(minutesOf(r)[10], -1), /minute: 1 record\(s\) logged -0.9s/],
+    [(r) => shiftTime(minutesOf(r).at(-1), 1), /last minute: 1 record\(s\) logged 1.0s/],
+    [(r) => delete minutesOf(r)[10].time, /1 record\(s\) without a parseable time/],
+    [(r) => delete r[0].time, /the baseline has no parseable time/],
+    [(r) => shiftTime(one(r, "cleanup"), -400), /the cleanup record is not logged last/],
+  ]) {
+    const r = flat();
+    mutate(r);
+    assertInconclusive(r, reason, options);
+  }
+  const control = () => buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
+  let r = control();
+  shiftTime(one(r, "worker-exit"), 1);
+  assertInconclusive(r, /worker-exit: 1 record\(s\) logged 1.0s/, { control: true });
+  r = control();
+  shiftTime(
+    r.find((x) => x.stage === "rpc-error"),
+    -1,
+  );
+  assertInconclusive(r, /rpc-error: 1 record\(s\) logged -0.8s/, { control: true });
+});
+
+test("round 4 finding 1: sample minute counts and the last bucket agree with the buckets", () => {
+  let r = flat();
+  sampleAt(r, 100).minutes += 1;
+  assertInconclusive(
+    r,
+    /1 sample\(s\) whose closed-minute count disagrees with the minute buckets/,
+  );
+  r = flat();
+  delete sampleAt(r, 100).minutes;
+  assertInconclusive(r, /1 sample\(s\) without a closed-minute count/);
+  r = flat();
+  minutesOf(r).at(-1).elapsedEnd -= 1;
+  assertInconclusive(r, /the last minute bucket ends at 14399.05s, not at load-end 14400.05s/);
+});
+
+// --- Round 4 finding 2 (analyze.mjs:584): only the heap-limit exit excuses, by time ---------
+
+const abortControl = () =>
+  buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
+
+test("round 4 finding 2: a failure logged before the exit is not excused by its message", () => {
+  for (const [kind, message] of [
+    ["stream", "worker dead"],
+    ["logs", "worker dead"],
+    ["inspect", "worker exit null"],
+  ]) {
+    const r = injectError(abortControl(), 1332.2, kind, message, 1332.2);
+    assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, {
+      control: true,
+    });
+  }
+});
+
+test("round 4 finding 2: a failure logged after the heap-limit exit is excused, whatever it says", () => {
+  // Dispatched after the last good sample and logged after the exit: the exit caused it.
+  const r = injectError(abortControl(), 1336.9, "logs", "socket hang up", 1337.2);
+  const result = analyze(r, { control: true });
+  assert.equal(result.verdict, "pass", JSON.stringify(result.inconclusive));
+  assert.equal(result.numbers.rpcErrors, 10);
+});
+
+// --- Round 4 finding 3 (analyze.mjs:595): every error counter of every kind counts ----------
+
+test("round 4 finding 3: an end stream-error counter with no event is inconclusive", () => {
+  const r = controlLeakingAtLoadEnd();
+  for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).streamErrors = 1;
+  assertInconclusive(r, /counters disagree with the events logged by then/, { control: true });
+});
+
+test("round 4 finding 3: a by-kind error counter with no event is inconclusive", () => {
+  const r = controlLeakingAtLoadEnd();
+  sampleAt(r, 10).errorsByKind.sample = 1;
+  assertInconclusive(r, /counters disagree with the events logged by then/, { control: true });
+  const s = flat();
+  delete sampleAt(s, 10).errorsByKind;
+  assertInconclusive(s, /1 sample\(s\) without errors by kind/);
+});
+
+test("round 4 finding 3: a recorded error of any kind before the leak point disqualifies a control", () => {
+  for (const kind of ["stream", "sample", "other", "send"]) {
+    const r = injectError(leakingControl(), 600.5, kind);
+    assertInconclusive(r, /before the leak point/, { control: true });
+  }
 });
 
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
@@ -788,15 +959,22 @@ test("audit: a rest far longer than five minutes is inconclusive", () => {
   assertInconclusive(withRest(flat(), 300 + 3 * 3600), /rest ran 11100.0s, expected 300s/);
 });
 
-test("audit: an RPC error event missing from every counter still fails", () => {
+test("audit: an RPC error event that no counter records is inconclusive", () => {
   const r = flat();
-  r.push({ stage: "rpc-error", elapsed: 7200, kind: "logs", message: "injected" });
-  assert.equal(verdictOf(r), "fail");
+  r.push({ time: wall(7200.1), stage: "rpc-error", elapsed: 7200, kind: "logs", message: "x" });
+  assertInconclusive(r, /counters disagree with the events logged by then/);
 });
 
 test("audit: a worker exit marked as the harness's own stop mid-run is inconclusive", () => {
   const r = flat();
-  r.push({ stage: "worker-exit", elapsed: 7200, code: null, signal: "SIGTERM", stopping: true });
+  r.push({
+    time: wall(7200),
+    stage: "worker-exit",
+    elapsed: 7200,
+    code: null,
+    signal: "SIGTERM",
+    stopping: true,
+  });
   assertInconclusive(r, /marked as the harness's stop before the run ended/);
 });
 
