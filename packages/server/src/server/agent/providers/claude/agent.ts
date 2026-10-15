@@ -1155,6 +1155,19 @@ interface TimelineMessageState {
   stopped: boolean;
 }
 
+/**
+ * Independent copy of the suffix of `text` starting at `start`.
+ *
+ * A `slice` returns a string that can share the whole `text` backing store, so each emitted
+ * streamed suffix keeps every earlier accumulated string alive: a message streamed in 64-byte
+ * chunks retains storage quadratic in its chunk count. The UTF-16 round trip detaches the copy;
+ * the UTF-8 one would replace a surrogate pair split across the boundary with replacement
+ * characters.
+ */
+function detachedSuffix(text: string, start: number): string {
+  return Buffer.from(text.slice(start), "utf16le").toString("utf16le");
+}
+
 class TimelineAssembler {
   private readonly messages = new Map<string, TimelineMessageState>();
   private readonly finalizedMessageIds = new Set<string>();
@@ -1320,7 +1333,7 @@ class TimelineAssembler {
 
   private emitNewContent(state: TimelineMessageState): AgentTimelineItem[] {
     const items: AgentTimelineItem[] = [];
-    const nextAssistantText = state.assistantText.slice(state.emittedAssistantLength);
+    const nextAssistantText = detachedSuffix(state.assistantText, state.emittedAssistantLength);
     if (
       nextAssistantText.length > 0 &&
       nextAssistantText !== INTERRUPT_TOOL_USE_PLACEHOLDER &&
@@ -1330,7 +1343,7 @@ class TimelineAssembler {
       items.push({ type: "assistant_message", text: nextAssistantText, messageId: state.id });
     }
 
-    const nextReasoningText = state.reasoningText.slice(state.emittedReasoningLength);
+    const nextReasoningText = detachedSuffix(state.reasoningText, state.emittedReasoningLength);
     if (nextReasoningText.length > 0) {
       state.emittedReasoningLength = state.reasoningText.length;
       items.push({ type: "reasoning", text: nextReasoningText });
