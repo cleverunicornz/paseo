@@ -1,7 +1,11 @@
 import { setImmediate as scheduleImmediate } from "node:timers";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { GitProcessScheduler, resolveGitProcessPolicy } from "./git-process-scheduler.js";
+import {
+  DEFAULT_GIT_PROCESS_POLICY,
+  GitProcessScheduler,
+  resolveGitProcessPolicy,
+} from "./git-process-scheduler.js";
 
 function createConcurrencyTask(
   index: number,
@@ -155,6 +159,94 @@ describe("GitProcessScheduler", () => {
   });
 });
 
+describe("GitProcessScheduler queue bound", () => {
+  test("refuses a submission with a named error when the queue is full", async () => {
+    const scheduler = new GitProcessScheduler({
+      maxProcessesPerSecond: 100,
+      maxProcessConcurrency: 1,
+      maxQueueDepth: 2,
+    });
+    const releases: Array<() => void> = [];
+    const started: number[] = [];
+
+    const active = scheduler.run(createConcurrencyTask(0, started, releases));
+    await vi.waitFor(() => expect(started).toEqual([0]));
+    const queuedA = scheduler.run(createConcurrencyTask(2, started, releases));
+    const queuedB = scheduler.run(createConcurrencyTask(2, started, releases));
+
+    // The third queued command has no slot: it is refused, not appended.
+    await expect(
+      scheduler.run(createConcurrencyTask(2, started, releases)),
+    ).rejects.toMatchObject({
+      name: "GitProcessQueueFullError",
+      code: "GIT_PROCESS_QUEUE_FULL",
+    });
+    expect(scheduler.pendingCount).toBe(2);
+
+    releases.shift()?.();
+    await Promise.all([active, queuedA, queuedB]);
+    expect(scheduler.pendingCount).toBe(0);
+  });
+
+  test("refusing a queued command never leaves the queue stuck", async () => {
+    const scheduler = new GitProcessScheduler({
+      maxProcessesPerSecond: 100,
+      maxProcessConcurrency: 2,
+      maxQueueDepth: 1,
+    });
+    const releases: Array<() => void> = [];
+    const started: number[] = [];
+
+    const a = scheduler.run(createConcurrencyTask(0, started, releases));
+    const b = scheduler.run(createConcurrencyTask(0, started, releases));
+    await vi.waitFor(() => expect(started).toEqual([0, 0]));
+    const queued = scheduler.run(createConcurrencyTask(2, started, releases));
+    await expect(scheduler.run(createConcurrencyTask(2, started, releases))).rejects.toThrow(
+      /queue is full/i,
+    );
+
+    releases.shift()?.();
+    releases.shift()?.();
+    await Promise.all([a, b, queued]);
+    expect(scheduler.pendingCount).toBe(0);
+    expect(scheduler.activeCount).toBe(0);
+  });
+
+  test("a bounded scheduler still admits interactive work ahead of observation work", async () => {
+    const scheduler = new GitProcessScheduler({
+      maxProcessesPerSecond: 100,
+      maxProcessConcurrency: 1,
+      maxQueueDepth: 4,
+    });
+    const releases: Array<() => void> = [];
+    const started: number[] = [];
+
+    const active = scheduler.run(createConcurrencyTask(0, started, releases));
+    await vi.waitFor(() => expect(started).toEqual([0]));
+    const observation = scheduler.run(createConcurrencyTask(2, started, releases));
+    const interactive = scheduler.run(createConcurrencyTask(3, started, releases), {
+      priority: "high",
+    });
+
+    releases.shift()?.();
+    await Promise.all([active, observation, interactive]);
+    expect(started).toEqual([0, 3, 2]);
+  });
+});
+
+describe("resolveGitProcessPolicy", () => {
+  test("defaults the queue depth to a bounded value and honours the override", () => {
+    expect(resolveGitProcessPolicy({ env: {} }).maxQueueDepth).toBe(
+      DEFAULT_GIT_PROCESS_POLICY.maxQueueDepth,
+    );
+    expect(
+      resolveGitProcessPolicy({
+        env: { PASEO_GIT_MAX_QUEUE_DEPTH: "7" },
+      }).maxQueueDepth,
+    ).toBe(7);
+  });
+});
+
 describe("resolveGitProcessPolicy", () => {
   test("prefers renamed environment variables over legacy and persisted values", () => {
     expect(
@@ -166,6 +258,10 @@ describe("resolveGitProcessPolicy", () => {
         },
         persisted: { maxProcessesPerSecond: 5, maxProcessConcurrency: 4 },
       }),
-    ).toEqual({ maxProcessesPerSecond: 12, maxProcessConcurrency: 7 });
+    ).toEqual({
+      maxProcessesPerSecond: 12,
+      maxProcessConcurrency: 7,
+      maxQueueDepth: DEFAULT_GIT_PROCESS_POLICY.maxQueueDepth,
+    });
   });
 });

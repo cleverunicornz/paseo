@@ -217,9 +217,12 @@ function enqueueSpawnBehaviors(...behaviors: FakeSpawnBehavior[]): void {
   fakeSpawnController.queue.push(...behaviors);
 }
 
-async function loadRunGitCommand(concurrency: number) {
+async function loadRunGitCommand(concurrency: number, options?: { queueDepth?: number }) {
   vi.resetModules();
   vi.stubEnv("PASEO_GIT_CONCURRENCY", String(concurrency));
+  if (options?.queueDepth !== undefined) {
+    vi.stubEnv("PASEO_GIT_MAX_QUEUE_DEPTH", String(options.queueDepth));
+  }
   return import("./run-git-command.js");
 }
 
@@ -340,6 +343,42 @@ describe("runGitCommand", () => {
       failed: 0,
       maxConcurrent: 1,
     });
+  });
+
+  it("measures a command's timeout from its start, not from its queue time", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+
+    // The first command holds the only slot for 250ms while the second waits.
+    // The second runs for 40ms against a 100ms timeout: it must succeed,
+    // because the queue wait is never charged against its own run budget.
+    enqueueSpawnBehaviors({ delayMs: 250 }, { delayMs: 40, stdoutData: "ok" });
+
+    const first = runGitCommand(["status"], { cwd: process.cwd(), timeout: 5_000 });
+    const queuedAt = Date.now();
+    const second = runGitCommand(["rev-parse", "--show-toplevel"], {
+      cwd: process.cwd(),
+      timeout: 100,
+    });
+
+    await expect(second).resolves.toMatchObject({ stdout: "ok" });
+    expect(Date.now() - queuedAt).toBeGreaterThanOrEqual(250);
+    await first;
+  });
+
+  it("refuses a command with a named error when the scheduler queue is full", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1, { queueDepth: 1 });
+
+    enqueueSpawnBehaviors({ delayMs: 40 }, { delayMs: 0, stdoutData: "ok" });
+
+    const active = runGitCommand(["status"], { cwd: process.cwd() });
+    const queued = runGitCommand(["status", "--short"], { cwd: process.cwd() });
+
+    await expect(runGitCommand(["status", "--porcelain"], { cwd: process.cwd() })).rejects.toMatchObject({
+      name: "GitProcessQueueFullError",
+      code: "GIT_PROCESS_QUEUE_FULL",
+    });
+
+    await Promise.all([active, queued]);
   });
 
   it("records submitted Git commands before they start and refuses an incomplete measurement", async () => {
