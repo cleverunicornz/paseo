@@ -196,9 +196,11 @@ jobs:
 
   server-unit:
     # The server's unit suite. It starts on the smallest test set, automation-test-s, per the
-    # ci-runners ladder; escalation is a Gap-backed memory kill on a smaller set, not an
-    # estimate. The suite runs its own files at a worker count that fits the set's 5 GiB pod
-    # budget, and the file-observer stress test runs alone after it.
+    # ci-runners ladder; a job moves up only after a memory kill on the smaller set, proven by
+    # the container's OOMKilled reason or a cgroup OOM event, never by estimate. The suite's
+    # subprocess-heavy git and agent files set its peak, not the worker count, so it runs one
+    # worker. On the container that peaked at 4.23 GiB PSS (4.69 GiB summed RSS), inside this
+    # set's 5 GiB pod budget; a memory kill here is the signal to reconsider the width.
     runs-on: { group: ci, labels: automation-test-s }
     permissions:
       contents: read
@@ -229,8 +231,6 @@ jobs:
       - name: Build server dependencies
         run: npm run build:server-deps
       - name: Run the server unit suite
-        # One worker: the suite's subprocess-heavy git and agent files, not the worker count,
-        # set its peak. The ladder's smallest set carries it at this width.
         run: npm run test:unit --workspace=@getpaseo/server -- --maxWorkers=1 --exclude "src/server/file-observer/**"
       - name: Run the file observer suites alone
         # Upstream's thousand-write stress test times out under the parallel run's load; alone,
