@@ -844,6 +844,43 @@ function runningProblems(series, loadEnd, { control, windowEnd, streamFailed }) 
   ];
 }
 
+// The client fixture: 13 persistent clients, 2 of them subscribed to agent updates (soak.mjs opens
+// them before the baseline and holds them; reconnect is off). The worker observes them as its TCP
+// socket handles, one per connected client (the short-lived call clients have closed by the time
+// a sample is taken), and as the agent manager's subscriptions: the 2 subscribed clients plus the
+// daemon's own persistence listener (persistence-hooks.ts). The baseline shows exactly 13 and 3;
+// every sample and the live load-end through the end of load (a control's up to its leak point)
+// shows no fewer. A drop is a fixture break: inconclusive.
+const DAEMON_SUBSCRIPTIONS = 1;
+
+function clientFixtureProblems(header, series, loadEnd, { control, windowEnd }) {
+  const sockets = EXPECTED_FIXTURE.persistentClients;
+  const subscriptions = EXPECTED_FIXTURE.subscribedClients + DAEMON_SUBSCRIPTIONS;
+  const seen = (stage, elapsed, o) => ({
+    stage,
+    elapsed,
+    sockets: o.handles.TCPSocketWrap ?? 0,
+    subscriptions: o.agents.subscriptionCount,
+    exact: stage === "baseline",
+  });
+  const observed = [
+    seen("baseline", 0, header.baseline),
+    ...series.map((s) => seen("sample", s.elapsed, s.rec)),
+    ...(loadEnd?.agents ? [seen("load-end", loadEnd.elapsed, loadEnd)] : []),
+  ];
+  const judged = control ? observed.filter((x) => x.elapsed <= windowEnd) : observed;
+  const off = judged.filter((x) =>
+    x.exact
+      ? x.sockets !== sockets || x.subscriptions !== subscriptions
+      : x.sockets < sockets || x.subscriptions < subscriptions,
+  );
+  if (off.length === 0) return [];
+  const f = off[0];
+  return [
+    `${off.length} observation(s) without the client fixture of ${sockets} persistent clients, ${EXPECTED_FIXTURE.subscribedClients} subscribed (first: ${f.stage} at ${f.elapsed}s: ${f.sockets} socket(s), ${f.subscriptions} subscription(s) with the daemon's own)`,
+  ];
+}
+
 // The worker does not come back after it exits: no record observes it afterwards. After the
 // harness's own stop only cleanup follows. After a death only cleanup follows, except in a control
 // whose leak point the death does not precede: there the driver's death path follows (the
@@ -1049,6 +1086,7 @@ export function analyze(records, options = {}) {
     ...stopProblems(r),
     ...afterExitProblems(records, r, { control, leak }),
     ...runningProblems(series, r.loadEnd, { control, windowEnd, streamFailed }),
+    ...clientFixtureProblems(header, series, r.loadEnd, { control, windowEnd }),
     ...deliveryProblems(r.loadEnd, series, windowEnd, full, !control && streamFailed),
     ...(full ? phaseProblems(r) : []),
     ...(control ? controlProblems({ series, counters, ...r, windowEnd }) : []),
