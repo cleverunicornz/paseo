@@ -1060,6 +1060,164 @@ test("schema: every worker observation comes from the baseline's worker, limit a
   assertInconclusive(r, violation("cleanup", "root /tmp/other != the header's"));
 });
 
+// --- Round 6 ------------------------------------------------------------------------------
+
+// From `slot` on, one of the seven running agents shows as idle (its held turn ended).
+function oneAgentStops(r, slot) {
+  const stopped = { byLifecycle: { running: 6, idle: 9 }, withActiveForegroundTurn: 6 };
+  for (const x of [...samplesOf(r).filter((s) => s.elapsed >= slot * 30), one(r, "load-end")])
+    Object.assign(x.agents, structuredClone(stopped));
+  return r;
+}
+
+test("round 6 finding 1: six running agents at load-end are inconclusive", () => {
+  const r = flat();
+  Object.assign(one(r, "load-end").agents, {
+    byLifecycle: { running: 6, idle: 9 },
+    withActiveForegroundTurn: 6,
+  });
+  assertInconclusive(r, /1 observation\(s\) with running agents != 7/);
+  // And with the same observation through the last periodic sample and post-rest.
+  assertInconclusive(oneAgentStops(flat(), 479), /2 observation\(s\) with running agents != 7/);
+});
+
+test("round 6 finding 1: an agent that stops running fails a fixed run only if its stream failed", () => {
+  // The stream to it kept being delivered: fewer than 7 streaming agents, inconclusive.
+  assertInconclusive(oneAgentStops(flat(), 241), /240 observation\(s\) with running agents != 7/);
+  // Its stream failed (recorded, consistent stream failures): the fixed build malfunctioned.
+  const r = oneAgentStops(flat(), 241);
+  for (const t of [7230.011, 7260.011, 7290.011]) injectError(r, t, "stream", "stream failed");
+  const result = analyze(r);
+  assert.deepEqual(result.inconclusive, []);
+  assert.equal(result.verdict, "fail");
+  assert.equal(result.numbers.streamErrors, 3);
+});
+
+test("round 6 finding 1: a control's running count matters only up to its leak point", () => {
+  // leakingControl rises past 500 MB at 1770 s.
+  assert.equal(verdictOf(oneAgentStops(leakingControl(), 100), { control: true }), "pass");
+  assertInconclusive(oneAgentStops(leakingControl(), 50), /with running agents != 7/, {
+    control: true,
+  });
+});
+
+test("round 6 finding 2: timeline totals are bounded by the fixture and the protocol", () => {
+  let r = flat();
+  r[0].baseline.agents.timelineStats.maxItemsPerAgent = 1;
+  assertInconclusive(
+    r,
+    violation(
+      "baseline",
+      "baseline.agents.timelineStats.totalItems 10907 exceeds agents.total 15 × maxItemsPerAgent 1",
+    ),
+  );
+  r = flat();
+  sampleAt(r, 100).agents.timelineStats = { totalItems: 50000, maxItemsPerAgent: 4000 };
+  assertInconclusive(
+    r,
+    violation("sample", "agents.timelineStats.totalItems 50000 exceeds the \\d+ rows"),
+  );
+  r = flat();
+  sampleAt(r, 100).agents.timelineStats = { totalItems: 10000, maxItemsPerAgent: 700 };
+  assertInconclusive(
+    r,
+    violation(
+      "sample",
+      "agents.timelineStats.totalItems 10000 is fewer than the 10900 seeded rows",
+    ),
+  );
+  r = flat();
+  r[0].baseline.agents.timelineStats.totalItems = 10922;
+  assertInconclusive(
+    r,
+    violation("baseline", "baseline.agents.timelineStats.totalItems 10922 exceeds the 10921 rows"),
+  );
+});
+
+test("round 6 finding 3: unknown fields named like prototype members are violations", () => {
+  for (const key of ["constructor", "toString", "hasOwnProperty", "__proto__", "valueOf"]) {
+    const lines = flat().map((x) => JSON.stringify(x));
+    const i = lines.findIndex((l) => l.includes('"stage":"sample"'));
+    lines[i] = lines[i].replace(/^\{/, `{"${key}":42,`);
+    const r = lines.map((l) => JSON.parse(l));
+    assertInconclusive(r, violation("sample", `${key} is not a field of this record type`));
+  }
+  const r = flat();
+  r[0].fixture.constructor = 15;
+  assertInconclusive(
+    r,
+    violation("baseline", "fixture.constructor is not a field of this record type"),
+  );
+});
+
+test("round 6 finding 4: nothing but cleanup follows a worker's exit, save a control's death path", () => {
+  // A worker observation after the exit: the worker no longer exists.
+  let r = abortControl();
+  const post = structuredClone(samplesOf(r).at(-1));
+  Object.assign(post, { stage: "post-rest", elapsed: 1638, time: wall(1638) });
+  for (const field of [
+    "calls",
+    "byKind",
+    "streamChunks",
+    "streamErrors",
+    "rpcErrors",
+    "workerDeaths",
+  ])
+    post[field] = structuredClone(one(r, "cleanup")[field]);
+  delete post.minutes;
+  delete post.errorsByKind;
+  r.push(post);
+  one(r, "cleanup").time = wall(1650);
+  assertInconclusive(
+    r,
+    /record \d+ \(post-rest\) observes the worker after its exit at 1337.011s/,
+    {
+      control: true,
+    },
+  );
+  // After the harness's own stop, only cleanup.
+  r = flat();
+  r.push({
+    time: wall(14702),
+    stage: "worker-exit",
+    elapsed: 14702,
+    code: null,
+    signal: "SIGTERM",
+    stopping: true,
+    oom: false,
+    reason: null,
+  });
+  r.push({ ...structuredClone(one(r, "post-rest")), time: wall(14703), elapsed: 14703 });
+  assertInconclusive(r, /record \d+ \(post-rest\) observes the worker after its exit at 14702s/);
+  // A fixed run's worker death: its death path follows the exit, which only a control after its
+  // leak point may show.
+  r = buildRun({ deathAt: 7200.5 });
+  assertInconclusive(r, /record \d+ \(rpc-error\) follows the worker's exit at 7200.5s/);
+  // The real control's death path, after its leak point, conforms.
+  assert.equal(verdictOf(abortControl(), { control: true }), "pass");
+});
+
+test("round 6 finding 5: an unknown stage named like a prototype member is a violation, not a crash", () => {
+  for (const stage of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    const r = flat();
+    r.push({ time: wall(14800), stage });
+    assertInconclusive(r, violation(stage.replace(/_/g, "_"), `unknown record type "${stage}"`));
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "heap-soak-test-"));
+  try {
+    const file = path.join(dir, "run.jsonl");
+    const lines = flat().map((x) => JSON.stringify(x));
+    lines.push(JSON.stringify({ time: wall(14800), stage: "constructor" }));
+    fs.writeFileSync(file, lines.join("\n") + "\n");
+    const analyzer = fileURLToPath(new URL("./analyze.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [analyzer, file], { encoding: "utf8" });
+    assert.equal(run.status, 2, run.stdout + run.stderr);
+    assert.match(run.stdout, /unknown record type "constructor"/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
 
 test("audit: a header whose control flag contradicts the mode is inconclusive", () => {
