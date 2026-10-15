@@ -8,6 +8,23 @@ import { loadPersistedConfig } from "./persisted-config.js";
 import type { PersistedConfig } from "./persisted-config.js";
 import type { MutableDaemonConfig } from "@getpaseo/protocol/messages";
 
+function gitLimitsFrom(
+  git:
+    | {
+        maxProcessesPerSecond?: number;
+        maxProcessConcurrency?: number;
+        maxQueueDepth?: number;
+      }
+    | undefined,
+): NonNullable<MutableDaemonConfig["git"]> {
+  const limits = git ?? {};
+  return {
+    maxProcessesPerSecond: limits.maxProcessesPerSecond ?? 64,
+    maxProcessConcurrency: limits.maxProcessConcurrency ?? 8,
+    maxQueueDepth: limits.maxQueueDepth ?? 256,
+  };
+}
+
 function reloadableConfig(
   persisted: PersistedConfig,
   options: { relayEnabledFallback?: boolean } = {},
