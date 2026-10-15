@@ -16,6 +16,9 @@
 //   worker reached its own V8 heap limit (a sample at heap_size_limit, or a timed worker exit whose
 //   stderr shows the V8 heap-limit abort), within the first 14,400 seconds of load.
 //
+// Every record must first pass its type's schema (schema.mjs, derived from what soak.mjs writes):
+// a violation makes the run INCONCLUSIVE, naming the record and the rule, and nothing is analysed.
+//
 // INCONCLUSIVE when anything the judgment rests on is absent, duplicated or contradictory, or the
 // load breaks its protocol. A run is judged through its window: the full four hours and the rest
 // for a fixed run or a control that shows no leak; for a control that shows the leak, through the
@@ -44,6 +47,8 @@
 // recorded, consistent error fails a fixed run.
 
 import fs from "node:fs";
+
+import { validateRun } from "./schema.mjs";
 
 const MIB = 1024 ** 2;
 const EXPECTED_SECONDS = 14400;
@@ -947,6 +952,19 @@ function evaluateControl(leak, numbers) {
 
 export function analyze(records, options = {}) {
   const control = options.control === true;
+  // The schema runs first: a record that is not exactly what the driver writes is not analysed.
+  const schemaViolations = validateRun(records);
+  if (schemaViolations.length > 0) {
+    return {
+      verdict: "inconclusive",
+      control,
+      inconclusive: schemaViolations,
+      schemaViolations,
+      checks: [],
+      numbers: {},
+      offProtocolMinutes: [],
+    };
+  }
   const r = readRecords(records);
   const header = r.header;
   const baseline = heapOf(header?.baseline);
@@ -1022,6 +1040,17 @@ function mib(bytes) {
 }
 
 function printReport(result, source) {
+  if (result.schemaViolations) {
+    return [
+      `run:            ${source}${result.control ? "  [control]" : ""}`,
+      `schema:         ${result.schemaViolations.length} violation(s); the run is not analysed`,
+      "",
+      ...result.schemaViolations.map((p) => `INCONCLUSIVE  ${p}`),
+      "",
+      `VERDICT: ${result.verdict.toUpperCase()}`,
+      JSON.stringify(result),
+    ].join("\n");
+  }
   const n = result.numbers;
   const out = [];
   out.push(`run:            ${source}`);
