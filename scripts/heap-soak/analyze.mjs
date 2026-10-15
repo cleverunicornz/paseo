@@ -31,7 +31,8 @@
 //   the wall-clock minute buckets are consecutive from 0, each anchored to its index and contiguous
 //     with the next, every whole minute with exactly 27 calls in the 15/9/2/1 mix;
 //   a full run has one load-end within 2 s of 14,400 s with its heap and counters, and one
-//     post-rest 300 s (within 2 s) after it; every run has one cleanup record;
+//     post-rest 300 s (within 2 s) after it, by the two records' wall-clock `time` fields (the
+//     load-end sample's own GC time is not rest); every run has one cleanup record;
 //   a control has no RPC error up to its leak point (only failures its worker's own exit caused
 //     are excused) and no death other than a timed heap-limit abort before it.
 // Error and death counters are reconciled by their maximum over every record and event, so a
@@ -65,6 +66,8 @@ const SAMPLE_PERIOD_SECONDS = 30;
 // drive the per-index loops).
 const MAX_MINUTE_INDEX = EXPECTED_SECONDS / 60;
 const TOLERANCE_SECONDS = 2;
+// `time` has millisecond resolution; `elapsed` is derived from the same clock.
+const CLOCK_RESOLUTION_SECONDS = 0.01;
 const HEAP_LIMIT_RE = /Reached heap limit|heap out of memory|Allocation failed/i;
 // The driver's own RPC failures once its worker has exited: "worker exit <code>" for the RPCs
 // pending at the exit, "worker dead" for every RPC after it.
@@ -76,6 +79,11 @@ const SINGLE_STAGES = ["baseline", "load-end", "post-rest", "cleanup"];
 const isCount = (v) => Number.isInteger(v) && v >= 0;
 const isTime = (v) => Number.isFinite(v) && v >= 0;
 const isAbsent = (v) => v === undefined || v === null;
+// A record's wall-clock `time` in seconds (the driver stamps every record as it logs it).
+const wallSeconds = (rec) => {
+  const ms = typeof rec?.time === "string" ? Date.parse(rec.time) : Number.NaN;
+  return Number.isFinite(ms) ? ms / 1000 : null;
+};
 const heapOf = (rec) => {
   const h = rec?.memory?.heapUsed;
   return Number.isFinite(h) && h > 0 ? h : null;
@@ -480,13 +488,40 @@ function loadEndProblems(loadEnd) {
   return problems;
 }
 
+// The rest is the driver's 300-second sleep, measured on the records' wall clock: from the
+// load-end record, logged after its forced-GC sample, to the post-rest record, logged after its own
+// (0.7 s at the median on the real runs; the driver does not record that sample's start). The
+// elapsed difference minus that wall-clock rest is the load-end sample's own time: measurement, not
+// rest. Like every forced-GC sample it lies within one 30-second sample period; outside that, the
+// records' elapsed and time fields contradict each other.
+function restSpan(loadEnd, postRest) {
+  const start = wallSeconds(loadEnd);
+  const end = wallSeconds(postRest);
+  if (start === null || end === null) return null;
+  const rest = end - start;
+  const elapsed =
+    isTime(postRest?.elapsed) && isTime(loadEnd?.elapsed)
+      ? postRest.elapsed - loadEnd.elapsed
+      : null;
+  return { rest, elapsed, loadEndSample: elapsed === null ? null : elapsed - rest };
+}
+
 function restProblems(loadEnd, postRest) {
-  if (!isTime(postRest.elapsed) || !isTime(loadEnd.elapsed))
-    return ["post-rest or load-end has no elapsed time"];
   const problems = [];
-  const rest = postRest.elapsed - loadEnd.elapsed;
-  if (Math.abs(rest - EXPECTED_REST_SECONDS) > TOLERANCE_SECONDS)
-    problems.push(`rest ran ${rest.toFixed(1)}s, expected ${EXPECTED_REST_SECONDS}s`);
+  if (!isTime(postRest.elapsed) || !isTime(loadEnd.elapsed))
+    problems.push("post-rest or load-end has no elapsed time");
+  const span = restSpan(loadEnd, postRest);
+  if (span === null) {
+    problems.push("load-end or post-rest has no parseable time: the rest is not observed");
+  } else {
+    if (Math.abs(span.rest - EXPECTED_REST_SECONDS) > TOLERANCE_SECONDS)
+      problems.push(`rest ran ${span.rest.toFixed(1)}s, expected ${EXPECTED_REST_SECONDS}s`);
+    const sample = span.loadEndSample;
+    if (sample !== null && (sample < -CLOCK_RESOLUTION_SECONDS || sample >= SAMPLE_PERIOD_SECONDS))
+      problems.push(
+        `the load-end sample took ${sample.toFixed(1)}s by its elapsed and time fields (expected 0 to ${SAMPLE_PERIOD_SECONDS} s)`,
+      );
+  }
   if (heapOf(postRest) === null) problems.push("post-rest has no heapUsed");
   return problems;
 }
@@ -626,6 +661,7 @@ function buildNumbers(ctx) {
     maxAboveBaselineBytes: baseline === null ? null : maxHeap - baseline,
     lastLoadSampleBytes: loadSamples.at(-1)?.heapUsed ?? null,
     postRestBytes: heapOf(postRest),
+    ...restNumbers(loadEnd, postRest),
     slopeBytesPerHour: leastSquaresSlopePerHour(tail),
     tailSamples: tail.length,
     rpcErrors: counters.errors,
@@ -646,6 +682,11 @@ function buildNumbers(ctx) {
     mixPerMinute: totalMix(minutes),
     ...identity(header),
   };
+}
+
+function restNumbers(loadEnd, postRest) {
+  const span = loadEnd && postRest ? restSpan(loadEnd, postRest) : null;
+  return { restSeconds: span?.rest ?? null, restElapsedSeconds: span?.elapsed ?? null };
 }
 
 function identity(header) {
@@ -773,6 +814,10 @@ export function analyze(records, options = {}) {
   };
 }
 
+function seconds(value) {
+  return typeof value === "number" ? `${value.toFixed(1)} s` : "(not observed)";
+}
+
 function mib(bytes) {
   return typeof bytes === "number" ? Number((bytes / MIB).toFixed(2)) : null;
 }
@@ -791,6 +836,9 @@ function printReport(result, source) {
   out.push(`last-hour slope:${mib(n.slopeBytesPerHour)} MiB/h (limit ${mib(MAX_SLOPE_PER_HOUR)})`);
   out.push(
     `post-rest:      ${mib(n.postRestBytes)} MiB vs last load ${mib(n.lastLoadSampleBytes)} MiB`,
+  );
+  out.push(
+    `rest:           ${seconds(n.restSeconds)} on the wall clock (elapsed ${seconds(n.restElapsedSeconds)}; expected ${EXPECTED_REST_SECONDS} s)`,
   );
   out.push(`rpc errors:     ${n.rpcErrors} (${n.streamErrors} of them stream)`);
   out.push(
