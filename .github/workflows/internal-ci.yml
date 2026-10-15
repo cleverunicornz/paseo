@@ -70,6 +70,14 @@ jobs:
           npx vitest run src/server/daemon-client.e2e.test.ts -t 'receives server_info on websocket connect'
           npx vitest run src/server/plugins/timeline-drain.e2e.test.ts src/server/stop-readiness.e2e.test.ts src/server/single-agent.e2e.test.ts src/server/mcp-gateway/plugin-tool-call.e2e.test.ts src/server/web-base-path.e2e.test.ts --maxWorkers=1
           npx vitest run src/server/web-base-path.test.ts src/server/web-ui.test.ts src/server/plugins/plugin-process.test.ts src/server/plugins/runtime.posix.test.ts
+      - name: Check the git scheduler, reconciliation and loop instrumentation
+        working-directory: packages/server
+        run: |
+          npx vitest run src/utils/git-process-scheduler.test.ts src/utils/run-git-command.test.ts
+          npx vitest run src/server/loop-health.test.ts
+          npx vitest run src/server/workspace-git-service.test.ts src/server/workspace-reconciliation-service.test.ts src/server/workspace-reconciliation-observation.test.ts
+          npx vitest run src/server/git-scheduler-at-scale.reproduction.test.ts
+          npx vitest run src/server/config-git.test.ts src/server/daemon-config-store.test.ts
       - name: Check session runtime in the app and protocol
         run: |
           npm run test --workspace=@getpaseo/protocol -- src/daemon-endpoints.test.ts
