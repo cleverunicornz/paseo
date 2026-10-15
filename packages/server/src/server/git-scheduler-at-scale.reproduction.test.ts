@@ -210,6 +210,13 @@ describe("git scheduler at scale", () => {
     await service.reconcileGitMetadata();
     expect(reads).toEqual([]);
 
+    // A deferred tick is a yield, not a change: it publishes nothing and leaves
+    // the cache warm, so the sweep that follows reads nothing.
+    const deferred = await service.reconcileGitMetadata();
+    expect(deferred.deferred).toBe(false);
+    expect(deferred.changesApplied).toEqual([]);
+    expect(reads).toEqual([]);
+
     // Three workspaces changed; only those three are read again.
     reads.length = 0;
     const changed = [cwds[7]!, cwds[123]!, cwds[299]!];
@@ -249,20 +256,23 @@ describe("git scheduler at scale", () => {
 
     // Without the bound, the same burst queued 907 deep in the live daemon.
     expect(peakPending).toBeLessThanOrEqual(QUEUE_BOUND);
-    // The sweep yielded instead of growing the backlog.
-    expect(deferrals).toBeGreaterThan(0);
 
     // Foreground work submitted into that full queue still executes: an agent's
     // or a user's Git command is never dropped for queue depth.
-    const foreground = Array.from({ length: 40 }, () => {
+    const foregroundStart = (): { result: Promise<void>; exited: Promise<void> } => {
       const completed = new Promise<void>((resolve) => setTimeout(resolve, 10));
-      return scheduler.run(() => ({ result: completed, exited: completed }));
-    });
+      return { result: completed, exited: completed };
+    };
+    const foreground = Array.from({ length: 40 }, () => scheduler.run(foregroundStart));
     await expect(Promise.all(foreground)).resolves.toHaveLength(40);
 
     // The queued background work still drains; a deferral never wedges the queue.
     await Promise.all(background);
     expect(scheduler.pendingCount).toBe(0);
     expect(scheduler.activeCount).toBe(0);
+
+    // The sweep yielded instead of growing the backlog. A refusal is rejected
+    // and observed on a microtask, so it is counted once the burst has drained.
+    expect(deferrals).toBeGreaterThan(0);
   });
 });

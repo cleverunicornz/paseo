@@ -127,6 +127,13 @@ const WORKSPACE_GIT_AUXILIARY_READ_TTL_MS = 15_000;
 const WORKSPACE_GIT_INTERNAL_MIN_GAP_MS = 2_000;
 // Small values (booleans, short strings, small arrays); generous cap.
 const WORKSPACE_GIT_AUXILIARY_CACHE_MAX = 256;
+/**
+ * The checkout cache must hold the whole live estate, or a sweep re-reads what
+ * the LRU evicted and the warm path degrades to O(workspaces). The observed
+ * estate is a few hundred live records across under a thousand roots; the bound
+ * leaves headroom above that, and stays bounded for a daemon that sees more.
+ */
+const WORKSPACE_GIT_CHECKOUT_CACHE_MAX = 4_096;
 
 function mergeSets<T>(
   left: ReadonlySet<T>,
@@ -633,7 +640,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
    * invalidation never publishes, so no path serves retired facts as fresh.
    */
   private readonly checkoutCache = new LRUCache<string, CachedCheckoutEntry>({
-    max: WORKSPACE_GIT_AUXILIARY_CACHE_MAX,
+    max: WORKSPACE_GIT_CHECKOUT_CACHE_MAX,
   });
   private readonly branchValidationCache = new LRUCache<
     string,

@@ -147,19 +147,15 @@ export class GitProcessScheduler {
     }
     return new Promise<T>((resolve, reject) => {
       const admit = () => {
-        void this.startThrottled(() =>
-          this.execute(start, resolve, reject, isBackground),
-        ).catch((error) => {
-          this.dropWaiting(isBackground);
-          reject(error);
-          this.scheduleDrain();
-        });
+        void this.startThrottled(() => this.execute(start, resolve, reject, isBackground)).catch(
+          (error) => {
+            this.dropWaiting(isBackground);
+            reject(error);
+            this.scheduleDrain();
+          },
+        );
       };
-      const queue = isBackground
-        ? this.backgroundPriorityQueue
-        : options?.priority === "high"
-          ? this.highPriorityQueue
-          : this.normalPriorityQueue;
+      const queue = this.queueFor(options?.priority, isBackground);
       queue.push(admit);
       if (this.admitted === 0 && !this.drainScheduled) {
         this.drainOne();
@@ -167,6 +163,16 @@ export class GitProcessScheduler {
         this.scheduleDrain();
       }
     });
+  }
+
+  private queueFor(
+    priority: GitProcessPriority | undefined,
+    isBackground: boolean,
+  ): Array<() => void> {
+    if (isBackground) {
+      return this.backgroundPriorityQueue;
+    }
+    return priority === "high" ? this.highPriorityQueue : this.normalPriorityQueue;
   }
 
   /** A command left the wait queue: it either started or its start failed. */

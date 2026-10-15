@@ -16,10 +16,7 @@ import {
 } from "./workspace-registry-model.js";
 import { workspaceIdsForProjects } from "./workspace-directory.js";
 import { deriveProjectKey } from "./project-key.js";
-import {
-  GitProcessQueueFullError,
-  runWithGitCommandClass,
-} from "../utils/run-git-command.js";
+import { GitProcessQueueFullError, runWithGitCommandClass } from "../utils/run-git-command.js";
 
 const DEFAULT_RESCAN_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_DEBOUNCE_MS = 100;
@@ -553,22 +550,7 @@ export class WorkspaceReconciliationService {
       }
     } catch (error) {
       if (!this.disposed) {
-        if (error instanceof GitProcessQueueFullError) {
-          // The sweep is the background class and the queue belongs to
-          // foreground work. This is a yield, not a failure: nothing surfaces
-          // to an agent or a user, and the tick retries shortly.
-          this.logger.debug(
-            { maxQueueDepth: error.maxQueueDepth, mode },
-            "Workspace reconciliation deferred to a full Git queue",
-          );
-          this.deferredRetryTimer = this.clock.setTimeout(() => {
-            this.deferredRetryTimer = null;
-            void this.reconcileObservedGitMetadata(mode);
-          }, DEFAULT_DEFERRED_RETRY_MS);
-          this.deferredRetryTimer.unref?.();
-        } else {
-          this.logger.warn({ err: error }, "Workspace reconciliation failed");
-        }
+        this.handleReconciliationFailure(error, mode);
       }
     } finally {
       this.reconciling = false;
@@ -578,6 +560,30 @@ export class WorkspaceReconciliationService {
         void this.reconcileObservedGitMetadata(queuedMode);
       }
     }
+  }
+
+  /**
+   * A full Git queue is the sweep yielding to foreground work, not a failure:
+   * nothing surfaces to an agent or a user, and the tick retries shortly.
+   * Anything else is a real reconciliation failure and is logged as one.
+   */
+  private handleReconciliationFailure(error: unknown, mode: "metadata" | "full"): void {
+    if (!(error instanceof GitProcessQueueFullError)) {
+      this.logger.warn({ err: error }, "Workspace reconciliation failed");
+      return;
+    }
+    this.logger.debug(
+      { maxQueueDepth: error.maxQueueDepth, mode },
+      "Workspace reconciliation deferred to a full Git queue",
+    );
+    if (this.deferredRetryTimer) {
+      this.clock.clearTimeout(this.deferredRetryTimer);
+    }
+    this.deferredRetryTimer = this.clock.setTimeout(() => {
+      this.deferredRetryTimer = null;
+      void this.reconcileObservedGitMetadata(mode);
+    }, DEFAULT_DEFERRED_RETRY_MS);
+    this.deferredRetryTimer.unref?.();
   }
 
   private async readCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
