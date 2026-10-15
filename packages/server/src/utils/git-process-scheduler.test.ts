@@ -160,7 +160,7 @@ describe("GitProcessScheduler", () => {
 });
 
 describe("GitProcessScheduler queue bound", () => {
-  test("refuses a submission with a named error when the queue is full", async () => {
+  test("refuses a background submission with a named error when the queue is full", async () => {
     const scheduler = new GitProcessScheduler({
       maxProcessesPerSecond: 100,
       maxProcessConcurrency: 1,
@@ -171,11 +171,17 @@ describe("GitProcessScheduler queue bound", () => {
 
     const active = scheduler.run(createConcurrencyTask(0, started, releases));
     await vi.waitFor(() => expect(started).toEqual([0]));
-    const queuedA = scheduler.run(createConcurrencyTask(2, started, releases));
-    const queuedB = scheduler.run(createConcurrencyTask(2, started, releases));
+    const queuedA = scheduler.run(createConcurrencyTask(2, started, releases), {
+      class: "background",
+    });
+    const queuedB = scheduler.run(createConcurrencyTask(2, started, releases), {
+      class: "background",
+    });
 
-    // The third queued command has no slot: it is refused, not appended.
-    await expect(scheduler.run(createConcurrencyTask(2, started, releases))).rejects.toMatchObject({
+    // The third background command has no slot: it is deferred, not appended.
+    await expect(
+      scheduler.run(createConcurrencyTask(2, started, releases), { class: "background" }),
+    ).rejects.toMatchObject({
       name: "GitProcessQueueFullError",
       code: "GIT_PROCESS_QUEUE_FULL",
     });
@@ -186,7 +192,7 @@ describe("GitProcessScheduler queue bound", () => {
     expect(scheduler.pendingCount).toBe(0);
   });
 
-  test("refusing a queued command never leaves the queue stuck", async () => {
+  test("a deferral never leaves the queue stuck", async () => {
     const scheduler = new GitProcessScheduler({
       maxProcessesPerSecond: 100,
       maxProcessConcurrency: 2,
@@ -198,10 +204,12 @@ describe("GitProcessScheduler queue bound", () => {
     const a = scheduler.run(createConcurrencyTask(0, started, releases));
     const b = scheduler.run(createConcurrencyTask(0, started, releases));
     await vi.waitFor(() => expect(started).toEqual([0, 0]));
-    const queued = scheduler.run(createConcurrencyTask(2, started, releases));
-    await expect(scheduler.run(createConcurrencyTask(2, started, releases))).rejects.toThrow(
-      /queue is full/i,
-    );
+    const queued = scheduler.run(createConcurrencyTask(2, started, releases), {
+      class: "background",
+    });
+    await expect(
+      scheduler.run(createConcurrencyTask(2, started, releases), { class: "background" }),
+    ).rejects.toThrow(/queue is full/i);
 
     releases.shift()?.();
     releases.shift()?.();
@@ -221,7 +229,9 @@ describe("GitProcessScheduler queue bound", () => {
 
     const active = scheduler.run(createConcurrencyTask(0, started, releases));
     await vi.waitFor(() => expect(started).toEqual([0]));
-    const observation = scheduler.run(createConcurrencyTask(2, started, releases));
+    const observation = scheduler.run(createConcurrencyTask(2, started, releases), {
+      class: "background",
+    });
     const interactive = scheduler.run(createConcurrencyTask(3, started, releases), {
       priority: "high",
     });
@@ -229,6 +239,106 @@ describe("GitProcessScheduler queue bound", () => {
     releases.shift()?.();
     await Promise.all([active, observation, interactive]);
     expect(started).toEqual([0, 3, 2]);
+  });
+
+  test("never defers a foreground submission, however deep the queue is", async () => {
+    const scheduler = new GitProcessScheduler({
+      maxProcessesPerSecond: 100,
+      maxProcessConcurrency: 1,
+      maxQueueDepth: 2,
+    });
+    const releases: Array<() => void> = [];
+    const started: number[] = [];
+
+    const active = scheduler.run(createConcurrencyTask(0, started, releases));
+    await vi.waitFor(() => expect(started).toEqual([0]));
+
+    // The queue is filled by background work, which yields at the bound.
+    const background: Array<Promise<void>> = [];
+    for (let index = 0; index < 2; index += 1) {
+      background.push(
+        scheduler.run(createConcurrencyTask(2, started, releases), { class: "background" }),
+      );
+    }
+    await expect(
+      scheduler.run(createConcurrencyTask(2, started, releases), { class: "background" }),
+    ).rejects.toMatchObject({ name: "GitProcessQueueFullError" });
+
+    // Every foreground command beyond the bound still enqueues and runs: a
+    // workspace.create or a checkout read is never dropped for queue depth.
+    const foreground = Array.from({ length: 5 }, (_, index) =>
+      scheduler.run(createConcurrencyTask(3 + index, started, releases)),
+    );
+
+    releases.shift()?.();
+    releases.shift()?.();
+    releases.shift()?.();
+    releases.shift()?.();
+    releases.shift()?.();
+    releases.shift()?.();
+    await Promise.all([active, ...background, ...foreground]);
+
+    expect(started).toContain(3);
+    expect(started).toContain(7);
+    expect(scheduler.pendingCount).toBe(0);
+  });
+
+  test("a foreground command jumps ahead of background commands already waiting", async () => {
+    const scheduler = new GitProcessScheduler({
+      maxProcessesPerSecond: 100,
+      maxProcessConcurrency: 1,
+      maxQueueDepth: 8,
+    });
+    const releases: Array<() => void> = [];
+    const started: number[] = [];
+
+    const active = scheduler.run(createConcurrencyTask(0, started, releases));
+    await vi.waitFor(() => expect(started).toEqual([0]));
+    const firstBackground = scheduler.run(createConcurrencyTask(2, started, releases), {
+      class: "background",
+    });
+    const secondBackground = scheduler.run(createConcurrencyTask(2, started, releases), {
+      class: "background",
+    });
+    const foreground = scheduler.run(createConcurrencyTask(3, started, releases));
+
+    releases.shift()?.();
+    await vi.waitFor(() => expect(started).toContain(3));
+    releases.shift()?.();
+    await vi.waitFor(() => expect(started).toContain(2));
+    releases.shift()?.();
+    await Promise.all([active, firstBackground, secondBackground, foreground]);
+
+    // The foreground command overtakes both waiting sweep commands.
+    expect(started).toEqual([0, 3, 2, 2]);
+  });
+
+  test("a waiting background command is admitted within the reservation, so the sweep cannot starve", async () => {
+    const scheduler = new GitProcessScheduler({
+      maxProcessesPerSecond: 100,
+      maxProcessConcurrency: 1,
+      maxQueueDepth: 64,
+    });
+    const started: number[] = [];
+    const task = (index: number) => () => {
+      started.push(index);
+      const completed = Promise.resolve();
+      return { result: completed, exited: completed };
+    };
+
+    // A foreground command is already running, then five more wait, and the
+    // sweep's read is submitted behind them.
+    const foreground = Array.from({ length: 6 }, (_, index) => scheduler.run(task(3 + index)));
+    const background = scheduler.run(task(2), { class: "background" });
+    await Promise.all([background, ...foreground]);
+
+    // Foreground work has priority, but a waiting background command is
+    // admitted within the reservation window, so a continuous foreground
+    // stream cannot starve the sweep: it is not last in an unbounded queue.
+    const backgroundIndex = started.indexOf(2);
+    expect(backgroundIndex).toBeGreaterThan(0);
+    expect(backgroundIndex).toBeLessThanOrEqual(2);
+    expect(scheduler.pendingCount).toBe(0);
   });
 });
 

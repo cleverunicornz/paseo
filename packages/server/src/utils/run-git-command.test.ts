@@ -365,22 +365,60 @@ describe("runGitCommand", () => {
     await first;
   });
 
-  it("refuses a command with a named error when the scheduler queue is full", async () => {
-    const { runGitCommand } = await loadRunGitCommand(1, { queueDepth: 1 });
+  it("defers a background command with a named error when the scheduler queue is full", async () => {
+    const { runGitCommand, runWithGitCommandClass } = await loadRunGitCommand(1, { queueDepth: 1 });
 
     enqueueSpawnBehaviors({ delayMs: 40 }, { delayMs: 0, stdoutData: "ok" });
 
     const active = runGitCommand(["status"], { cwd: process.cwd() });
-    const queued = runGitCommand(["status", "--short"], { cwd: process.cwd() });
+    const queued = runWithGitCommandClass("background", () =>
+      runGitCommand(["status", "--short"], { cwd: process.cwd() }),
+    );
 
     await expect(
-      runGitCommand(["status", "--porcelain"], { cwd: process.cwd() }),
+      runWithGitCommandClass("background", () =>
+        runGitCommand(["status", "--porcelain"], { cwd: process.cwd() }),
+      ),
     ).rejects.toMatchObject({
       name: "GitProcessQueueFullError",
       code: "GIT_PROCESS_QUEUE_FULL",
     });
 
     await Promise.all([active, queued]);
+  });
+
+  it("never defers a foreground command for queue depth, however deep the queue is", async () => {
+    const { runGitCommand, runWithGitCommandClass } = await loadRunGitCommand(1, { queueDepth: 1 });
+
+    enqueueSpawnBehaviors(
+      { delayMs: 40 },
+      { delayMs: 0, stdoutData: "queued-background" },
+      ...Array.from({ length: 4 }, (_, index) => ({
+        delayMs: 0,
+        stdoutData: `foreground-${index}`,
+      })),
+    );
+
+    const active = runGitCommand(["status"], { cwd: process.cwd() });
+    const background = runWithGitCommandClass("background", () =>
+      runGitCommand(["status", "--short"], { cwd: process.cwd() }),
+    );
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+
+    // The queue bound is full, so the next background command yields...
+    await expect(
+      runWithGitCommandClass("background", () =>
+        runGitCommand(["status", "--porcelain"], { cwd: process.cwd() }),
+      ),
+    ).rejects.toMatchObject({ name: "GitProcessQueueFullError" });
+
+    // ...but every foreground command still enqueues and executes.
+    const foreground = Array.from({ length: 4 }, (_, index) =>
+      runGitCommand(["rev-parse", `f${index}`], { cwd: process.cwd() }),
+    );
+
+    await expect(Promise.all([active, background, ...foreground])).resolves.toHaveLength(6);
+    expect(fakeSpawnController.processes).toHaveLength(6);
   });
 
   it("records submitted Git commands before they start and refuses an incomplete measurement", async () => {

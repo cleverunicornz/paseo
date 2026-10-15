@@ -5,10 +5,16 @@ export interface GitProcessPolicy {
   maxProcessesPerSecond: number;
   maxProcessConcurrency: number;
   /**
-   * The largest number of commands that may wait for a process slot at once.
-   * Past this bound the scheduler refuses rather than growing without limit:
-   * a five-minute reconciliation sweep of a large estate once queued 907
-   * commands with no ceiling and starved interactive work for minutes.
+   * The largest number of queued commands before the scheduler stops accepting
+   * new ones. It bounds only submissions of the `background` class; a
+   * `foreground` submission is never refused for depth, because a command an
+   * agent or a user asked for is work, and refusing it drops that work.
+   *
+   * A five-minute reconciliation sweep of a large estate once queued 907
+   * commands with no ceiling and starved interactive work for minutes. The
+   * sweep, not the interactive command, is what yields: past this bound a
+   * background submission is refused, and the caller treats the refusal as a
+   * deferral (skip this tick, retry the next).
    */
   maxQueueDepth: number;
 }
@@ -27,17 +33,25 @@ export interface ScheduledGitProcess<T> {
 export type GitProcessPriority = "normal" | "high";
 
 /**
- * Thrown when the scheduler's wait queue is at its bound. The caller's command
- * never ran: it is refused, not queued, so a burst cannot grow the backlog.
- * Callers that treat a Git read as optional (observation, reconciliation) drop
- * the read; interactive callers surface the refusal to the user.
+ * What asked for a command. `foreground` is the default and is never refused
+ * for queue depth: it is the work an agent or a user asked for. `background`
+ * is the reconciliation sweep's own reads, which yield when the queue is deep.
+ */
+export type GitProcessClass = "foreground" | "background";
+
+/**
+ * Thrown when the scheduler's wait queue is at its bound and the submission is
+ * of the `background` class. The command never ran: it is refused, not queued,
+ * so a sweep cannot grow the backlog. The refusal is the yield signal - the
+ * sweep defers the tick and retries. A `foreground` submission never throws
+ * this: refusing it would drop work an agent or a user asked for.
  */
 export class GitProcessQueueFullError extends Error {
   readonly code = "GIT_PROCESS_QUEUE_FULL";
 
   constructor(readonly maxQueueDepth: number) {
     super(
-      `Git process queue is full (${maxQueueDepth} waiting); refusing command so the backlog cannot grow unbounded`,
+      `Git process queue is full (${maxQueueDepth} waiting); deferring background command so the backlog cannot grow unbounded`,
     );
     this.name = "GitProcessQueueFullError";
   }
@@ -73,13 +87,24 @@ export function resolveGitProcessPolicy(input: {
   };
 }
 
+/**
+ * Foreground admissions owed to waiting background work. A background command
+ * is admitted at least once per this many foreground admissions, so an
+ * unbroken stream of foreground work delays the reconciliation sweep by at
+ * most a bounded number of commands rather than starving it.
+ */
+const BACKGROUND_RESERVATION_WINDOW = 1;
+
 export class GitProcessScheduler {
   private readonly startThrottled;
   private readonly highPriorityQueue: Array<() => void> = [];
   private readonly normalPriorityQueue: Array<() => void> = [];
+  private readonly backgroundPriorityQueue: Array<() => void> = [];
   private admitted = 0;
   private running = 0;
   private waiting = 0;
+  private backgroundWaiting = 0;
+  private foregroundAdmissionsSinceReservation = 0;
   private drainScheduled = false;
 
   constructor(readonly policy: GitProcessPolicy) {
@@ -105,23 +130,36 @@ export class GitProcessScheduler {
 
   run<T>(
     start: () => ScheduledGitProcess<T>,
-    options?: { priority?: GitProcessPriority },
+    options?: { priority?: GitProcessPriority; class?: GitProcessClass },
   ): Promise<T> {
-    if (this.waiting >= this.policy.maxQueueDepth) {
+    const isBackground = options?.class === "background";
+    // The bound governs the sweep. A foreground command is the work an agent
+    // or a user asked for, so it always enqueues, however deep the queue.
+    if (isBackground && this.waiting >= this.policy.maxQueueDepth) {
       return Promise.reject(new GitProcessQueueFullError(this.policy.maxQueueDepth));
     }
     this.waiting += 1;
+    if (isBackground) {
+      this.backgroundWaiting += 1;
+      // A newly waiting sweep read waits behind at most the reservation window
+      // of foreground admissions, counted from its own arrival.
+      this.foregroundAdmissionsSinceReservation = 0;
+    }
     return new Promise<T>((resolve, reject) => {
       const admit = () => {
-        void this.startThrottled(() => this.execute(start, resolve, reject)).catch((error) => {
-          this.waiting = Math.max(0, this.waiting - 1);
-          this.admitted = Math.max(0, this.admitted - 1);
+        void this.startThrottled(() =>
+          this.execute(start, resolve, reject, isBackground),
+        ).catch((error) => {
+          this.dropWaiting(isBackground);
           reject(error);
           this.scheduleDrain();
         });
       };
-      const queue =
-        options?.priority === "high" ? this.highPriorityQueue : this.normalPriorityQueue;
+      const queue = isBackground
+        ? this.backgroundPriorityQueue
+        : options?.priority === "high"
+          ? this.highPriorityQueue
+          : this.normalPriorityQueue;
       queue.push(admit);
       if (this.admitted === 0 && !this.drainScheduled) {
         this.drainOne();
@@ -131,11 +169,19 @@ export class GitProcessScheduler {
     });
   }
 
+  /** A command left the wait queue: it either started or its start failed. */
+  private dropWaiting(isBackground: boolean): void {
+    this.waiting = Math.max(0, this.waiting - 1);
+    if (isBackground) {
+      this.backgroundWaiting = Math.max(0, this.backgroundWaiting - 1);
+    }
+  }
+
   private scheduleDrain(): void {
     if (this.drainScheduled || this.admitted >= this.policy.maxProcessConcurrency) {
       return;
     }
-    if (this.highPriorityQueue.length === 0 && this.normalPriorityQueue.length === 0) {
+    if (this.waiting === 0) {
       return;
     }
     this.drainScheduled = true;
@@ -147,7 +193,7 @@ export class GitProcessScheduler {
     if (this.admitted >= this.policy.maxProcessConcurrency) {
       return;
     }
-    const admit = this.highPriorityQueue.shift() ?? this.normalPriorityQueue.shift();
+    const admit = this.takeNextAdmission();
     if (!admit) {
       return;
     }
@@ -158,12 +204,41 @@ export class GitProcessScheduler {
     this.scheduleDrain();
   }
 
+  /**
+   * Foreground work goes ahead of a waiting sweep, but not without limit: once
+   * the reservation window's worth of foreground commands have been admitted
+   * while background work waits, the sweep gets the next turn. Foreground
+   * admission is otherwise what keeps interactive work responsive.
+   */
+  private takeNextAdmission(): (() => void) | undefined {
+    const hasForeground = this.highPriorityQueue.length > 0 || this.normalPriorityQueue.length > 0;
+    const hasBackground = this.backgroundPriorityQueue.length > 0;
+    const awaitsReservation =
+      hasForeground &&
+      hasBackground &&
+      this.foregroundAdmissionsSinceReservation >= BACKGROUND_RESERVATION_WINDOW;
+    if (hasBackground && (!hasForeground || awaitsReservation)) {
+      if (awaitsReservation) {
+        this.foregroundAdmissionsSinceReservation = 0;
+      }
+      return this.backgroundPriorityQueue.shift();
+    }
+    if (!hasForeground) {
+      return undefined;
+    }
+    if (hasBackground) {
+      this.foregroundAdmissionsSinceReservation += 1;
+    }
+    return this.highPriorityQueue.shift() ?? this.normalPriorityQueue.shift();
+  }
+
   private async execute<T>(
     start: () => ScheduledGitProcess<T>,
     resolve: (value: T | PromiseLike<T>) => void,
     reject: (reason?: unknown) => void,
+    isBackground: boolean,
   ): Promise<void> {
-    this.waiting = Math.max(0, this.waiting - 1);
+    this.dropWaiting(isBackground);
     this.running += 1;
     try {
       const process = start();

@@ -16,9 +16,21 @@ import {
 } from "./workspace-registry-model.js";
 import { workspaceIdsForProjects } from "./workspace-directory.js";
 import { deriveProjectKey } from "./project-key.js";
+import {
+  GitProcessQueueFullError,
+  runWithGitCommandClass,
+} from "../utils/run-git-command.js";
 
 const DEFAULT_RESCAN_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_DEBOUNCE_MS = 100;
+/**
+ * How long a tick that yielded to a full Git queue waits before trying again.
+ * The sweep is the background class: when the queue is deep it defers, so an
+ * agent's or a user's Git command is never made to wait behind it. The retry is
+ * short because a deferral means the sweep has work outstanding, not that the
+ * five-minute cadence has come round again.
+ */
+const DEFAULT_DEFERRED_RETRY_MS = 5_000;
 
 export type ProjectUpdate =
   | { kind: "upsert"; project: PersistedProjectRecord }
@@ -79,6 +91,12 @@ export type ReconciliationChange =
 export interface ReconciliationResult {
   changesApplied: ReconciliationChange[];
   durationMs: number;
+  /**
+   * True when the sweep yielded to a full Git queue: it made no live Git read
+   * because the queue is the foreground's. The sweep is not an error and
+   * nothing surfaces to an agent or a user; the tick simply retries later.
+   */
+  deferred: boolean;
 }
 
 export interface WorkspaceReconciliationServiceOptions {
@@ -134,6 +152,7 @@ export class WorkspaceReconciliationService {
   private unsubscribeRegistry: (() => void) | null = null;
   private rescanTimer: ReconciliationTimer | null = null;
   private debounceTimer: ReconciliationTimer | null = null;
+  private deferredRetryTimer: ReconciliationTimer | null = null;
   private disposed = false;
   private started = false;
   private reconciling = false;
@@ -188,6 +207,7 @@ export class WorkspaceReconciliationService {
     this.unsubscribeRegistry = null;
     if (this.rescanTimer) this.clock.clearInterval(this.rescanTimer);
     if (this.debounceTimer) this.clock.clearTimeout(this.debounceTimer);
+    if (this.deferredRetryTimer) this.clock.clearTimeout(this.deferredRetryTimer);
     for (const { watcher } of this.watchers) watcher.close();
     this.watchers.length = 0;
   }
@@ -207,15 +227,21 @@ export class WorkspaceReconciliationService {
       siblings.push(workspace);
       workspacesByProject.set(workspace.projectId, siblings);
     }
-    await this.reconcileGitMetadataForProjects(
-      projects.filter(
-        (project) => !project.archivedAt && this.inspectDirectory(project.rootPath) === "directory",
-      ),
-      workspacesByProject,
-      changes,
-    );
+    try {
+      await this.reconcileGitMetadataForProjects(
+        projects.filter(
+          (project) =>
+            !project.archivedAt && this.inspectDirectory(project.rootPath) === "directory",
+        ),
+        workspacesByProject,
+        changes,
+      );
+    } catch (error) {
+      if (!(error instanceof GitProcessQueueFullError)) throw error;
+      return { changesApplied: changes, durationMs: Date.now() - start, deferred: true };
+    }
     if (changes.length > 0) this.onChanges?.(changes);
-    return { changesApplied: changes, durationMs: Date.now() - start };
+    return { changesApplied: changes, durationMs: Date.now() - start, deferred: false };
   }
 
   async runOnce(): Promise<ReconciliationResult> {
@@ -283,17 +309,25 @@ export class WorkspaceReconciliationService {
     // 2. Reconcile mutable git metadata without changing identity or membership.
     //    Projects persist until explicitly removed, even when they currently have
     //    zero active workspaces, so they still reconcile their own metadata.
-    await this.reconcileGitMetadataForProjects(
-      activeProjects.filter((project) => reachableProjectIds.has(project.projectId)),
-      workspacesByProject,
-      changes,
-    );
+    try {
+      await this.reconcileGitMetadataForProjects(
+        activeProjects.filter((project) => reachableProjectIds.has(project.projectId)),
+        workspacesByProject,
+        changes,
+      );
+    } catch (error) {
+      if (!(error instanceof GitProcessQueueFullError)) throw error;
+      // The sweep yielded to the foreground's queue. Whatever it applied before
+      // the yield stands; the tick retries. It is not a failure.
+      this.onChanges?.(changes);
+      return { changesApplied: changes, durationMs: Date.now() - start, deferred: true };
+    }
 
     if (changes.length > 0 && this.onChanges) {
       this.onChanges(changes);
     }
 
-    const result = { changesApplied: changes, durationMs: Date.now() - start };
+    const result = { changesApplied: changes, durationMs: Date.now() - start, deferred: false };
     if (changes.length > 0) {
       this.logger.info(
         { changeCount: changes.length, durationMs: result.durationMs, changes },
@@ -345,6 +379,11 @@ export class WorkspaceReconciliationService {
             ),
           );
         } catch (error) {
+          // A full queue is the sweep yielding, not a read failure: it must
+          // reach the tick so the tick defers, never be logged as an error.
+          if (error instanceof GitProcessQueueFullError) {
+            throw error;
+          }
           this.logger.warn(
             { err: error, rootPath },
             "Skipped workspace reconciliation after Git read failed",
@@ -514,7 +553,22 @@ export class WorkspaceReconciliationService {
       }
     } catch (error) {
       if (!this.disposed) {
-        this.logger.warn({ err: error }, "Workspace reconciliation failed");
+        if (error instanceof GitProcessQueueFullError) {
+          // The sweep is the background class and the queue belongs to
+          // foreground work. This is a yield, not a failure: nothing surfaces
+          // to an agent or a user, and the tick retries shortly.
+          this.logger.debug(
+            { maxQueueDepth: error.maxQueueDepth, mode },
+            "Workspace reconciliation deferred to a full Git queue",
+          );
+          this.deferredRetryTimer = this.clock.setTimeout(() => {
+            this.deferredRetryTimer = null;
+            void this.reconcileObservedGitMetadata(mode);
+          }, DEFAULT_DEFERRED_RETRY_MS);
+          this.deferredRetryTimer.unref?.();
+        } else {
+          this.logger.warn({ err: error }, "Workspace reconciliation failed");
+        }
       }
     } finally {
       this.reconciling = false;
@@ -542,7 +596,11 @@ export class WorkspaceReconciliationService {
         mainRepoRoot: null,
       };
     }
-    return this.workspaceGitService.getCheckout(cwd);
+    // The sweep's own reads are background: when the queue is deep they yield
+    // rather than making foreground work wait. The yield leaves the tick as a
+    // GitProcessQueueFullError and is caught as a deferral, never surfaced.
+    const service = this.workspaceGitService;
+    return runWithGitCommandClass("background", () => service.getCheckout(cwd));
   }
 
   /**

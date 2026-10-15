@@ -1,23 +1,24 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { ProjectCheckoutLitePayload } from "@getpaseo/protocol/messages";
 import type pino from "pino";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { GitProcessScheduler, GitProcessQueueFullError } from "../utils/git-process-scheduler.js";
+import type { CheckoutStatusGit } from "../utils/checkout-git.js";
 import {
   createPersistedProjectRecord,
   createPersistedWorkspaceRecord,
 } from "./workspace-registry.js";
 import type { ProjectRegistry, WorkspaceRegistry } from "./workspace-registry.js";
 import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
+import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
 
 /**
- * The at-scale reproduction O-000299 asks for, at one fifth of the live
- * estate's workspace count (300 against ~500). Both halves are fixtures, never
- * the live daemon: a reconciliation sweep across every workspace, and a burst
- * of Git submissions through the shared scheduler.
+ * The at-scale reproduction O-000299 asks for, shaped like the live estate: a
+ * few hundred live workspace records, some whose directories are gone, swept by
+ * a real WorkspaceGitServiceImpl. The scheduler burst is a fixture; the cache
+ * half is the production service, not a stand-in.
  */
 
 const WORKSPACE_COUNT = 300;
@@ -39,33 +40,41 @@ function createLogger(): pino.Logger {
   return logger as unknown as pino.Logger;
 }
 
-/**
- * A Git service that counts every live read and caches the checkout on the
- * first one, exactly as a completed workspace refresh would: the second sweep
- * over an unobserved-but-warm workspace reads no Git at all.
- */
-function createCachingGit() {
-  const reads: string[] = [];
-  const cache = new Map<string, ProjectCheckoutLitePayload>();
+function createCheckoutStatus(cwd: string): CheckoutStatusGit {
   return {
-    reads,
-    invalidate: (cwd: string) => cache.delete(cwd),
-    peekCachedCheckout: (cwd: string): ProjectCheckoutLitePayload | null => cache.get(cwd) ?? null,
-    getCheckout: async (cwd: string): Promise<ProjectCheckoutLitePayload> => {
-      reads.push(cwd);
-      const checkout: ProjectCheckoutLitePayload = {
-        cwd,
-        isGit: true,
-        currentBranch: "main",
-        remoteUrl: null,
-        worktreeRoot: cwd,
-        isPaseoOwnedWorktree: false,
-        mainRepoRoot: null,
-      };
-      cache.set(cwd, checkout);
-      return checkout;
-    },
+    isGit: true,
+    repoRoot: cwd,
+    mainRepoRoot: null,
+    currentBranch: "main",
+    isDirty: false,
+    baseRef: "main",
+    aheadBehind: { ahead: 0, behind: 0 },
+    aheadOfOrigin: 0,
+    behindOfOrigin: 0,
+    hasRemote: false,
+    remoteUrl: null,
+    isPaseoOwnedWorktree: false,
   };
+}
+
+/**
+ * The real WorkspaceGitServiceImpl with an injected status read, so a live read
+ * is counted and no Git process is spawned. The reconciliation sweep reaches it
+ * through exactly the production methods.
+ */
+function createRealGitService() {
+  const reads: string[] = [];
+  const service = new WorkspaceGitServiceImpl({
+    logger: createLogger(),
+    paseoHome: "/tmp/l15-at-scale",
+    deps: {
+      getCheckoutStatus: async (cwd: string) => {
+        reads.push(cwd);
+        return createCheckoutStatus(cwd);
+      },
+    },
+  });
+  return { reads, service };
 }
 
 function createRegistries(projectRoot: string) {
@@ -149,10 +158,17 @@ describe("git scheduler at scale", () => {
       }),
     );
     const cwds: string[] = [];
+    // The live estate's shape: hundreds of live records across many roots, and
+    // a fraction whose directories are gone (the sweep self-archives those).
     for (let index = 0; index < WORKSPACE_COUNT; index += 1) {
       const cwd = path.join(projectRoot, `ws-${index}`);
-      mkdirSync(cwd, { recursive: true });
-      cwds.push(cwd);
+      if (index % 20 === 0) {
+        // A workspace whose directory no longer exists.
+        cwds.push(cwd);
+      } else {
+        mkdirSync(cwd, { recursive: true });
+        cwds.push(cwd);
+      }
       workspaces.set(
         `w${index}`,
         createPersistedWorkspaceRecord({
@@ -169,50 +185,60 @@ describe("git scheduler at scale", () => {
         }),
       );
     }
-    const git = createCachingGit();
+    const { reads, service: gitService } = createRealGitService();
     const service = new WorkspaceReconciliationService({
       projectRegistry,
       workspaceRegistry,
       logger: createLogger(),
-      workspaceGitService: git,
+      workspaceGitService: gitService,
     });
 
-    // Cold: every workspace is read once (never observed before).
+    // Cold: every live directory is read once (never observed before).
     await service.reconcileGitMetadata();
-    expect(git.reads.length).toBe(WORKSPACE_COUNT + 1);
+    const coldReads = reads.length;
+    expect(coldReads).toBeGreaterThan(0);
 
-    // Warm: the whole estate's cache is populated, so the sweep reads nothing.
-    git.reads.length = 0;
+    // Warm, second full sweep, nothing changed: no live read at all. The first
+    // sweep's reads populated the real service's cache across sweeps.
+    reads.length = 0;
+    const secondSweep = await service.reconcileGitMetadata();
+    expect(secondSweep.deferred).toBe(false);
+    expect(reads).toEqual([]);
+
+    // A third sweep with no change events reads nothing either: the warm claim
+    // holds sweep over sweep, not only within one sweep.
     await service.reconcileGitMetadata();
-    expect(git.reads).toEqual([]);
+    expect(reads).toEqual([]);
 
     // Three workspaces changed; only those three are read again.
-    git.reads.length = 0;
+    reads.length = 0;
     const changed = [cwds[7]!, cwds[123]!, cwds[299]!];
-    for (const cwd of changed) git.invalidate(cwd);
+    for (const cwd of changed) gitService.onWorkspaceStateMayHaveChanged(cwd);
     await service.reconcileGitMetadata();
-    expect(git.reads.toSorted()).toEqual([...changed].toSorted());
-    expect(git.reads.length).toBeLessThan(WORKSPACE_COUNT);
+    expect(reads.toSorted()).toEqual([...changed].toSorted());
+    expect(reads.length).toBeLessThan(WORKSPACE_COUNT);
+
+    await gitService.dispose();
   });
 
-  test("a sweep-scale burst keeps pending within the bound and refuses the rest", async () => {
+  test("a sweep-scale burst defers the sweep while foreground commands complete", async () => {
     const scheduler = new GitProcessScheduler({
       maxProcessesPerSecond: MAX_PROCESSES_PER_SECOND,
       maxProcessConcurrency: 8,
       maxQueueDepth: QUEUE_BOUND,
     });
     let peakPending = 0;
-    let refusals = 0;
-    const submissions: Array<Promise<void>> = [];
+    let deferrals = 0;
+    const background: Array<Promise<void>> = [];
     // One sweep of the live estate submits ~800-1,100 commands in one tick.
     for (let index = 0; index < BURST_SUBMISSIONS; index += 1) {
       const completed = new Promise<void>((resolve) => setTimeout(resolve, 30));
-      submissions.push(
+      background.push(
         scheduler
-          .run(() => ({ result: completed, exited: completed }))
+          .run(() => ({ result: completed, exited: completed }), { class: "background" })
           .catch((error: unknown) => {
             if (error instanceof GitProcessQueueFullError) {
-              refusals += 1;
+              deferrals += 1;
               return;
             }
             throw error;
@@ -223,10 +249,19 @@ describe("git scheduler at scale", () => {
 
     // Without the bound, the same burst queued 907 deep in the live daemon.
     expect(peakPending).toBeLessThanOrEqual(QUEUE_BOUND);
+    // The sweep yielded instead of growing the backlog.
+    expect(deferrals).toBeGreaterThan(0);
 
-    // The queued work still drains; a refusal never wedges the queue.
-    await Promise.all(submissions);
-    expect(refusals).toBeGreaterThan(0);
+    // Foreground work submitted into that full queue still executes: an agent's
+    // or a user's Git command is never dropped for queue depth.
+    const foreground = Array.from({ length: 40 }, () => {
+      const completed = new Promise<void>((resolve) => setTimeout(resolve, 10));
+      return scheduler.run(() => ({ result: completed, exited: completed }));
+    });
+    await expect(Promise.all(foreground)).resolves.toHaveLength(40);
+
+    // The queued background work still drains; a deferral never wedges the queue.
+    await Promise.all(background);
     expect(scheduler.pendingCount).toBe(0);
     expect(scheduler.activeCount).toBe(0);
   });
