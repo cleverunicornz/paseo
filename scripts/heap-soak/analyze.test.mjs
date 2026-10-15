@@ -185,8 +185,11 @@ function buildDeath(deathAt, total, minutes, loadEnd) {
       reason: "Reached heap limit",
     },
   ];
+  // As the driver records it: the exit handler rejects the pending stream RPC ("worker exit
+  // null"); every later RPC fails at once ("worker dead").
   for (let i = 0; i < 7; i++) {
-    records.push({ stage: "rpc-error", elapsed: deathAt - 0.16, kind: "stream", message: "dead" });
+    const message = i === 0 ? "worker exit null" : "worker dead";
+    records.push({ stage: "rpc-error", elapsed: deathAt - 0.16, kind: "stream", message });
   }
   records.push({ stage: "rpc-error", elapsed: loadEnd, kind: "sample", message: "worker dead" });
   const final = {
@@ -216,15 +219,15 @@ function verdictOf(records, options) {
   return analyze(records, options).verdict;
 }
 
-function assertInconclusive(records, options, reason) {
+// Every inconclusive case names the problem it reproduces, so an unrelated problem cannot make it
+// pass.
+function assertInconclusive(records, reason, options) {
   const result = analyze(records, options);
   assert.equal(result.verdict, "inconclusive", JSON.stringify(result.inconclusive));
-  if (reason) {
-    assert.ok(
-      result.inconclusive.some((p) => reason.test(p)),
-      `expected a problem matching ${reason}: ${JSON.stringify(result.inconclusive)}`,
-    );
-  }
+  assert.ok(
+    result.inconclusive.some((p) => reason.test(p)),
+    `expected a problem matching ${reason}: ${JSON.stringify(result.inconclusive)}`,
+  );
 }
 
 // --- The driver's own format: what a real run looks like ------------------------------------
@@ -283,8 +286,8 @@ test("a heap-limit abort with a sample missing before it is inconclusive", () =>
   const r = buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
   assertInconclusive(
     r.filter((x) => x !== sampleAt(r, 20)),
+    /1 sample slot\(s\) missing \(first at 600s\)/,
     { control: true },
-    /slot/,
   );
 });
 
@@ -293,53 +296,59 @@ test("a heap-limit abort with a sample missing before it is inconclusive", () =>
 test("round 1 finding 1: a boundary-copy run is inconclusive", () => {
   const r = flat();
   r[0].boundaryCopy = true;
-  assertInconclusive(r);
+  assertInconclusive(r, /boundaryCopy true/);
 });
 
 test("round 1 finding 1: an altered streaming period is inconclusive", () => {
   const r = flat();
   r[0].protocol.messageSeconds = 3600;
-  assertInconclusive(r);
+  assertInconclusive(r, /protocol.messageSeconds 3600 != 1800/);
 });
 
 test("round 1 finding 1: an altered fixture is inconclusive", () => {
   const r = flat();
   r[0].fixture.seededRows = 1;
-  assertInconclusive(r);
+  assertInconclusive(r, /fixture.seededRows 1 != 10900/);
 });
 
 test("round 1 finding 2: a missing, duplicated, stretched or off-mix minute is inconclusive", () => {
   let r = flat().filter((x) => !(x.stage === "minute" && x.index === 239));
-  assertInconclusive(r);
+  assertInconclusive(r, /minute index\(es\) missing \(first 239\)/);
   r = flat();
   minutesOf(r)[239].index = 238;
-  assertInconclusive(r);
+  assertInconclusive(r, /1 duplicated minute index/);
   r = flat();
   minutesOf(r)[0].elapsedEnd = 90;
-  assertInconclusive(r);
+  assertInconclusive(r, /1 off-protocol minute/);
   r = flat();
   minutesOf(r)[239].byKind = { logs: 15, inspect: 9, ls: 3, send: 0 };
-  assertInconclusive(r);
+  assertInconclusive(r, /1 off-protocol minute/);
 });
 
 test("round 1 finding 3: missing samples and short phases are inconclusive", () => {
   let r = flat();
-  assertInconclusive(r.filter((x) => x !== sampleAt(r, 240)));
+  assertInconclusive(
+    r.filter((x) => x !== sampleAt(r, 240)),
+    /1 sample slot\(s\) missing \(first at 7200s\)/,
+  );
   r = flat();
-  assertInconclusive(r.filter((x) => !(x.stage === "sample" && x.elapsed >= 7200)));
+  assertInconclusive(
+    r.filter((x) => !(x.stage === "sample" && x.elapsed >= 7200)),
+    /240 sample slot\(s\) missing \(first at 7200s\)/,
+  );
   r = flat();
   one(r, "load-end").elapsed = 14375;
   one(r, "post-rest").elapsed = 14675;
-  assertInconclusive(r);
+  assertInconclusive(r, /load ran 14375.0s, expected 14400s/);
   r = flat();
   one(r, "post-rest").elapsed = 14675;
-  assertInconclusive(r);
+  assertInconclusive(r, /rest ran 275.0s, expected 300s/);
 });
 
 test("round 1 finding 6: samples without an observed running count are inconclusive", () => {
   const r = flat();
   for (const s of samplesOf(r)) delete s.agents;
-  assertInconclusive(r);
+  assertInconclusive(r, /480 sample\(s\) without an observed running-agent count/);
 });
 
 test("round 1 finding 7: a control rising 510,000,000 bytes passes", () => {
@@ -350,7 +359,7 @@ test("round 1 finding 8: a control leaking only after four hours is inconclusive
   const r = buildRun({ control: true });
   one(r, "load-end").elapsed = 18000;
   one(r, "load-end").memory.heapUsed = 200 * MIB + 800_000_000;
-  assertInconclusive(r, { control: true });
+  assertInconclusive(r, /load ran 18000.0s, expected 14400s/, { control: true });
 });
 
 test("round 1 finding 9: 95% of the requested bound is not the bound", () => {
@@ -361,7 +370,9 @@ test("round 1 finding 9: 95% of the requested bound is not the bound", () => {
 test("round 1 finding 9: a flat control with an unexplained death is inconclusive", () => {
   const r = buildRun({ control: true });
   r.push({ stage: "worker-exit", elapsed: 3600, code: 1, signal: null, oom: false, reason: null });
-  assertInconclusive(r, { control: true });
+  assertInconclusive(r, /1 worker death\(s\) that are not a timed heap-limit abort/, {
+    control: true,
+  });
 });
 
 test("round 1 finding 10: a sample error or death hidden by zero final counters fails", () => {
@@ -380,7 +391,7 @@ test("round 2 finding 1: 240 minute buckets all covering [0, 60] are inconclusiv
     m.elapsedStart = 0;
     m.elapsedEnd = 60;
   }
-  assertInconclusive(r, undefined, /minute/);
+  assertInconclusive(r, /minute bucket\(s\) not anchored to their index or not contiguous/);
 });
 
 test("round 2 finding 1: minute buckets without start or end times are inconclusive", () => {
@@ -389,7 +400,7 @@ test("round 2 finding 1: minute buckets without start or end times are inconclus
     delete m.elapsedStart;
     delete m.elapsedEnd;
   }
-  assertInconclusive(r, undefined, /minute/);
+  assertInconclusive(r, /240 minute bucket\(s\) without an index, start and end times/);
 });
 
 // --- Round 2 finding 2 (analyze.mjs:155): a duplicate must not hide a missing sample ---------
@@ -400,7 +411,7 @@ test("round 2 finding 2: a missing initial sample replaced by a duplicate is inc
   const second = sampleAt(r, 1);
   const out = r.filter((x) => x !== first);
   out.push(structuredClone(second));
-  assertInconclusive(out, undefined, /slot/);
+  assertInconclusive(out, /sample slot\(s\) missing \(first at 0s\)/);
 });
 
 // --- Round 2 finding 3 (analyze.mjs:172): instruments must be present and agree --------------
@@ -408,19 +419,19 @@ test("round 2 finding 2: a missing initial sample replaced by a duplicate is inc
 test("round 2 finding 3: samples with empty per-kind counts are inconclusive", () => {
   const r = flat();
   for (const s of samplesOf(r)) s.byKind = {};
-  assertInconclusive(r);
+  assertInconclusive(r, /480 sample\(s\) without cumulative counts by kind that sum to its calls/);
 });
 
 test("round 2 finding 3: zero per-kind counts against 6,480 calls in minutes are inconclusive", () => {
   const r = flat();
   for (const s of samplesOf(r)) s.byKind = zeroKinds();
-  assertInconclusive(r);
+  assertInconclusive(r, /sample\(s\) whose cumulative calls disagree with the minutes/);
 });
 
 test("round 2 finding 3: zero delivered stream chunks are inconclusive", () => {
   const r = flat();
   for (const x of r) if ("streamChunks" in x) x.streamChunks = 0;
-  assertInconclusive(r, undefined, /stream/);
+  assertInconclusive(r, /delivered stream chunks are off the schedule/);
 });
 
 test("round 2 finding 3: absent error and death counters are inconclusive", () => {
@@ -430,7 +441,10 @@ test("round 2 finding 3: absent error and death counters are inconclusive", () =
     delete x.streamErrors;
     delete x.workerDeaths;
   }
-  assertInconclusive(r);
+  assertInconclusive(
+    r,
+    /480 sample\(s\) without RPC error, stream error and worker death counters/,
+  );
 });
 
 // --- Round 2 finding 4 (analyze.mjs:66): a sample's stream error must survive ----------------
@@ -455,7 +469,9 @@ test("round 2 finding 5: an unrelated SIGABRT does not qualify a flat control", 
     oom: false,
     reason: "intentional process.abort()",
   });
-  assertInconclusive(r, { control: true });
+  assertInconclusive(r, /1 worker death\(s\) that are not a timed heap-limit abort/, {
+    control: true,
+  });
 });
 
 test("round 2 finding 5: an untimed heap-limit abort with no load does not qualify", () => {
@@ -467,20 +483,24 @@ test("round 2 finding 5: an untimed heap-limit abort with no load does not quali
     oom: true,
     reason: "Reached heap limit",
   });
-  assertInconclusive(r, { control: true });
+  assertInconclusive(r, /1 worker death\(s\) that are not a timed heap-limit abort/, {
+    control: true,
+  });
 });
 
 test("round 2 finding 5: a timed heap-limit abort without the load before it does not qualify", () => {
   const r = buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 }).filter(
     (x) => !["sample", "minute"].includes(x.stage),
   );
-  assertInconclusive(r, { control: true });
+  assertInconclusive(r, /sample slot\(s\) missing \(first at 0s\)/, { control: true });
 });
 
 // --- Round 2 finding 6 (analyze.mjs:99): the control reads the idle agents ---------------------
 
 test("round 2 finding 6: a control reading streaming agents is inconclusive", () => {
-  assertInconclusive(leakingControl({ readStreaming: true }), { control: true }, /readStreaming/);
+  assertInconclusive(leakingControl({ readStreaming: true }), /control reads the 8 idle agents/, {
+    control: true,
+  });
 });
 
 // --- Round 2 finding 7 (analyze.mjs:253): the last-hour window needs the load end ----------
@@ -490,30 +510,115 @@ test("round 2 finding 7: a last-hour rise without a load-end record does not pas
   assert.equal(verdictOf(r), "fail");
   // The validator's control: the final load point recorded as one more sample, not as load-end.
   one(r, "load-end").stage = "sample";
-  assertInconclusive(r, undefined, /load-end/);
+  assertInconclusive(r, /no load-end record/);
   assert.ok(analyze(r).numbers.slopeBytesPerHour >= 16 * MIB);
+});
+
+// --- Round 3 finding 1 (analyze.mjs:482): the rest is 300 s, within 2 s ---------------------
+
+test("round 3 finding 1: a 330-second rest is inconclusive", () => {
+  const r = flat();
+  one(r, "post-rest").elapsed = one(r, "load-end").elapsed + 330;
+  assertInconclusive(r, /rest ran 330.0s, expected 300s/);
+});
+
+test("round 3 finding 1: the rest bound is 298 to 302 seconds", () => {
+  for (const [rest, verdict] of [
+    [297.9, "inconclusive"],
+    [298.1, "pass"],
+    [301.9, "pass"],
+    [302.1, "inconclusive"],
+  ]) {
+    const r = flat();
+    one(r, "post-rest").elapsed = one(r, "load-end").elapsed + rest;
+    assert.equal(verdictOf(r), verdict, String(rest));
+  }
+});
+
+// --- Round 3 finding 2 (analyze.mjs:550): every control error up to the leak point counts ---
+
+// A control flat through its samples whose only leak evidence is the load-end sample.
+function controlLeakingAtLoadEnd() {
+  const r = buildRun({ control: true, postRestHeapMiB: 200 });
+  one(r, "load-end").memory.heapUsed = 200 * MIB + 510_000_000;
+  return r;
+}
+
+test("round 3 finding 2: a control read failure after the last sample, before the leak, counts", () => {
+  const r = controlLeakingAtLoadEnd();
+  assert.equal(verdictOf(r, { control: true }), "pass");
+  for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).rpcErrors = 1;
+  r.push({ stage: "rpc-error", elapsed: 14390, kind: "inspect", message: "socket hang up" });
+  assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
+});
+
+test("round 3 finding 2: a control error in the end counters with no event counts", () => {
+  const r = controlLeakingAtLoadEnd();
+  for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).rpcErrors = 1;
+  assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
+});
+
+test("round 3 finding 2: before a heap-limit abort, only the abort's own failures are excused", () => {
+  const r = buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
+  r.push({ stage: "rpc-error", elapsed: 1332.2, kind: "logs", message: "socket hang up" });
+  for (const stage of ["load-end", "cleanup"]) one(r, stage).rpcErrors += 1;
+  assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
+});
+
+test("round 3 finding 2: a 'worker dead' failure before the last sample is not excused", () => {
+  const r = buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
+  r.push({ stage: "rpc-error", elapsed: 600.2, kind: "stream", message: "worker dead" });
+  for (const stage of ["load-end", "cleanup"]) {
+    one(r, stage).rpcErrors += 1;
+    one(r, stage).streamErrors += 1;
+  }
+  assertInconclusive(r, /1 RPC error\(s\) or death\(s\) before the leak point/, { control: true });
+});
+
+// --- Round 3 finding 3 (analyze.mjs:435): delivery holds through the end of the load --------
+
+test("round 3 finding 3: no stream delivered after the last sample is inconclusive", () => {
+  const r = flat();
+  const last = samplesOf(r).at(-1).streamChunks;
+  for (const stage of ["load-end", "post-rest", "cleanup"]) one(r, stage).streamChunks = last;
+  assertInconclusive(r, /load-end stream chunks 114443 short of the 114667 due by 14400.05s/);
+});
+
+test("round 3 finding 3: a control's delivery must reach its heap-limit abort", () => {
+  const r = buildRun({ control: true, heapAt: (t) => 200 + t / 10, deathAt: 1337.011 });
+  const last = samplesOf(r).at(-1).streamChunks;
+  for (const stage of ["load-end", "cleanup"]) one(r, stage).streamChunks = last;
+  assertInconclusive(r, /load-end stream chunks 10507 short of the 10626 due by 1337.011s/, {
+    control: true,
+  });
+});
+
+test("round 3 finding 3: a control leak point between samples needs the delivered count", () => {
+  const r = controlLeakingAtLoadEnd();
+  for (const stage of ["load-end", "post-rest", "cleanup"]) delete one(r, stage).streamChunks;
+  assertInconclusive(r, /no delivered stream-chunk count at the load end/, { control: true });
 });
 
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
 
 test("audit: a header whose control flag contradicts the mode is inconclusive", () => {
-  assertInconclusive(flat(), { control: true }, /control/);
-  assertInconclusive(leakingControl(), undefined, /control/);
+  assertInconclusive(flat(), /header control false, but judged as the control/, { control: true });
+  assertInconclusive(leakingControl(), /header control true, but judged as a fixed run/);
 });
 
 test("audit: absent run identity in the header is inconclusive", () => {
-  for (const drop of [
-    (h) => delete h.boundaryCopy,
-    (h) => delete h.readStreaming,
-    (h) => delete h.heapSizeLimitBytes,
-    (h) => delete h.label,
-    (h) => delete h.baseline.agents,
-    (h) => (h.baseline.agents.byLifecycle.running = 6),
-    (h) => (h.baseline.agents.timelineStats.totalItems = 100),
+  for (const [drop, reason] of [
+    [(h) => delete h.boundaryCopy, /boundaryCopy undefined/],
+    [(h) => delete h.readStreaming, /readStreaming undefined is not recorded/],
+    [(h) => delete h.heapSizeLimitBytes, /heap_size_limit is not recorded/],
+    [(h) => delete h.label, /no run label/],
+    [(h) => delete h.baseline.agents, /the baseline does not observe 15 agents/],
+    [(h) => (h.baseline.agents.byLifecycle.running = 6), /the baseline does not observe 15 agents/],
+    [(h) => (h.baseline.agents.timelineStats.totalItems = 100), /observes 100 timeline rows/],
   ]) {
     const r = flat();
     drop(r[0]);
-    assertInconclusive(r);
+    assertInconclusive(r, reason);
   }
 });
 
@@ -521,7 +626,7 @@ test("audit: a duplicated baseline, load-end, post-rest or cleanup record is inc
   for (const stage of ["baseline", "load-end", "post-rest", "cleanup"]) {
     const r = flat();
     r.push(structuredClone(one(r, stage)));
-    assertInconclusive(r, undefined, new RegExp(stage));
+    assertInconclusive(r, new RegExp(`2 "${stage}" records, expected one`));
   }
 });
 
@@ -529,8 +634,7 @@ test("audit: a missing load-end, post-rest or cleanup record is inconclusive", (
   for (const stage of ["load-end", "post-rest", "cleanup"]) {
     assertInconclusive(
       flat().filter((x) => x.stage !== stage),
-      undefined,
-      new RegExp(stage),
+      new RegExp(`no ${stage} record`),
     );
   }
 });
@@ -538,38 +642,38 @@ test("audit: a missing load-end, post-rest or cleanup record is inconclusive", (
 test("audit: a sample without a numeric heapUsed is not silently dropped", () => {
   const r = flat();
   delete sampleAt(r, 240).memory;
-  assertInconclusive(r, undefined, /sample/);
+  assertInconclusive(r, /1 sample record\(s\) without a numeric elapsed or heapUsed/);
 });
 
 test("audit: an extra sample off its 30-second slot is inconclusive", () => {
   const r = flat();
   r.push({ ...structuredClone(sampleAt(r, 0)), elapsed: 15 });
-  assertInconclusive(r, undefined, /slot/);
+  assertInconclusive(r, /sample slot\(s\) with more than one sample \(0s\)/);
 });
 
 test("audit: a sample after the four hours of load is inconclusive", () => {
   const r = flat();
   r.push({ ...structuredClone(sampleAt(r, 479)), elapsed: 14400.02 });
-  assertInconclusive(r);
+  assertInconclusive(r, /1 sample\(s\) at or after the 14400s load/);
 });
 
 test("audit: a minute beyond the four hours is inconclusive", () => {
   const r = flat();
   const last = minutesOf(r)[239];
   r.push({ ...structuredClone(last), index: 240, elapsedStart: last.elapsedEnd });
-  assertInconclusive(r, undefined, /minute/);
+  assertInconclusive(r, /1 minute bucket\(s\) beyond the 14400s load/);
 });
 
 test("audit: a minute index far past the load is malformed and does not stall the analyzer", () => {
   const r = flat();
   minutesOf(r)[239].index = 1e12;
-  assertInconclusive(r, undefined, /minute/);
+  assertInconclusive(r, /1 minute bucket\(s\) without an index/);
 });
 
 test("audit: a counter that is present but not a count is inconclusive", () => {
   const r = flat();
   one(r, "load-end").rpcErrors = "0";
-  assertInconclusive(r, undefined, /load-end/);
+  assertInconclusive(r, /load-end rpcErrors not a count/);
 });
 
 test("audit: a decreasing cumulative call count is inconclusive", () => {
@@ -577,27 +681,27 @@ test("audit: a decreasing cumulative call count is inconclusive", () => {
   const s = sampleAt(r, 101);
   s.calls = sampleAt(r, 100).calls - 1;
   s.byKind = { ...sampleAt(r, 100).byKind, logs: sampleAt(r, 100).byKind.logs - 1 };
-  assertInconclusive(r);
+  assertInconclusive(r, /1 sample\(s\) with a decreasing cumulative count/);
 });
 
 test("audit: load-end calls that disagree with the minutes are inconclusive", () => {
   const r = flat();
   one(r, "load-end").calls += 27;
   one(r, "load-end").byKind.logs += 27;
-  assertInconclusive(r, undefined, /load-end/);
+  assertInconclusive(r, /load-end calls 6507 != 6480 in the minute buckets/);
 });
 
 test("audit: calls during the rest are inconclusive", () => {
   const r = flat();
   one(r, "post-rest").calls += 1;
   one(r, "post-rest").byKind.ls += 1;
-  assertInconclusive(r, undefined, /post-rest/);
+  assertInconclusive(r, /post-rest calls 6481 != 6480 in the minute buckets/);
 });
 
 test("audit: a rest far longer than five minutes is inconclusive", () => {
   const r = flat();
   one(r, "post-rest").elapsed += 3 * 3600;
-  assertInconclusive(r, undefined, /rest/);
+  assertInconclusive(r, /rest ran 11101.2s, expected 300s/);
 });
 
 test("audit: an RPC error event missing from every counter still fails", () => {
@@ -609,13 +713,13 @@ test("audit: an RPC error event missing from every counter still fails", () => {
 test("audit: a worker exit marked as the harness's own stop mid-run is inconclusive", () => {
   const r = flat();
   r.push({ stage: "worker-exit", elapsed: 7200, code: null, signal: "SIGTERM", stopping: true });
-  assertInconclusive(r, undefined, /stop/);
+  assertInconclusive(r, /marked as the harness's stop before the run ended/);
 });
 
 test("audit: a control with an RPC error before its leak point is inconclusive", () => {
   const r = leakingControl();
   for (const s of samplesOf(r)) if (s.elapsed > 300) s.rpcErrors = 1;
-  assertInconclusive(r, { control: true }, /before the leak point/);
+  assertInconclusive(r, /before the leak point/, { control: true });
 });
 
 test("audit: an unparseable JSONL line makes the CLI inconclusive", () => {
