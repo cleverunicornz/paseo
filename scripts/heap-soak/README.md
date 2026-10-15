@@ -83,9 +83,14 @@ node --test scripts/heap-soak/analyze.test.mjs
 load sample; RPC errors and worker deaths; the calls per minute and the 15/9/2/1 mix per minute
 with every off-protocol minute listed; and the streaming-agent count. For `--control` it reports
 whether the run rose more than 500 MB above its own baseline or reached the worker's heap bound
-within the 4 hours. A protocol break (an off-protocol minute, fewer than 7 streaming agents, a
-missing sample, a run cut short) exits 2 — inconclusive — because the run does not qualify a
-release.
+(a sample at `heap_size_limit`, or a timed worker exit whose stderr shows the V8 heap-limit abort)
+within the 4 hours, and judges the control's record only up to that leak point.
+
+A run qualifies only on a complete, consistent record. A protocol break (an off-protocol minute,
+fewer than 7 streaming agents, a missing sample, a run cut short) and anything absent, duplicated
+or contradictory in the JSONL (a counter, a sample slot, a header field, a minute's times, an
+unparseable line) exit 2, inconclusive. `--control` judges only a run recorded with `--control`.
+The rules are listed at the top of `analyze.mjs`.
 
 ## Diagnostics only
 

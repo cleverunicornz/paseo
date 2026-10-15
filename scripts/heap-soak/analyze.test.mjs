@@ -12,7 +12,6 @@ const MIB = 1024 ** 2;
 const SECONDS = 14400;
 const RATE = 27;
 const MIX = { logs: 15, inspect: 9, ls: 2, send: 1 };
-const KINDS = ["logs", "inspect", "ls", "send"];
 // The offsets a real run shows (the 2026-10-14 23:48Z runs): a sample lands a few milliseconds
 // after its 30-second slot, a call a few milliseconds after its schedule, the load ends just past
 // 14,400 s, and the post-rest record follows two forced-GC passes and the 300-second rest.
@@ -489,11 +488,10 @@ test("round 2 finding 6: a control reading streaming agents is inconclusive", ()
 test("round 2 finding 7: a last-hour rise without a load-end record does not pass", () => {
   const r = buildRun({ heapAt: (t) => 200 + (Math.max(0, t - 10800) / 3600) * 20 });
   assert.equal(verdictOf(r), "fail");
-  const out = r.map((x) =>
-    x.stage === "load-end" ? { ...x, stage: "sample", agents: { byLifecycle: { running: 7 } } } : x,
-  );
-  assertInconclusive(out, undefined, /load-end/);
-  assert.ok(analyze(out).numbers.slopeBytesPerHour >= 16 * MIB);
+  // The validator's control: the final load point recorded as one more sample, not as load-end.
+  one(r, "load-end").stage = "sample";
+  assertInconclusive(r, undefined, /load-end/);
+  assert.ok(analyze(r).numbers.slopeBytesPerHour >= 16 * MIB);
 });
 
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
@@ -562,6 +560,12 @@ test("audit: a minute beyond the four hours is inconclusive", () => {
   assertInconclusive(r, undefined, /minute/);
 });
 
+test("audit: a minute index far past the load is malformed and does not stall the analyzer", () => {
+  const r = flat();
+  minutesOf(r)[239].index = 1e12;
+  assertInconclusive(r, undefined, /minute/);
+});
+
 test("audit: a counter that is present but not a count is inconclusive", () => {
   const r = flat();
   one(r, "load-end").rpcErrors = "0";
@@ -600,6 +604,12 @@ test("audit: an RPC error event missing from every counter still fails", () => {
   const r = flat();
   r.push({ stage: "rpc-error", elapsed: 7200, kind: "logs", message: "injected" });
   assert.equal(verdictOf(r), "fail");
+});
+
+test("audit: a worker exit marked as the harness's own stop mid-run is inconclusive", () => {
+  const r = flat();
+  r.push({ stage: "worker-exit", elapsed: 7200, code: null, signal: "SIGTERM", stopping: true });
+  assertInconclusive(r, undefined, /stop/);
 });
 
 test("audit: a control with an RPC error before its leak point is inconclusive", () => {
