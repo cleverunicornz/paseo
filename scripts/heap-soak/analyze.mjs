@@ -1030,23 +1030,55 @@ function evaluateControl(leak, numbers) {
   };
 }
 
+// A result that judges nothing: the run cannot be analysed, so it is INCONCLUSIVE.
+function unanalysed(control, why, problems, extra = {}) {
+  return {
+    verdict: "inconclusive",
+    control,
+    unanalysed: why,
+    inconclusive: problems,
+    checks: [],
+    numbers: {},
+    offProtocolMinutes: [],
+    ...extra,
+  };
+}
+
+// A run that fails before its baseline (the worker does not start, or seeding the fixture fails)
+// leaves only the driver's failure records: its fixture was never observed, and nothing can be
+// judged.
+function preBaselineProblem(records) {
+  const exits = records
+    .filter((x) => x?.stage === "worker-exit")
+    .map((e) => `the worker exited at ${e.elapsed}s (code ${e.code}, signal ${e.signal})`);
+  const failures = records.filter((x) => x?.stage === "rpc-error").length;
+  const seen = [...exits, ...(failures > 0 ? [`${failures} RPC failure(s)`] : [])];
+  return `no baseline record: the run never reached its baseline${seen.length > 0 ? ` (${seen.join("; ")})` : ""}`;
+}
+
+// Judge a run. No exception decides the verdict: an internal error makes the run INCONCLUSIVE,
+// naming the error.
 export function analyze(records, options = {}) {
   const control = options.control === true;
+  try {
+    return analyzeRun(records, control);
+  } catch (error) {
+    return unanalysed(control, "internal error", [`internal error: ${errorText(error)}`]);
+  }
+}
+
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function analyzeRun(records, control) {
   // The schema runs first: a record that is not exactly what the driver writes is not analysed.
   const schemaViolations = validateRun(records);
-  if (schemaViolations.length > 0) {
-    return {
-      verdict: "inconclusive",
-      control,
-      inconclusive: schemaViolations,
-      schemaViolations,
-      checks: [],
-      numbers: {},
-      offProtocolMinutes: [],
-    };
-  }
+  if (schemaViolations.length > 0)
+    return unanalysed(control, "schema", schemaViolations, { schemaViolations });
   const r = readRecords(records);
   const header = r.header;
+  if (!header) return unanalysed(control, "no baseline", [preBaselineProblem(records)]);
   const baseline = heapOf(header?.baseline);
   const heapLimit =
     Number.isFinite(header?.heapSizeLimitBytes) && header.heapSizeLimitBytes > 0
@@ -1124,12 +1156,12 @@ function mib(bytes) {
 }
 
 function printReport(result, source) {
-  if (result.schemaViolations) {
+  if (result.unanalysed) {
     return [
       `run:            ${source}${result.control ? "  [control]" : ""}`,
-      `schema:         ${result.schemaViolations.length} violation(s); the run is not analysed`,
+      `not analysed:   ${result.unanalysed}`,
       "",
-      ...result.schemaViolations.map((p) => `INCONCLUSIVE  ${p}`),
+      ...result.inconclusive.map((p) => `INCONCLUSIVE  ${p}`),
       "",
       `VERDICT: ${result.verdict.toUpperCase()}`,
       JSON.stringify(result),
@@ -1201,20 +1233,43 @@ const isMain =
   process.argv[1] &&
   fs.realpathSync(process.argv[1]) === fs.realpathSync(new URL(import.meta.url).pathname);
 
-if (isMain) {
-  const args = process.argv.slice(2);
+// The CLI's last resort: whatever fails while reading, analysing or reporting, the verdict is
+// INCONCLUSIVE (exit 2), naming the error. It builds its text without the report's helpers.
+function failInconclusive(source, error) {
+  process.stdout.write(
+    [
+      `run:            ${source}`,
+      "not analysed:   internal error",
+      "",
+      `INCONCLUSIVE  internal error: ${errorText(error)}`,
+      "",
+      "VERDICT: INCONCLUSIVE",
+      "",
+    ].join("\n"),
+  );
+  process.exit(2);
+}
+
+function main(args) {
   const control = args.includes("--control");
   const file = args.find((a) => !a.startsWith("--"));
   if (!file) {
     process.stderr.write("usage: analyze.mjs [--control] <run.jsonl>\n");
     process.exit(2);
   }
-  const text = file === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(file, "utf8");
-  const records = text
-    .split("\n")
-    .filter((l) => l.trim())
-    .map(parseLine);
-  const result = analyze(records, { control });
-  process.stdout.write(printReport(result, file) + "\n");
-  process.exit(exitCodeFor(result.verdict));
+  process.on("uncaughtException", (error) => failInconclusive(file, error));
+  try {
+    const text = file === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(file, "utf8");
+    const records = text
+      .split("\n")
+      .filter((l) => l.trim())
+      .map(parseLine);
+    const result = analyze(records, { control });
+    process.stdout.write(printReport(result, file) + "\n");
+    process.exit(exitCodeFor(result.verdict));
+  } catch (error) {
+    failInconclusive(file, error);
+  }
 }
+
+if (isMain) main(process.argv.slice(2));

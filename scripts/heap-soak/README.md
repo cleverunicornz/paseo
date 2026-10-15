@@ -80,6 +80,11 @@ node scripts/heap-soak/analyze.mjs --control run-control.jsonl
 node --test scripts/heap-soak/analyze.test.mjs
 ```
 
+The exit code is the verdict: 0 PASS, 1 FAIL, 2 INCONCLUSIVE. No exception decides it: any internal
+error, from reading the file to printing the report, prints an INCONCLUSIVE verdict naming the
+error and exits 2. A run that never reached its baseline (the worker did not start, or seeding the
+fixture failed) is INCONCLUSIVE.
+
 `analyze.mjs` computes P-000269 H1's numbers: the baseline; the max sample minus baseline
 (≤ 64 MiB); the last-hour least-squares slope (< 16 MiB/h); the post-rest sample against the last
 load sample; RPC errors and worker deaths; the calls per minute and the 15/9/2/1 mix per minute
