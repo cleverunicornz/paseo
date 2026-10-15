@@ -13,7 +13,14 @@
 const ISO_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
 const CALL_KINDS = ["logs", "inspect", "ls", "send"];
 const ERROR_KINDS = [...CALL_KINDS, "stream", "sample", "other"];
+// P-000269 H1's fixture: 15 agents, 7 of them held running, 10,900 seeded rows.
 const FIXTURE_AGENTS = 15;
+const FIXTURE_HELD_PROMPTS = 7;
+const FIXTURE_SEEDED_ROWS = 10900;
+// What one prompt can add to a timeline: its user message and, from the fake provider's canary
+// turn (fake-agent-client.mjs emitTurnEvents), at most two assistant chunks. A held prompt adds only
+// its user message. Each delivered stream chunk is one assembler delta: at most one row.
+const ROWS_PER_PROMPT = 3;
 const MAX_MINUTE_INDEX = 240;
 // worker.mjs reports v8.getHeapStatistics() whole; these are its keys on the Node that ran the soak.
 const HEAP_STATISTICS = [
@@ -197,11 +204,11 @@ function fieldViolations(value, rule, path, out) {
 function objectViolations(value, fields, path, out) {
   const prefix = path ? `${path}.` : "";
   for (const [k, rule] of Object.entries(fields)) {
-    if (!(k in value)) out.push(`${prefix}${k} is missing`);
+    if (!Object.hasOwn(value, k)) out.push(`${prefix}${k} is missing`);
     else fieldViolations(value[k], rule, `${prefix}${k}`, out);
   }
   for (const k of Object.keys(value)) {
-    if (!(k in fields)) out.push(`${prefix}${k} is not a field of this record type`);
+    if (!Object.hasOwn(fields, k)) out.push(`${prefix}${k} is not a field of this record type`);
   }
 }
 
@@ -221,8 +228,13 @@ function metricsInvariants(m, path) {
   if (m.resident !== a.total) out.push(`${p}resident ${m.resident} != agents.total ${a.total}`);
   if (a.withActiveForegroundTurn > a.total)
     out.push(`${p}agents.withActiveForegroundTurn exceeds agents.total`);
-  if (a.timelineStats.maxItemsPerAgent > a.timelineStats.totalItems)
+  const { totalItems, maxItemsPerAgent } = a.timelineStats;
+  if (maxItemsPerAgent > totalItems)
     out.push(`${p}agents.timelineStats.maxItemsPerAgent exceeds totalItems`);
+  if (totalItems > a.total * maxItemsPerAgent)
+    out.push(
+      `${p}agents.timelineStats.totalItems ${totalItems} exceeds agents.total ${a.total} × maxItemsPerAgent ${maxItemsPerAgent}`,
+    );
   if (m.memory.heapUsed > m.memory.heapTotal) out.push(`${p}memory.heapUsed exceeds heapTotal`);
   const h = m.heapStatistics;
   if (h.used_heap_size > h.total_heap_size)
@@ -296,8 +308,9 @@ function invariants(r) {
 function recordViolations(r) {
   if (r === null || typeof r !== "object" || Array.isArray(r) || r.stage === "unparseable")
     return ["not a JSON object"];
+  // Own properties only: a stage named like a prototype member ("constructor") is unknown.
+  if (!Object.hasOwn(SCHEMAS, r.stage)) return [`unknown record type ${JSON.stringify(r.stage)}`];
   const schemas = SCHEMAS[r.stage];
-  if (!schemas) return [`unknown record type ${JSON.stringify(r.stage)}`];
   let best = null;
   for (const fields of schemas) {
     const out = [];
@@ -308,12 +321,30 @@ function recordViolations(r) {
   return best;
 }
 
-// --- Run identity: one worker, one heap limit, one home --------------------------------------
+// --- Run identity: one worker, one heap limit, one home; timelines the fixture can hold ------
+
+// Every observation's timeline holds the seeded rows and at most what the protocol can add by
+// then: a prompt's rows for each held prompt and each send, and a row per delivered chunk.
+function timelineViolations(r, i, path) {
+  const seeded = FIXTURE_SEEDED_ROWS;
+  const prompts = FIXTURE_HELD_PROMPTS + (r.byKind?.send ?? 0);
+  const most = seeded + ROWS_PER_PROMPT * prompts + (r.streamChunks ?? 0);
+  const rows = (path ? r.baseline : r).agents.timelineStats.totalItems;
+  const at = `record ${i + 1} (${r.stage}): ${path}agents.timelineStats.totalItems ${rows}`;
+  if (rows < seeded) return [`${at} is fewer than the ${seeded} seeded rows`];
+  if (rows > most)
+    return [`${at} exceeds the ${most} rows the fixture and protocol can hold by then`];
+  return [];
+}
 
 function identityViolations(records) {
   const header = records.find((r) => r?.stage === "baseline");
   if (!header) return [];
   const out = [];
+  records.forEach((r, i) => {
+    if (r === header) out.push(...timelineViolations(r, i, "baseline."));
+    else if (r?.memory) out.push(...timelineViolations(r, i, ""));
+  });
   records.forEach((r, i) => {
     if (r === header || !r?.memory) return;
     if (r.pid !== header.baseline.pid)

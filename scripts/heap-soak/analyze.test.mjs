@@ -1239,7 +1239,7 @@ test("audit: absent run identity in the header is inconclusive", () => {
     ],
     [
       (h) => (h.baseline.agents.timelineStats = { totalItems: 100, maxItemsPerAgent: 100 }),
-      /observes 100 timeline rows/,
+      violation("baseline", "baseline.agents.timelineStats.totalItems 100 is fewer than the 10900"),
     ],
   ]) {
     const r = flat();

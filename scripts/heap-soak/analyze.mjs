@@ -321,13 +321,6 @@ function slotProblems(series, malformed, windowEnd, full) {
 }
 
 const SAMPLE_INSTRUMENTS = [
-  ["without an observed running-agent count", (s) => isAbsent(s.agents?.byLifecycle?.running)],
-  [
-    `with running agents != ${EXPECTED_FIXTURE.running}`,
-    (s) =>
-      !isAbsent(s.agents?.byLifecycle?.running) &&
-      s.agents.byLifecycle.running !== EXPECTED_FIXTURE.running,
-  ],
   ["without a cumulative call count", (s) => !isCount(s.calls)],
   [
     "without cumulative counts by kind that sum to its calls",
@@ -467,8 +460,8 @@ function recordProblems({ loadEnd, postRest, cleanup }, totals, series, minutes)
     ["cleanup", cleanup],
   ].filter(([, rec]) => rec);
   for (const [name, rec] of named) {
-    const bad = RECORD_COUNTERS.filter((f) => f in rec && !isCount(rec[f]));
-    if ("byKind" in rec && !kindsValid(rec.byKind)) bad.push("byKind");
+    const bad = RECORD_COUNTERS.filter((f) => Object.hasOwn(rec, f) && !isCount(rec[f]));
+    if (Object.hasOwn(rec, "byKind") && !kindsValid(rec.byKind)) bad.push("byKind");
     if (bad.length > 0) problems.push(`${name} ${bad.join(", ")} not a count`);
     if (isCount(rec.calls) && rec.calls !== totals.all.calls)
       problems.push(`${name} calls ${rec.calls} != ${totals.all.calls} in the minute buckets`);
@@ -819,7 +812,9 @@ function errorCounts(rec) {
 // sample: the count delivered by the load end reaches the schedule 2 s before the window's end (the
 // driver streams at the start of every loop iteration, about every 100 ms). A window that ends on a
 // sample is already checked exactly by that sample.
-function deliveryProblems(loadEnd, series, windowEnd, full) {
+function deliveryProblems(loadEnd, series, windowEnd, full, explained) {
+  // A fixed run's recorded stream failures explain the shortfall; they fail the run.
+  if (explained) return [];
   const through = full ? loadEnd?.elapsed : windowEnd;
   if (!isTime(through) || series.some((s) => s.elapsed === through)) return [];
   const chunks = loadEnd?.streamChunks;
@@ -831,6 +826,54 @@ function deliveryProblems(loadEnd, series, windowEnd, full) {
   return chunks < due
     ? [`load-end stream chunks ${chunks} short of the ${due} due by ${through}s`]
     : [];
+}
+
+// Seven agents run and stream throughout: every sample and the load-end sample observe 7 running
+// agents (a control's, up to its leak point). One that stops running is a malfunction. If the
+// fixed run recorded stream failures, its stream stopped: the run FAILs on those errors and the
+// count is not a protocol break. Otherwise fewer than 7 streaming agents is inconclusive
+// (O-000279). An agent that is closed or errors changes the total or adds a lifecycle, which the
+// schema rejects.
+function runningProblems(series, loadEnd, { control, windowEnd, streamFailed }) {
+  const observed = [...series.map((s) => s.rec), ...(loadEnd?.agents ? [loadEnd] : [])];
+  const judged = control ? observed.filter((x) => x.elapsed <= windowEnd) : observed;
+  const off = judged.filter((x) => x.agents.byLifecycle.running !== EXPECTED_FIXTURE.running);
+  if (off.length === 0 || (!control && streamFailed)) return [];
+  return [
+    `${off.length} observation(s) with running agents != ${EXPECTED_FIXTURE.running} (first at ${off[0].elapsed}s): fewer than 7 streaming agents`,
+  ];
+}
+
+// The worker does not come back after it exits: no record observes it afterwards. After the
+// harness's own stop only cleanup follows. After a death only cleanup follows, except in a control
+// whose leak point the death does not precede: there the driver's death path follows (the
+// failures the exit causes, the last minute bucket and the sample-less load-end, both closed at
+// load end).
+const DEATH_PATH = new Set(["rpc-error", "minute", "load-end", "cleanup"]);
+
+function afterExitProblems(records, r, { control, leak }) {
+  const exits = r.workerExits
+    .map((e) => ({ e, t: wallSeconds(e) }))
+    .filter((x) => x.t !== null)
+    .sort((a, b) => a.t - b.t);
+  if (exits.length === 0) return [];
+  const { e: exit, t: exitAt } = exits[0];
+  const deathPath =
+    control && exit.stopping !== true && leak.leakShown && leak.leakElapsed <= exit.elapsed;
+  const problems = [];
+  records.forEach((x, i) => {
+    const t = wallSeconds(x);
+    if (x === exit || t === null || t <= exitAt) return;
+    if (x.memory)
+      problems.push(
+        `record ${i + 1} (${x.stage}) observes the worker after its exit at ${exit.elapsed}s`,
+      );
+    else if (x.stage !== "cleanup" && !(deathPath && DEATH_PATH.has(x.stage)))
+      problems.push(`record ${i + 1} (${x.stage}) follows the worker's exit at ${exit.elapsed}s`);
+  });
+  return problems.length > 3
+    ? [...problems.slice(0, 3), `... and ${problems.length - 3} more record(s) after the exit`]
+    : problems;
 }
 
 // The load's heap series: every sample, then the load-end sample when it has a heap.
@@ -989,6 +1032,7 @@ export function analyze(records, options = {}) {
   // A control that shows the leak is judged through its leak point; every other run through the
   // full four hours and its rest.
   const full = !leak.leakShown;
+  const streamFailed = counters.streamErrors > 0;
   const windowEnd = full ? EXPECTED_SECONDS : leak.leakElapsed;
   const minuteCheck = minuteProblems(minutes, windowEnd, full);
 
@@ -1003,7 +1047,9 @@ export function analyze(records, options = {}) {
     ...clockProblems(records, r, lastMinuteRecord(r.minuteRecords)),
     ...counterProblems(r),
     ...stopProblems(r),
-    ...deliveryProblems(r.loadEnd, series, windowEnd, full),
+    ...afterExitProblems(records, r, { control, leak }),
+    ...runningProblems(series, r.loadEnd, { control, windowEnd, streamFailed }),
+    ...deliveryProblems(r.loadEnd, series, windowEnd, full, !control && streamFailed),
     ...(full ? phaseProblems(r) : []),
     ...(control ? controlProblems({ series, counters, ...r, windowEnd }) : []),
   ];
