@@ -115,7 +115,7 @@ function buildRun(overrides = {}) {
       ...structuredClone(final),
       minutes: minutes.length,
       errorsByKind: zeroErrors(),
-      ...observation(heapAt(SECONDS)),
+      ...observation(heapAt(loadEnd)),
     });
     const restEnd = loadEnd + GC_SAMPLE_SECONDS + REST_SLEEP_SECONDS + GC_SAMPLE_SECONDS;
     records.push({
@@ -123,7 +123,7 @@ function buildRun(overrides = {}) {
       stage: "post-rest",
       elapsed: restEnd,
       ...structuredClone(final),
-      ...observation(o.postRestHeapMiB ?? heapAt(SECONDS)),
+      ...observation(o.postRestHeapMiB ?? heapAt(loadEnd)),
     });
     records.push({ time: wall(restEnd + 0.5), stage: "cleanup", ...structuredClone(final) });
   }
@@ -925,6 +925,14 @@ test("audit: a minute index far past the load is malformed and does not stall th
   const r = flat();
   minutesOf(r)[239].index = 1e12;
   assertInconclusive(r, /1 minute bucket\(s\) without an index/);
+});
+
+test("audit: a full run's load-end without its minutes or errors by kind is inconclusive", () => {
+  for (const field of ["minutes", "errorsByKind"]) {
+    const r = flat();
+    delete one(r, "load-end")[field];
+    assertInconclusive(r, new RegExp(`load-end without ${field}`));
+  }
 });
 
 test("audit: a counter that is present but not a count is inconclusive", () => {

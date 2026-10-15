@@ -540,7 +540,9 @@ function loadEndProblems(loadEnd) {
   else if (Math.abs(loadEnd.elapsed - EXPECTED_SECONDS) > TOLERANCE_SECONDS)
     problems.push(`load ran ${loadEnd.elapsed.toFixed(1)}s, expected ${EXPECTED_SECONDS}s`);
   if (heapOf(loadEnd) === null) problems.push("load-end has no heapUsed");
-  const absent = [...RECORD_COUNTERS, "byKind"].filter((f) => isAbsent(loadEnd[f]));
+  const absent = [...RECORD_COUNTERS, "byKind", "minutes", "errorsByKind"].filter((f) =>
+    isAbsent(loadEnd[f]),
+  );
   if (absent.length > 0) problems.push(`load-end without ${absent.join(", ")}`);
   return problems;
 }
