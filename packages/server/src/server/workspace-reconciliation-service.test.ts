@@ -19,6 +19,15 @@ import {
   type ReconciliationChange,
   WorkspaceReconciliationService,
 } from "./workspace-reconciliation-service.js";
+import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
+import { DEFAULT_GIT_PROCESS_POLICY } from "../utils/git-process-scheduler.js";
+import {
+  configureGitProcessPolicy,
+  getGitCommandMetrics,
+  runGitCommand,
+  startGitCommandMetrics,
+  stopGitCommandMetrics,
+} from "../utils/run-git-command.js";
 import { deriveProjectKey } from "./project-key.js";
 
 function canonicalLocalProjectKey(rootPath: string): string {
@@ -404,6 +413,82 @@ describe("WorkspaceReconciliationService cache", () => {
     git.invalidate(cwds[0]!);
     await service.reconcileGitMetadata();
     expect(git.reads).toEqual([cwds[0]!]);
+  });
+
+  test("a real full queue defers the sweep instead of caching and persisting non-Git", async () => {
+    const projectRoot = realpathSync(mkdtempSync(path.join(tmpdir(), "reconcile-full-queue-")));
+    tempDirs.push(projectRoot);
+    execFileSync("git", ["-c", "core.hooksPath=/dev/null", "init", "-b", "main"], {
+      cwd: projectRoot,
+      stdio: "ignore",
+    });
+    const { projects, projectRegistry, workspaceRegistry } = createTestRegistries();
+    projects.set(
+      "p1",
+      createPersistedProjectRecord({
+        projectId: "p1",
+        rootPath: projectRoot,
+        kind: "git",
+        displayName: "full-queue",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    // The real Git service over a real repository: the scheduler at one slot
+    // and one queued command, held by foreground work, is the live shape of a
+    // queue an agent's commands filled.
+    const git = new WorkspaceGitServiceImpl({
+      logger: createTestLogger(),
+      paseoHome: path.join(projectRoot, "paseo-home"),
+    });
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      workspaceGitService: git,
+    });
+    configureGitProcessPolicy({
+      maxProcessesPerSecond: 10_000,
+      maxProcessConcurrency: 1,
+      maxQueueDepth: 1,
+    });
+    startGitCommandMetrics();
+    const hold = runGitCommand(["-c", "alias.reconcileHold=!sleep 0.3", "reconcileHold"], {
+      cwd: projectRoot,
+    });
+    while (getGitCommandMetrics().active !== 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const queued = runGitCommand(["rev-parse", "--show-toplevel"], { cwd: projectRoot });
+    expect(getGitCommandMetrics().pending).toBe(1);
+
+    try {
+      const tick = await service.reconcileGitMetadata();
+      const cachedDuringQueue = git.peekCachedCheckout(projectRoot);
+      const kindDuringQueue = (await projectRegistry.get("p1"))!.kind;
+
+      // The queue drains; the next read classifies the real repository.
+      await Promise.all([hold, queued]);
+      const postDrain = await git.getCheckout(projectRoot);
+      const nextTick = await service.reconcileGitMetadata();
+
+      // The sweep yields: the deferral is reported, nothing is cached, and the
+      // persisted project kind is untouched - never a real repository
+      // misclassified as non-Git for as long as the record lives.
+      expect(tick.deferred).toBe(true);
+      expect(tick.changesApplied).toEqual([]);
+      expect(cachedDuringQueue).toBeNull();
+      expect(kindDuringQueue).toBe("git");
+      expect(postDrain.isGit).toBe(true);
+      expect(nextTick.deferred).toBe(false);
+      expect((await projectRegistry.get("p1"))!.kind).toBe("git");
+    } finally {
+      await Promise.all([hold, queued]).catch(() => {});
+      service.dispose();
+      await git.dispose();
+      stopGitCommandMetrics();
+      configureGitProcessPolicy(DEFAULT_GIT_PROCESS_POLICY);
+    }
   });
 });
 

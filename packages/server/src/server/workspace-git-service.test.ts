@@ -663,6 +663,40 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("an unobserved slow read begun before an invalidation never overwrites a newer read", async () => {
+    // No workspace target ever observes this cwd: the client status path is its
+    // only reader. The invalidation identity must not depend on a target
+    // existing, or a slow read captured before the invalidation can publish
+    // over the fresh read that completed after it.
+    const oldRead = createDeferred<CheckoutStatusGit>();
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { currentBranch: "fresh" }),
+    );
+    getCheckoutStatus.mockImplementationOnce(async () => oldRead.promise);
+    const service = createService({ getCheckoutStatus });
+
+    // The status read starts and hangs.
+    const pending = service.getCheckout(REPO_CWD);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+
+    // The cwd is invalidated while the slow read is out; a second read goes
+    // live and completes with the current facts.
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+    expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch).toBe("fresh");
+
+    // The slow read resolves with the retired facts. It must be discarded, so
+    // both the next client call and the reconciliation sweep keep reading the
+    // fresh entry.
+    oldRead.resolve(createCheckoutStatus(REPO_CWD, { currentBranch: "obsolete" }));
+    await pending;
+
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+    expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch).toBe("fresh");
+
+    service.dispose();
+  });
+
   test("bounds refresh generations and re-enqueues hot workspace successors fairly", async () => {
     const hotCwds = Array.from({ length: WORKSPACE_GIT_REFRESH_CONCURRENCY }, (_, index) =>
       path.resolve(`/tmp/hot-repo-${index}`),
