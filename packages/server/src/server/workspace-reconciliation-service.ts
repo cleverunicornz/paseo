@@ -87,7 +87,8 @@ export interface WorkspaceReconciliationServiceOptions {
   workspaceRegistry: WorkspaceRegistry;
   logger: pino.Logger;
   onChanges?: (changes: ReconciliationChange[]) => void;
-  workspaceGitService?: Pick<WorkspaceGitService, "getCheckout">;
+  workspaceGitService?: Pick<WorkspaceGitService, "getCheckout"> &
+    Partial<Pick<WorkspaceGitService, "peekCachedCheckout">>;
   onProjectUpdate?: (update: ProjectUpdate) => void;
   onWorkspaceArchived?: (workspaceId: string) => void | Promise<void>;
   onWorkspacesChanged?: (workspaceIds: string[]) => Promise<void>;
@@ -118,7 +119,10 @@ export class WorkspaceReconciliationService {
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly logger: pino.Logger;
   private readonly onChanges: ((changes: ReconciliationChange[]) => void) | null;
-  private readonly workspaceGitService: Pick<WorkspaceGitService, "getCheckout"> | null;
+  private readonly workspaceGitService:
+    | (Pick<WorkspaceGitService, "getCheckout"> &
+        Partial<Pick<WorkspaceGitService, "peekCachedCheckout">>)
+    | null;
   private readonly onProjectUpdate: ((update: ProjectUpdate) => void) | null;
   private readonly onWorkspaceArchived: ((workspaceId: string) => void | Promise<void>) | null;
   private readonly onWorkspacesChanged: ((workspaceIds: string[]) => Promise<void>) | null;
@@ -523,6 +527,10 @@ export class WorkspaceReconciliationService {
   }
 
   private async readCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
+    const cached = this.peekCachedCheckout(cwd);
+    if (cached) {
+      return cached;
+    }
     if (!this.workspaceGitService) {
       return {
         cwd,
@@ -535,6 +543,15 @@ export class WorkspaceReconciliationService {
       };
     }
     return this.workspaceGitService.getCheckout(cwd);
+  }
+
+  /**
+   * The warmed checkout for a cwd, when the Git service exposes one. A cache
+   * miss or a service without the peek falls through to a live read, so the
+   * sweep stays correct for a directory nothing has observed yet.
+   */
+  private peekCachedCheckout(cwd: string): ProjectCheckoutLitePayload | null {
+    return this.workspaceGitService?.peekCachedCheckout?.(cwd) ?? null;
   }
 
   private inspectDirectory(targetPath: string): DirectoryState {

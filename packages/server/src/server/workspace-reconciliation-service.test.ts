@@ -231,6 +231,182 @@ function createTempGitRepo(prefix: string): string {
 
 const timestamp = "2025-01-01T00:00:00.000Z";
 
+class CachedCheckouts {
+  readonly reads: string[] = [];
+  private readonly checkouts = new Map<string, ProjectCheckoutLitePayload>();
+
+  set(cwd: string, checkout: ProjectCheckoutLitePayload): void {
+    this.checkouts.set(cwd, checkout);
+  }
+
+  invalidate(cwd: string): void {
+    this.checkouts.delete(cwd);
+  }
+
+  async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
+    this.reads.push(cwd);
+    return this.checkouts.get(cwd) ?? createCheckout(cwd);
+  }
+
+  peekCachedCheckout(cwd: string): ProjectCheckoutLitePayload | null {
+    return this.checkouts.get(cwd) ?? null;
+  }
+}
+
+describe("WorkspaceReconciliationService cache", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of tempDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    tempDirs.length = 0;
+  });
+
+  function seedManyWorkspaces(workspaceCount: number) {
+    const projectRoot = realpathSync(mkdtempSync(path.join(tmpdir(), "reconcile-cache-project-")));
+    tempDirs.push(projectRoot);
+    const { projects, projectRegistry, workspaceRegistry } = createTestRegistries();
+    projects.set(
+      "p1",
+      createPersistedProjectRecord({
+        projectId: "p1",
+        rootPath: projectRoot,
+        kind: "git",
+        displayName: "cached",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    const cwds: string[] = [];
+    for (let index = 0; index < workspaceCount; index += 1) {
+      const cwd = path.join(projectRoot, `ws-${index}`);
+      mkdirSync(cwd, { recursive: true });
+      cwds.push(cwd);
+      const record = createPersistedWorkspaceRecord({
+        workspaceId: `w${index}`,
+        projectId: "p1",
+        cwd,
+        kind: "worktree",
+        displayName: `ws-${index}`,
+        branch: "main",
+        worktreeRoot: cwd,
+        mainRepoRoot: projectRoot,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+      workspaceRegistry.upsert(record);
+    }
+    return { projectRoot, cwds, projectRegistry, workspaceRegistry };
+  }
+
+  test("a sweep over many workspaces issues no Git read when the cache is warm", async () => {
+    const { projectRoot, cwds, projectRegistry, workspaceRegistry } = seedManyWorkspaces(50);
+    const git = new CachedCheckouts();
+    git.set(
+      projectRoot,
+      createCheckout(projectRoot, {
+        isGit: true,
+        currentBranch: "main",
+        worktreeRoot: projectRoot,
+      }),
+    );
+    for (const cwd of cwds) {
+      git.set(
+        cwd,
+        createCheckout(cwd, {
+          isGit: true,
+          currentBranch: "main",
+          worktreeRoot: cwd,
+          mainRepoRoot: projectRoot,
+        }),
+      );
+    }
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      workspaceGitService: git,
+    });
+
+    await service.reconcileGitMetadata();
+
+    // 50 workspaces + 1 project, all warm: no Git command is issued at all.
+    expect(git.reads).toEqual([]);
+  });
+
+  test("a warm cache miss falls back to a live Git read", async () => {
+    const { projectRoot, cwds, projectRegistry, workspaceRegistry } = seedManyWorkspaces(3);
+    const git = new CachedCheckouts();
+    git.set(
+      projectRoot,
+      createCheckout(projectRoot, {
+        isGit: true,
+        currentBranch: "main",
+        worktreeRoot: projectRoot,
+      }),
+    );
+    // Only the first workspace is warm; the other two must be read.
+    git.set(
+      cwds[0]!,
+      createCheckout(cwds[0]!, {
+        isGit: true,
+        currentBranch: "main",
+        worktreeRoot: cwds[0]!,
+        mainRepoRoot: projectRoot,
+      }),
+    );
+
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      workspaceGitService: git,
+    });
+
+    await service.reconcileGitMetadata();
+
+    expect(git.reads.toSorted()).toEqual([cwds[1], cwds[2]].toSorted());
+  });
+
+  test("an event that changes a workspace's facts invalidates its cached checkout", async () => {
+    const { projectRoot, cwds, projectRegistry, workspaceRegistry } = seedManyWorkspaces(1);
+    const git = new CachedCheckouts();
+    git.set(
+      projectRoot,
+      createCheckout(projectRoot, {
+        isGit: true,
+        currentBranch: "main",
+        worktreeRoot: projectRoot,
+      }),
+    );
+    git.set(
+      cwds[0]!,
+      createCheckout(cwds[0]!, {
+        isGit: true,
+        currentBranch: "main",
+        worktreeRoot: cwds[0]!,
+        mainRepoRoot: projectRoot,
+      }),
+    );
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      workspaceGitService: git,
+    });
+
+    await service.reconcileGitMetadata();
+    expect(git.reads).toEqual([]);
+
+    // The workspace's branch changed; the cache entry is dropped and the next
+    // sweep reads Git again for the same cwd.
+    git.invalidate(cwds[0]!);
+    await service.reconcileGitMetadata();
+    expect(git.reads).toEqual([cwds[0]!]);
+  });
+});
+
 describe("WorkspaceReconciliationService", () => {
   const tempDirs: string[] = [];
 

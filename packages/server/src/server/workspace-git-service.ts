@@ -210,6 +210,7 @@ export interface WorkspaceGitService {
 
   onSnapshotUpdated(listener: WorkspaceGitSnapshotUpdatedListener): WorkspaceGitSubscription;
   peekSnapshot(cwd: string): WorkspaceGitRuntimeSnapshot | null;
+  peekCachedCheckout(cwd: string): ProjectCheckoutLitePayload | null;
   getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload>;
   getSnapshot(
     cwd: string,
@@ -434,6 +435,13 @@ interface WorkspaceGitTarget {
   latestSnapshotLoadedAtMs: number | null;
   latestFacts: CheckoutSnapshotFacts | null;
   factsPromise: Promise<CheckoutSnapshotFacts> | null;
+  /**
+   * The last lite checkout derived from a completed refresh, or null when the
+   * cached facts have been invalidated. A five-minute reconciliation sweep of a
+   * large estate once re-derived this with 6-12 Git processes per workspace and
+   * queued hundreds of commands; the sweep reads this instead.
+   */
+  cachedCheckout: ProjectCheckoutLitePayload | null;
   latestFingerprint: string | null;
   lastShellOutAtMs: number | null;
   repoGitRoot: string | null;
@@ -789,6 +797,20 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return this.workspaceTargets.get(cwd)?.latestSnapshot ?? null;
   }
 
+  /**
+   * The last completed lite checkout for a warmed workspace, or null when there
+   * is none (no target, or invalidated since the last refresh). Reads nothing
+   * from Git, so a whole-estate sweep costs no processes beyond the refreshes
+   * the workspace's own events already schedule.
+   */
+  peekCachedCheckout(cwd: string): ProjectCheckoutLitePayload | null {
+    const target = this.workspaceTargets.get(resolve(cwd));
+    if (!target || target.closed) {
+      return null;
+    }
+    return target.cachedCheckout;
+  }
+
   async getCheckoutDiff(
     cwd: string,
     options: CheckoutDiffCompare,
@@ -997,6 +1019,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (!target || target.closed) {
       return;
     }
+    // The cached lite checkout may be stale now; the refresh below republishes it.
+    target.cachedCheckout = null;
     this.invalidateForge(normalizedCwd);
     this.scheduleWorkspaceRefresh(target, {
       force: true,
@@ -1199,6 +1223,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       latestSnapshotLoadedAtMs: null,
       latestFacts: null,
       factsPromise: null,
+      cachedCheckout: null,
       latestFingerprint: null,
       lastShellOutAtMs: null,
       repoGitRoot: null,
@@ -3258,7 +3283,36 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     const snapshot = this.combineSnapshot(target);
     target.latestSnapshotLoadedAtMs = this.deps.now().getTime();
+    this.cacheCheckoutFromLatestGit(target, snapshot.git);
     return snapshot;
+  }
+
+  /**
+   * Publish the lite checkout derived from the freshest facts this refresh
+   * established, so a later reconciliation sweep can read it without Git.
+   */
+  private cacheCheckoutFromLatestGit(
+    target: WorkspaceGitTarget,
+    git: WorkspaceGitRuntimeSnapshot["git"],
+  ): void {
+    target.cachedCheckout =
+      git.isGit && git.repoRoot
+        ? checkoutLiteFromGitSnapshot(target.cwd, {
+            isGit: true,
+            currentBranch: git.currentBranch,
+            remoteUrl: git.remoteUrl,
+            repoRoot: git.repoRoot,
+            isPaseoOwnedWorktree: git.isPaseoOwnedWorktree,
+            mainRepoRoot: git.mainRepoRoot,
+          })
+        : checkoutLiteFromGitSnapshot(target.cwd, {
+            isGit: false,
+            currentBranch: null,
+            remoteUrl: null,
+            repoRoot: null,
+            isPaseoOwnedWorktree: false,
+            mainRepoRoot: null,
+          });
   }
 
   private async refreshRefDerivedSnapshot(

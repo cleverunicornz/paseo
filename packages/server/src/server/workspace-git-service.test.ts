@@ -525,6 +525,56 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("caches the lite checkout from a refresh and drops it on a state change", async () => {
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const service = createService({ getCheckoutStatus });
+
+    expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "warm" });
+
+    const cached = service.peekCachedCheckout(REPO_CWD);
+    expect(cached).toMatchObject({
+      cwd: REPO_CWD,
+      isGit: true,
+      currentBranch: "main",
+      worktreeRoot: REPO_CWD,
+    });
+
+    // A state change (an external git mutation, a branch switch) invalidates it.
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+
+    // The next refresh republishes it.
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "re-warm" });
+    expect(service.peekCachedCheckout(REPO_CWD)).toEqual(cached);
+
+    service.dispose();
+  });
+
+  test("caches a plain directory as a non-Git lite checkout", async () => {
+    const getCheckoutStatus = vi.fn(async () => ({ isGit: false as const }));
+    const service = createService({ getCheckoutStatus });
+
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "plain-directory" });
+
+    expect(service.peekCachedCheckout(REPO_CWD)).toMatchObject({
+      cwd: REPO_CWD,
+      isGit: false,
+      worktreeRoot: null,
+    });
+
+    service.dispose();
+  });
+
+  test("a closed or unobserved workspace has no cached checkout", async () => {
+    const service = createService();
+
+    expect(service.peekCachedCheckout(join(REPO_CWD, "never-seen"))).toBeNull();
+
+    service.dispose();
+  });
+
   test("bounds refresh generations and re-enqueues hot workspace successors fairly", async () => {
     const hotCwds = Array.from({ length: WORKSPACE_GIT_REFRESH_CONCURRENCY }, (_, index) =>
       path.resolve(`/tmp/hot-repo-${index}`),
