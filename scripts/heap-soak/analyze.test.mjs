@@ -1218,6 +1218,42 @@ test("round 6 finding 5: an unknown stage named like a prototype member is a vio
   }
 });
 
+// --- Round 7: the client fixture holds through the load ------------------------------------
+//
+// The validator's real-writer reproduction: the two subscribed persistent clients drop after all
+// 13 connect, so the worker observes 11 client sockets and one subscription (the daemon's own
+// persistence listener) from the baseline on, with no RPC error.
+
+function dropClients(r, fromElapsed) {
+  const observations = [r[0].baseline, ...r.filter((x) => x.memory && x !== r[0])];
+  for (const o of observations) {
+    if ((o === r[0].baseline ? 0 : o.elapsed) < fromElapsed) continue;
+    o.handles.TCPSocketWrap = 11;
+    o.agents.subscriptionCount = 1;
+  }
+  return r;
+}
+
+test("round 7 finding 1: a run that loses its two subscribed clients is inconclusive", () => {
+  // From the baseline on, as in the validator's control series (heap-limit abort at 1321 s).
+  assertInconclusive(
+    dropClients(abortControl(), 0),
+    /observation\(s\) without the client fixture of 13 persistent clients, 2 subscribed \(first: baseline at 0s: 11 socket\(s\), 1 subscription\(s\)/,
+    { control: true },
+  );
+  // Mid-run, in a fixed run: from 7200 s to the end of load.
+  assertInconclusive(
+    dropClients(flat(), 7200),
+    /241 observation\(s\) without the client fixture .* \(first: sample at 7200.011s/,
+  );
+  // A control's fixture matters up to its leak point only (leakingControl leaks at 1770 s).
+  assert.equal(verdictOf(dropClients(leakingControl(), 3000), { control: true }), "pass");
+  // A client socket still closing at a sample is not a drop.
+  const r = flat();
+  sampleAt(r, 100).handles.TCPSocketWrap = 14;
+  assert.equal(verdictOf(r), "pass");
+});
+
 // --- Audit: anything absent, duplicated or contradictory is never PASS ----------------------
 
 test("audit: a header whose control flag contradicts the mode is inconclusive", () => {
