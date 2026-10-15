@@ -197,10 +197,10 @@ jobs:
   server-unit:
     # The server's unit suite. It starts on the smallest test set, automation-test-s, per the
     # ci-runners ladder; a job moves up only after a memory kill on the smaller set, proven by
-    # the container's OOMKilled reason or a cgroup OOM event, never by estimate. The suite's
-    # subprocess-heavy git and agent files set its peak, not the worker count, so it runs one
-    # worker. On the container that peaked at 4.23 GiB PSS (4.69 GiB summed RSS), inside this
-    # set's 5 GiB pod budget; a memory kill here is the signal to reconsider the width.
+    # the container's OOMKilled reason or a cgroup OOM event, never by estimate. One worker: the
+    # suite's subprocess-heavy git and agent files set its peak, not the worker count, and it
+    # fits — this job passes 6197 tests on automation-test-s with no memory kill. A kill here is
+    # the signal to reconsider the width, not the set.
     runs-on: { group: ci, labels: automation-test-s }
     permissions:
       contents: read
