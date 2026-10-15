@@ -48,7 +48,7 @@ jobs:
           tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
           echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
       - name: Check the release rules
-        run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs
+        run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs scripts/check-managed-update-anchors.test.mjs
       - name: Check the release tag
         # The pre-build guard, ahead of npm ci and every build step: the repository, the ref,
         # the tag's shape and its base version. A dispatch in a fork, or a tag the line does
@@ -76,31 +76,22 @@ jobs:
           npm run format:check
       - name: Check the managed-update anchors
         # runner-images images/repo-pod/paseo-managed-update.mjs edits two exact anchors in the
-        # built server and fails its image build if either is not found exactly once. The built
-        # files must equal upstream 0.11.2's byte for byte, so this job fetches the published
-        # tarball, checks its sha256 against runner-images' pin, and compares both anchored
-        # files. A CLI-body change the consumer would refuse fails here.
+        # built server and fails its image build if either is not found exactly once. Its CLI
+        # anchor is the whole installLatest body, not the signature, so the built files must
+        # equal upstream 0.11.2's byte for byte. This job fetches the published tarball, checks
+        # its sha256 against runner-images' pin, and compares both anchored files. A CLI-body
+        # change the consumer would refuse fails here; the checker's rules have their own tests.
         shell: bash
         run: |
           set -euo pipefail
           server=packages/server/dist/server/server
-          count_cli="$(grep -c 'installLatest(options = {})' "$server/session/daemon/npm-global-cli.js" || true)"
-          test "$count_cli" = 1
-          count_update="$(grep -c 'daemonSelfUpdate: this.daemonRuntimeConfig?.desktopManaged !== true,' "$server/websocket-server.js" || true)"
-          test "$count_update" = 1
-          # No version is baked in: the console reads it from package.json at runtime.
-          test "$(grep -c '0\.11\.2' "$server/session/daemon/npm-global-cli.js" || true)" = 0
-          test "$(grep -c '0\.11\.2' "$server/websocket-server.js" || true)" = 0
-          # Byte-identity to the upstream tarball the runner-images pin names, both files.
           upstream="$RUNNER_TEMP/upstream"
           mkdir -p "$upstream"
           curl --fail --location --silent --show-error --output "$upstream/server.tgz" \
             "https://registry.npmjs.org/@getpaseo/server/-/server-0.11.2.tgz"
           echo '7a727fcbb8f96ff044d4a60526af8b0f6adce2c827dc74b4bd75677e97798a50  '"$upstream/server.tgz" | sha256sum --check
           tar -xzf "$upstream/server.tgz" -C "$upstream"
-          for file in session/daemon/npm-global-cli.js websocket-server.js; do
-            cmp "$upstream/package/dist/server/server/$file" "$server/$file"
-          done
+          node scripts/check-managed-update-anchors.mjs "$server" "$upstream/package/dist/server/server"
       - name: Set the release version
         # Every workspace package takes the tag's version before packing (P-000269 H2). The
         # repo's own sync script rewrites the packages' internal dependency ranges too, so the

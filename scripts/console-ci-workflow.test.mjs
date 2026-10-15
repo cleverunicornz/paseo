@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { ANCHORED_FILES, ANCHORS } from "./check-managed-update-anchors.mjs";
 
 const workflow = readFileSync(
   new URL("../.github/workflows/console-ci.yml", import.meta.url),
@@ -55,7 +56,7 @@ test("the release scripts are tested on every run", () => {
   const check = step("Check the release rules");
   assert.match(
     check.text,
-    /node --test scripts\/console-release-channel\.test\.mjs scripts\/console-ci-workflow\.test\.mjs/,
+    /node --test scripts\/console-release-channel\.test\.mjs scripts\/console-ci-workflow\.test\.mjs scripts\/check-managed-update-anchors\.test\.mjs/,
   );
   assert.doesNotMatch(check.text, /\n {8}if:/);
 });
@@ -140,24 +141,25 @@ test("the managed-update anchors are checked against upstream's own bytes", () =
   // runner-images images/repo-pod/paseo-managed-update.mjs edits two exact anchors in the
   // built server and fails its image build if either is not found once, or if the CLI body
   // around its anchor has moved. So this job compares both built files to the upstream
-  // tarball the runner-images pin names, not just the anchor strings.
+  // tarball the runner-images pin names, not just the anchor strings. The rules and their
+  // anchors live in the checker, which has its own tests.
   const anchors = step("Check the managed-update anchors");
   assert.ok(stepIndex("Build daemon and CLI") < stepIndex("Check the managed-update anchors"));
+  // The checker requires both files and both anchors, as the consumer does.
+  assert.deepEqual(Object.keys(ANCHORS).sort(), ANCHORED_FILES.slice().sort());
   for (const anchor of [
     "installLatest(options = {})",
-    "npm-global-cli.js",
     "daemonSelfUpdate: this.daemonRuntimeConfig?.desktopManaged !== true,",
-    "websocket-server.js",
   ]) {
-    assert.ok(anchors.text.includes(anchor), `anchor ${anchor}`);
+    assert.ok(Object.values(ANCHORS).includes(anchor), `anchor ${anchor}`);
   }
-  // It fetches upstream's tarball, checks its pinned sha256, and compares both files.
+  // It fetches upstream's tarball, checks its pinned sha256, and runs the checker.
   assert.match(anchors.text, /registry\.npmjs\.org\/@getpaseo\/server\/-\/server-0\.11\.2\.tgz/);
   assert.match(anchors.text, /7a727fcbb8f96ff044d4a60526af8b0f6adce2c827dc74b4bd75677e97798a50/);
   assert.match(anchors.text, /sha256sum --check/);
   assert.match(
     flat(anchors.text),
-    /for file in session\/daemon\/npm-global-cli\.js websocket-server\.js; do cmp "\$upstream\/package\/dist\/server\/server\/\$file" "\$server\/\$file"/,
+    /node scripts\/check-managed-update-anchors\.mjs "\$server" "\$upstream\/package\/dist\/server\/server"/,
   );
 });
 
