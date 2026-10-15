@@ -14,11 +14,17 @@ const RATE = 27;
 const MIX = { logs: 15, inspect: 9, ls: 2, send: 1 };
 // The offsets a real run shows (the 2026-10-14 23:48Z runs): a sample lands a few milliseconds
 // after its 30-second slot, a call a few milliseconds after its schedule, the load ends just past
-// 14,400 s, and the post-rest record follows two forced-GC passes and the 300-second rest.
+// 14,400 s, and each forced-GC sample takes about 0.7 s (its record's wall-clock `time` follows its
+// `elapsed` by that much). The driver logs load-end after its forced-GC sample, sleeps the
+// 300-second rest, then takes the post-rest sample and logs it.
 const SAMPLE_OFFSET = 0.011;
 const CALL_OFFSET = 0.004;
 const LOAD_END_OFFSET = 0.05;
-const REST_ELAPSED = 301.2;
+const GC_SAMPLE_SECONDS = 0.7;
+const REST_SLEEP_SECONDS = 300;
+const LOAD_START_MS = Date.UTC(2026, 9, 14, 23, 48, 25, 478);
+// A record's wall-clock `time` at this many seconds after the load started.
+const wall = (seconds) => new Date(LOAD_START_MS + Math.round(seconds * 1000)).toISOString();
 
 const DEFAULTS = {
   baselineMiB: 200,
@@ -78,6 +84,7 @@ function buildRun(overrides = {}) {
       next++;
     }
     records.push({
+      time: wall(t + GC_SAMPLE_SECONDS),
       stage: "sample",
       elapsed: t,
       ...counters(counted, scheduledChunks(t), 0),
@@ -93,19 +100,27 @@ function buildRun(overrides = {}) {
   } else {
     const final = counters(total, scheduledChunks(loadEnd - 0.1), 0);
     records.push({
+      time: wall(loadEnd + GC_SAMPLE_SECONDS),
       stage: "load-end",
       elapsed: loadEnd,
       ...structuredClone(final),
       minutes: minutes.length,
       ...observation(heapAt(SECONDS)),
     });
+    const restEnd = loadEnd + GC_SAMPLE_SECONDS + REST_SLEEP_SECONDS + GC_SAMPLE_SECONDS;
     records.push({
+      time: wall(restEnd),
       stage: "post-rest",
-      elapsed: loadEnd + REST_ELAPSED,
+      elapsed: restEnd,
       ...structuredClone(final),
       ...observation(o.postRestHeapMiB ?? heapAt(SECONDS)),
     });
-    records.push({ stage: "cleanup", removed: true, ...structuredClone(final) });
+    records.push({
+      time: wall(restEnd + 0.5),
+      stage: "cleanup",
+      removed: true,
+      ...structuredClone(final),
+    });
   }
   return records;
 }
@@ -123,6 +138,7 @@ function counters(counted, streamChunks, streamErrors) {
 
 function buildHeader(o) {
   return {
+    time: wall(0),
     stage: "baseline",
     label: o.control ? "A-unfixed" : "B-fixed",
     control: o.control,
@@ -158,6 +174,7 @@ function buildMinutes(calls, loadEnd) {
     while (buckets.length <= index) {
       const i = buckets.length;
       buckets.push({
+        time: wall((i + 1) * 60 + CALL_OFFSET), // closed when the next minute's first call lands
         stage: "minute",
         index: i,
         elapsedStart: i * 60,
@@ -170,12 +187,14 @@ function buildMinutes(calls, loadEnd) {
     buckets[index].calls++;
   }
   buckets.at(-1).elapsedEnd = loadEnd;
+  buckets.at(-1).time = wall(loadEnd);
   return buckets;
 }
 
 function buildDeath(deathAt, total, minutes, loadEnd) {
   const records = [
     {
+      time: wall(deathAt),
       stage: "worker-exit",
       elapsed: deathAt,
       code: null,
@@ -189,16 +208,35 @@ function buildDeath(deathAt, total, minutes, loadEnd) {
   // null"); every later RPC fails at once ("worker dead").
   for (let i = 0; i < 7; i++) {
     const message = i === 0 ? "worker exit null" : "worker dead";
-    records.push({ stage: "rpc-error", elapsed: deathAt - 0.16, kind: "stream", message });
+    const exitTime = wall(deathAt);
+    records.push({
+      time: exitTime,
+      stage: "rpc-error",
+      elapsed: deathAt - 0.16,
+      kind: "stream",
+      message,
+    });
   }
-  records.push({ stage: "rpc-error", elapsed: loadEnd, kind: "sample", message: "worker dead" });
+  const time = wall(loadEnd);
+  records.push({
+    time,
+    stage: "rpc-error",
+    elapsed: loadEnd,
+    kind: "sample",
+    message: "worker dead",
+  });
   const final = {
     ...counters(total, scheduledChunks(deathAt - 0.3), 7),
     rpcErrors: 8,
     workerDeaths: 1,
   };
-  records.push({ stage: "load-end", elapsed: loadEnd, ...structuredClone(final), minutes });
-  records.push({ stage: "cleanup", removed: true, ...structuredClone(final) });
+  records.push({ time, stage: "load-end", elapsed: loadEnd, ...structuredClone(final), minutes });
+  records.push({
+    time: wall(loadEnd + REST_SLEEP_SECONDS + 15),
+    stage: "cleanup",
+    removed: true,
+    ...structuredClone(final),
+  });
   return records;
 }
 
@@ -206,6 +244,16 @@ const samplesOf = (r) => r.filter((x) => x.stage === "sample");
 const minutesOf = (r) => r.filter((x) => x.stage === "minute");
 const sampleAt = (r, slot) => samplesOf(r).find((x) => Math.floor(x.elapsed / 30) === slot);
 const one = (r, stage) => r.find((x) => x.stage === stage);
+// Set the rest as the driver would record it: the load-end record logged `loadEndSample` seconds
+// after the load end (its forced-GC sample), the post-rest record `rest` seconds after that.
+function withRest(r, rest, loadEndSample = GC_SAMPLE_SECONDS) {
+  const end = one(r, "load-end");
+  const post = one(r, "post-rest");
+  end.time = wall(end.elapsed + loadEndSample);
+  post.elapsed = end.elapsed + loadEndSample + rest;
+  post.time = wall(post.elapsed);
+  return r;
+}
 const flat = () => buildRun({ postRestHeapMiB: 199 });
 // A control that rises 510,000,000 bytes over its first 30 minutes and stays there.
 const leakingControl = (extra = {}) =>
@@ -340,9 +388,7 @@ test("round 1 finding 3: missing samples and short phases are inconclusive", () 
   one(r, "load-end").elapsed = 14375;
   one(r, "post-rest").elapsed = 14675;
   assertInconclusive(r, /load ran 14375.0s, expected 14400s/);
-  r = flat();
-  one(r, "post-rest").elapsed = 14675;
-  assertInconclusive(r, /rest ran 275.0s, expected 300s/);
+  assertInconclusive(withRest(flat(), 275), /rest ran 275.0s, expected 300s/);
 });
 
 test("round 1 finding 6: samples without an observed running count are inconclusive", () => {
@@ -517,9 +563,7 @@ test("round 2 finding 7: a last-hour rise without a load-end record does not pas
 // --- Round 3 finding 1 (analyze.mjs:482): the rest is 300 s, within 2 s ---------------------
 
 test("round 3 finding 1: a 330-second rest is inconclusive", () => {
-  const r = flat();
-  one(r, "post-rest").elapsed = one(r, "load-end").elapsed + 330;
-  assertInconclusive(r, /rest ran 330.0s, expected 300s/);
+  assertInconclusive(withRest(flat(), 330), /rest ran 330.0s, expected 300s/);
 });
 
 test("round 3 finding 1: the rest bound is 298 to 302 seconds", () => {
@@ -529,10 +573,52 @@ test("round 3 finding 1: the rest bound is 298 to 302 seconds", () => {
     [301.9, "pass"],
     [302.1, "inconclusive"],
   ]) {
-    const r = flat();
-    one(r, "post-rest").elapsed = one(r, "load-end").elapsed + rest;
-    assert.equal(verdictOf(r), verdict, String(rest));
+    assert.equal(verdictOf(withRest(flat(), rest)), verdict, String(rest));
   }
+});
+
+// --- Lead decision: the rest is measured on the records' wall clock ------------------------
+//
+// From the load-end record (logged after its forced-GC sample) to the post-rest record, by their
+// `time` fields, within 300 s ± 2 s. The load-end sample's own GC time is measurement, not rest.
+
+test("rest on the wall clock: a 297-second rest is inconclusive", () => {
+  assertInconclusive(withRest(flat(), 297), /rest ran 297.0s, expected 300s/);
+});
+
+test("rest on the wall clock: a 303-second rest is inconclusive", () => {
+  assertInconclusive(withRest(flat(), 303), /rest ran 303.0s, expected 300s/);
+});
+
+test("rest on the wall clock: a 301.4-second rest after 2.7 s of GC sample time passes", () => {
+  const result = analyze(withRest(flat(), 301.4, 2.7));
+  assert.equal(result.verdict, "pass", JSON.stringify(result.inconclusive));
+  assert.equal(result.numbers.restSeconds.toFixed(1), "301.4");
+  assert.equal(result.numbers.restElapsedSeconds.toFixed(1), "304.1");
+});
+
+test("rest on the wall clock: an absent or unparseable time on load-end or post-rest is inconclusive", () => {
+  for (const [stage, value] of [
+    ["load-end", undefined],
+    ["post-rest", undefined],
+    ["load-end", "not a time"],
+    ["post-rest", 14701.4],
+  ]) {
+    const r = flat();
+    if (value === undefined) delete one(r, stage).time;
+    else one(r, stage).time = value;
+    assertInconclusive(r, /no parseable time: the rest is not observed/);
+  }
+});
+
+test("rest on the wall clock: elapsed and time that disagree by a sample period are inconclusive", () => {
+  // The round-3 probe's shape: post-rest elapsed 330 s after load end, its time 300 s after the
+  // load-end record; the load-end sample would have taken 30 s.
+  const r = withRest(flat(), 300, 0);
+  one(r, "post-rest").elapsed += 30;
+  assertInconclusive(r, /the load-end sample took 30.0s by its elapsed and time/);
+  // And a load-end record logged before the load end it records.
+  assertInconclusive(withRest(flat(), 300, -1), /the load-end sample took -1.0s by its elapsed/);
 });
 
 // --- Round 3 finding 2 (analyze.mjs:550): every control error up to the leak point counts ---
@@ -699,9 +785,7 @@ test("audit: calls during the rest are inconclusive", () => {
 });
 
 test("audit: a rest far longer than five minutes is inconclusive", () => {
-  const r = flat();
-  one(r, "post-rest").elapsed += 3 * 3600;
-  assertInconclusive(r, /rest ran 11101.2s, expected 300s/);
+  assertInconclusive(withRest(flat(), 300 + 3 * 3600), /rest ran 11100.0s, expected 300s/);
 });
 
 test("audit: an RPC error event missing from every counter still fails", () => {
