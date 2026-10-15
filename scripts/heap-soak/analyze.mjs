@@ -27,12 +27,13 @@
 //   every sample carries its observed running-agent count (7), its cumulative calls and calls by
 //     kind (consistent with the minute buckets and never decreasing), its delivered stream chunks
 //     (exactly the 7-agent, 2048-chunks-per-30-minutes schedule) and its error and death counters;
+//   the stream schedule holds through the window's end: the load-end count reaches it within 2 s;
 //   the wall-clock minute buckets are consecutive from 0, each anchored to its index and contiguous
 //     with the next, every whole minute with exactly 27 calls in the 15/9/2/1 mix;
 //   a full run has one load-end within 2 s of 14,400 s with its heap and counters, and one
-//     post-rest after the 300-second rest; every run has one cleanup record;
-//   a control has no RPC error before its leak point and no death other than a timed heap-limit
-//     abort before it.
+//     post-rest 300 s (within 2 s) after it; every run has one cleanup record;
+//   a control has no RPC error up to its leak point (only failures its worker's own exit caused
+//     are excused) and no death other than a timed heap-limit abort before it.
 // Error and death counters are reconciled by their maximum over every record and event, so a
 // later zero never erases an observed error: an observed error fails a fixed run.
 
@@ -64,10 +65,10 @@ const SAMPLE_PERIOD_SECONDS = 30;
 // drive the per-index loops).
 const MAX_MINUTE_INDEX = EXPECTED_SECONDS / 60;
 const TOLERANCE_SECONDS = 2;
-// The post-rest record follows the load-end and post-rest forced-GC passes (about a second each on
-// the real runs); a rest more than one sample period over its 300 seconds contradicts the header.
-const REST_OVERRUN_SECONDS = SAMPLE_PERIOD_SECONDS;
 const HEAP_LIMIT_RE = /Reached heap limit|heap out of memory|Allocation failed/i;
+// The driver's own RPC failures once its worker has exited: "worker exit <code>" for the RPCs
+// pending at the exit, "worker dead" for every RPC after it.
+const WORKER_EXIT_FAILURE_RE = /^worker (dead|exit\b)/;
 const ERROR_COUNTERS = ["rpcErrors", "streamErrors", "workerDeaths"];
 const RECORD_COUNTERS = ["calls", "streamChunks", ...ERROR_COUNTERS];
 const SINGLE_STAGES = ["baseline", "load-end", "post-rest", "cleanup"];
@@ -484,10 +485,7 @@ function restProblems(loadEnd, postRest) {
     return ["post-rest or load-end has no elapsed time"];
   const problems = [];
   const rest = postRest.elapsed - loadEnd.elapsed;
-  if (
-    rest < EXPECTED_REST_SECONDS - TOLERANCE_SECONDS ||
-    rest > EXPECTED_REST_SECONDS + REST_OVERRUN_SECONDS
-  )
+  if (Math.abs(rest - EXPECTED_REST_SECONDS) > TOLERANCE_SECONDS)
     problems.push(`rest ran ${rest.toFixed(1)}s, expected ${EXPECTED_REST_SECONDS}s`);
   if (heapOf(postRest) === null) problems.push("post-rest has no heapUsed");
   return problems;
@@ -540,21 +538,36 @@ function leakEvidence({ series, loadEnd, baseline, heapLimit, oomDeaths }) {
   return { leakShown, leakElapsed: leakShown ? elapsed : null };
 }
 
-// Up to its leak point, the control's load must have been delivered: no RPC error, stream error or
-// death recorded by any sample in the window or by an event at or before the last of them, and no
-// death other than a timed heap-limit abort at or before the window's end.
-function controlProblems({ series, counters, rpcErrorEvents, windowEnd }) {
+// Up to its leak point, the control's load must have been delivered. Every error counts: one
+// recorded by a sample in the window, an event at or before the leak point (or untimed), and an end
+// counter with no event of its own (untimed). The only failures excused are those the worker's exit
+// itself caused, shown by the driver's own message, after the last successful sample, in a run
+// whose worker exited. No death other than a timed heap-limit abort may come at or before the
+// window's end.
+function controlProblems({ series, counters, rpcErrorEvents, workerExits, windowEnd }) {
   const problems = [];
-  const inWindow = series.filter((s) => s.elapsed <= windowEnd);
-  const lastSeen = inWindow.at(-1)?.elapsed ?? -Infinity;
-  const events = rpcErrorEvents.filter((e) => !isTime(e.elapsed) || e.elapsed <= lastSeen).length;
-  const counted = inWindow.reduce(
-    (m, { rec }) => Math.max(m, ...ERROR_COUNTERS.map((f) => (isCount(rec[f]) ? rec[f] : 0))),
-    0,
-  );
-  if (Math.max(events, counted) > 0)
+  const lastSample = series.at(-1)?.elapsed ?? -Infinity;
+  const exited = workerExits.some((e) => e.stopping !== true);
+  const causedByExit = (e) =>
+    exited &&
+    typeof e.message === "string" &&
+    WORKER_EXIT_FAILURE_RE.test(e.message) &&
+    isTime(e.elapsed) &&
+    e.elapsed > lastSample;
+  const timed = rpcErrorEvents.filter(
+    (e) => !causedByExit(e) && (!isTime(e.elapsed) || e.elapsed <= windowEnd),
+  ).length;
+  const untimed = counters.errors - rpcErrorEvents.length;
+  const counted = series
+    .filter((s) => s.elapsed <= windowEnd)
+    .reduce(
+      (m, { rec }) => Math.max(m, ...ERROR_COUNTERS.map((f) => (isCount(rec[f]) ? rec[f] : 0))),
+      0,
+    );
+  const errors = Math.max(timed + untimed, counted);
+  if (errors > 0)
     problems.push(
-      `${Math.max(events, counted)} RPC error(s) or death(s) before the leak point: the load was not delivered as stated`,
+      `${errors} RPC error(s) or death(s) before the leak point: the load was not delivered as stated`,
     );
   const otherDeaths = counters.otherDeaths.filter(
     (e) => !isTime(e.elapsed) || e.elapsed <= windowEnd,
@@ -563,6 +576,24 @@ function controlProblems({ series, counters, rpcErrorEvents, windowEnd }) {
   if (unexplained > 0)
     problems.push(`${unexplained} worker death(s) that are not a timed heap-limit abort`);
   return problems;
+}
+
+// The stream schedule holds through the end of the judged window, not only at the last 30 s
+// sample: the count delivered by the load end reaches the schedule 2 s before the window's end (the
+// driver streams at the start of every loop iteration, about every 100 ms). A window that ends on a
+// sample is already checked exactly by that sample.
+function deliveryProblems(loadEnd, series, windowEnd, full) {
+  const through = full ? loadEnd?.elapsed : windowEnd;
+  if (!isTime(through) || series.some((s) => s.elapsed === through)) return [];
+  const chunks = loadEnd?.streamChunks;
+  if (!isCount(chunks))
+    return [
+      `no delivered stream-chunk count at the load end: delivery to ${through}s not observed`,
+    ];
+  const due = scheduledChunks(through - TOLERANCE_SECONDS);
+  return chunks < due
+    ? [`load-end stream chunks ${chunks} short of the ${due} due by ${through}s`]
+    : [];
 }
 
 // The load's heap series: every sample, then the load-end sample when it has a heap.
@@ -714,10 +745,9 @@ export function analyze(records, options = {}) {
     ...sampleLoadProblems(series, totals),
     ...recordProblems(r, totals, series, r.minuteRecords.length),
     ...stopProblems(r),
+    ...deliveryProblems(r.loadEnd, series, windowEnd, full),
     ...(full ? phaseProblems(r) : []),
-    ...(control
-      ? controlProblems({ series, counters, rpcErrorEvents: r.rpcErrorEvents, windowEnd })
-      : []),
+    ...(control ? controlProblems({ series, counters, ...r, windowEnd }) : []),
   ];
 
   const numbers = buildNumbers({
