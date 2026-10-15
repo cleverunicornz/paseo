@@ -1234,27 +1234,56 @@ const isMain =
   fs.realpathSync(process.argv[1]) === fs.realpathSync(new URL(import.meta.url).pathname);
 
 // The CLI's last resort: whatever fails while reading, analysing or reporting, the verdict is
-// INCONCLUSIVE (exit 2), naming the error. It builds its text without the report's helpers.
+// INCONCLUSIVE (exit 2), naming the error. It writes synchronously, without the report's helpers,
+// and exits 2 whether or not its own writes succeed.
 function failInconclusive(source, error) {
-  process.stdout.write(
-    [
-      `run:            ${source}`,
-      "not analysed:   internal error",
-      "",
-      `INCONCLUSIVE  internal error: ${errorText(error)}`,
-      "",
-      "VERDICT: INCONCLUSIVE",
-      "",
-    ].join("\n"),
-  );
+  const text = [
+    `run:            ${source}`,
+    "not analysed:   internal error",
+    "",
+    `INCONCLUSIVE  internal error: ${errorText(error)}`,
+    "",
+    "VERDICT: INCONCLUSIVE",
+    "",
+  ].join("\n");
+  writeQuietly(1, text);
+  writeQuietly(2, `analyze.mjs: internal error: ${errorText(error)}; VERDICT: INCONCLUSIVE\n`);
   process.exit(2);
+}
+
+function writeQuietly(fd, text) {
+  try {
+    fs.writeSync(fd, text);
+  } catch {
+    // no channel left to report on; the exit code still says INCONCLUSIVE
+  }
+}
+
+// The verdict counts only when its report is written in full: exit with the verdict's code from
+// the write's callback, once stdout has taken the whole report. A failed write, or an error on
+// stdout or stderr before then (ENOSPC, EPIPE, ...), exits 2 and says so on stderr.
+function emitReport(source, text, code) {
+  const failed = (error) => {
+    writeQuietly(
+      2,
+      `analyze.mjs: the report for ${source} could not be written (${error?.code ?? ""} ${errorText(error)}); VERDICT: INCONCLUSIVE\n`,
+    );
+    process.exit(2);
+  };
+  process.stdout.on("error", failed);
+  process.stderr.on("error", failed);
+  try {
+    process.stdout.write(text, (error) => (error ? failed(error) : process.exit(code)));
+  } catch (error) {
+    failed(error);
+  }
 }
 
 function main(args) {
   const control = args.includes("--control");
   const file = args.find((a) => !a.startsWith("--"));
   if (!file) {
-    process.stderr.write("usage: analyze.mjs [--control] <run.jsonl>\n");
+    writeQuietly(2, "usage: analyze.mjs [--control] <run.jsonl>\n");
     process.exit(2);
   }
   process.on("uncaughtException", (error) => failInconclusive(file, error));
@@ -1265,8 +1294,7 @@ function main(args) {
       .filter((l) => l.trim())
       .map(parseLine);
     const result = analyze(records, { control });
-    process.stdout.write(printReport(result, file) + "\n");
-    process.exit(exitCodeFor(result.verdict));
+    emitReport(file, printReport(result, file) + "\n", exitCodeFor(result.verdict));
   } catch (error) {
     failInconclusive(file, error);
   }
