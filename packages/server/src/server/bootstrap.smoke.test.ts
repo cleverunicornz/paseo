@@ -155,7 +155,7 @@ describe("paseo daemon bootstrap", () => {
         cors: { allowedOrigins: ["https://before.example.test"] },
         trustedProxies: [],
         mcp: { enabled: true, injectIntoAgents: false },
-        git: { maxProcessesPerSecond: 64, maxProcessConcurrency: 8 },
+        git: { maxProcessesPerSecond: 64, maxProcessConcurrency: 8, maxQueueDepth: 256 },
         relay: {
           enabled: false,
           endpoint: "127.0.0.1:9",
@@ -240,7 +240,7 @@ describe("paseo daemon bootstrap", () => {
           cors: { allowedOrigins: ["https://after.example.test"] },
           trustedProxies: true as const,
           mcp: { enabled: false, injectIntoAgents: false },
-          git: { maxProcessesPerSecond: 5, maxProcessConcurrency: 1 },
+          git: { maxProcessesPerSecond: 5, maxProcessConcurrency: 1, maxQueueDepth: 256 },
           relay: { ...initialPersisted.daemon.relay, enabled: true },
         },
         app: { baseUrl: "https://after.example.test" },

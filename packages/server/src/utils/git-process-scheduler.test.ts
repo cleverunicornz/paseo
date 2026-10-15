@@ -175,9 +175,7 @@ describe("GitProcessScheduler queue bound", () => {
     const queuedB = scheduler.run(createConcurrencyTask(2, started, releases));
 
     // The third queued command has no slot: it is refused, not appended.
-    await expect(
-      scheduler.run(createConcurrencyTask(2, started, releases)),
-    ).rejects.toMatchObject({
+    await expect(scheduler.run(createConcurrencyTask(2, started, releases))).rejects.toMatchObject({
       name: "GitProcessQueueFullError",
       code: "GIT_PROCESS_QUEUE_FULL",
     });

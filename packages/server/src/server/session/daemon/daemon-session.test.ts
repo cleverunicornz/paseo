@@ -628,7 +628,9 @@ describe("DaemonSession", () => {
       throw new Error("expected diagnostics response");
     }
     const { diagnostic } = message.payload;
-    expect(diagnostic).toContain("Loop lateness: timer p50=2ms, p95=9ms, max=250ms, utilization=0.42");
+    expect(diagnostic).toContain(
+      "Loop lateness: timer p50=2ms, p95=9ms, max=250ms, utilization=0.42",
+    );
     expect(diagnostic).toContain("GC: count=5, maxPause=12ms");
     expect(diagnostic).toContain("heapUsed=12.0 MiB");
     expect(diagnostic).toContain("kinds=minor=4");

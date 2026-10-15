@@ -373,7 +373,9 @@ describe("runGitCommand", () => {
     const active = runGitCommand(["status"], { cwd: process.cwd() });
     const queued = runGitCommand(["status", "--short"], { cwd: process.cwd() });
 
-    await expect(runGitCommand(["status", "--porcelain"], { cwd: process.cwd() })).rejects.toMatchObject({
+    await expect(
+      runGitCommand(["status", "--porcelain"], { cwd: process.cwd() }),
+    ).rejects.toMatchObject({
       name: "GitProcessQueueFullError",
       code: "GIT_PROCESS_QUEUE_FULL",
     });
