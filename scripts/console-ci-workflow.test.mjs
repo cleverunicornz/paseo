@@ -203,7 +203,9 @@ test("the console line's ancestry and its built payload are both checked", () =>
   const payload = step("Check the built payload carries both fixes");
   assert.match(payload.text, /packages\/server\/dist\/server\/server/);
   assert.match(payload.text, /assertPayloadCarriesFixes/);
-  assert.ok(stepIndex("Build daemon and CLI") < stepIndex("Check the built payload carries both fixes"));
+  assert.ok(
+    stepIndex("Build daemon and CLI") < stepIndex("Check the built payload carries both fixes"),
+  );
   // The provenance script has its own tests in the release-rules step.
   assert.match(
     step("Check the release rules").text,

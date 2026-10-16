@@ -35,7 +35,15 @@ export const PAYLOAD_MARKERS = {
 };
 
 /** The seven workspace packages of one release, packed together. */
-export const RELEASE_PACKAGES = ["highlight", "relay", "protocol", "client", "plugin", "server", "cli"];
+export const RELEASE_PACKAGES = [
+  "highlight",
+  "relay",
+  "protocol",
+  "client",
+  "plugin",
+  "server",
+  "cli",
+];
 
 /**
  * The version the release's assets must name: the tag's version without its
