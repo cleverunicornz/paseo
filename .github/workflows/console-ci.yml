@@ -57,8 +57,8 @@ jobs:
         run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs scripts/check-managed-update-anchors.test.mjs scripts/console-release-provenance.test.mjs scripts/release-assets.test.mjs
       - name: Check the console release ancestry
         # The console's line, and the heap fix in it. The scheduler port's own
-        # commits cannot name themselves in a committed manifest, so they are
-        # proven by the built payload's markers in the step after the build.
+        # commits are also listed in the checklist; the built payload's behavior
+        # is proven in the step after the build.
         # The 2026-10-16 v0.11.2-cvu.2 defect was a right-looking tag over a
         # 0.10.3 v2-line build, so both checks are needed.
         shell: bash
@@ -170,39 +170,17 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/paseo-release" "$RELEASE_TAG" "$GITHUB_SHA" <<'JS'
           import assert from "node:assert/strict";
           import {
+            assertPackedReleaseAssets,
             assertPrepublicationProvenance,
-            expectedReleaseAssets,
-            expectedAssetVersion,
             RELEASE_PACKAGES,
           } from "./scripts/console-release-provenance.mjs";
           import { readReleaseAssets } from "./scripts/release-assets.mjs";
 
           const [releaseDir, tag, runCommit] = process.argv.slice(2);
-          const version = expectedAssetVersion(tag);
           const assets = readReleaseAssets({ releaseDir, expectedPackageNames: RELEASE_PACKAGES });
-
-          // The packed bytes are read, not their names.
-          const wanted = [...expectedReleaseAssets(version)].sort();
-          assert.deepEqual([...assets.assetNames].sort(), wanted, "the packed asset set");
-          for (const name of RELEASE_PACKAGES) {
-            const packed = assets.packages.find((item) => item.name === `@getpaseo/${name}`);
-            assert.ok(packed, `@getpaseo/${name} is not packed`);
-            assert.equal(packed.version, version, `the packed @getpaseo/${name}`);
-          }
-          // The checksums bind the tarballs' bytes, and SOURCE_COMMIT is the run's head.
-          for (const [label, table, key] of [
-            ["SHA256SUMS", assets.checksum256, "sha256"],
-            ["SHA512SUMS", assets.checksum512, "sha512"],
-          ]) {
-            assert.equal(table.length, RELEASE_PACKAGES.length, `${label} entries`);
-            for (const entry of table) {
-              assert.equal(
-                assets.digests.get(entry.file)?.[key],
-                entry.digest,
-                `${label}'s ${entry.file}`,
-              );
-            }
-          }
+          // The same exact seven identities, filenames and byte digests are
+          // required before and after publication, including unique coverage.
+          assertPackedReleaseAssets({ tag, assets });
           assert.equal(assets.sourceCommit, runCommit, "SOURCE_COMMIT is the run's head");
           assert.equal(assets.nodeVersion, process.version, "NODE_VERSION");
 
@@ -329,14 +307,13 @@ jobs:
         run: |
           set -euo pipefail
           published="$RUNNER_TEMP/paseo-published"
-          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
-          test -n "$tag_commit"
+          tag_commit="$(node scripts/resolve-published-tag.mjs "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$GITHUB_SHA")"
           # Install the seven downloaded tarballs as the session image does: one
           # global install, so their own dependencies resolve and the probes load
           # the published bytes, not the build tree.
           image="$RUNNER_TEMP/paseo-published-image"
           npm install --global --prefix "$image" --no-audit --no-fund "$published/"*.tgz
-          node --input-type=module - "$published" "$image/lib/node_modules" "$RELEASE_TAG" "$tag_commit" <<'JS'
+          node --input-type=module - "$published" "$image/lib/node_modules" "$RELEASE_TAG" "$tag_commit" "$GITHUB_SHA" <<'JS'
           import path from "node:path";
           import {
             assertPayloadCarriesFixes,
@@ -345,7 +322,7 @@ jobs:
           } from "./scripts/console-release-provenance.mjs";
           import { readReleaseAssets } from "./scripts/release-assets.mjs";
 
-          const [releaseDir, installedRoot, tag, tagCommit] = process.argv.slice(2);
+          const [releaseDir, installedRoot, tag, tagCommit, runCommit] = process.argv.slice(2);
           const assets = readReleaseAssets({ releaseDir, expectedPackageNames: RELEASE_PACKAGES });
 
           // The behavior proof runs against the INSTALLED server's dist: the
@@ -356,6 +333,7 @@ jobs:
           const result = assertReleaseProvenance({
             tag,
             tagCommit,
+            runCommit,
             assets,
             payloadObservations: observations,
           });
