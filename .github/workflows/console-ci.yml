@@ -92,23 +92,17 @@ jobs:
           npm run typecheck:server
           npm run format:check
       - name: Check the managed-update anchors
-        # runner-images images/repo-pod/paseo-managed-update.mjs edits two exact anchors in the
-        # built server and fails its image build if either is not found exactly once. Its CLI
-        # anchor is the whole installLatest body, not the signature, so the built files must
-        # equal upstream 0.11.2's byte for byte. This job fetches the published tarball, checks
-        # its sha256 against runner-images' pin, and compares both anchored files. A CLI-body
-        # change the consumer would refuse fails here; the checker's rules have their own tests.
+        # runner-images images/repo-pod/paseo-managed-update.mjs replaces each of two exact
+        # strings in the built server and fails its image build if either is not present
+        # exactly once. The CLI anchor is the WHOLE installLatest body, so a change inside
+        # that body would move it and the image build would refuse; the websocket anchor is
+        # one line, so other content in that file is irrelevant to the consumer. The checker
+        # applies exactly that rule, no stricter: PR #24's loop-health instrumentation adds
+        # code to websocket-server.js and the consumer's own patcher still applies.
         shell: bash
         run: |
           set -euo pipefail
-          server=packages/server/dist/server/server
-          upstream="$RUNNER_TEMP/upstream"
-          mkdir -p "$upstream"
-          curl --fail --location --silent --show-error --output "$upstream/server.tgz" \
-            "https://registry.npmjs.org/@getpaseo/server/-/server-0.11.2.tgz"
-          echo '7a727fcbb8f96ff044d4a60526af8b0f6adce2c827dc74b4bd75677e97798a50  '"$upstream/server.tgz" | sha256sum --check
-          tar -xzf "$upstream/server.tgz" -C "$upstream"
-          node scripts/check-managed-update-anchors.mjs "$server" "$upstream/package/dist/server/server"
+          node scripts/check-managed-update-anchors.mjs packages/server/dist/server/server
       - name: Check the built payload carries both fixes
         # The tag and the ancestry are claims; the built payload is the evidence.
         # The 2026-10-16 v0.11.2-cvu.2 defect carried neither fix. This reads the

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { ANCHORED_FILES, ANCHORS } from "./check-managed-update-anchors.mjs";
+import { ANCHORED_FILES, ANCHORS, CLI_SIGNATURE } from "./check-managed-update-anchors.mjs";
 
 const workflow = readFileSync(
   new URL("../.github/workflows/console-ci.yml", import.meta.url),
@@ -137,30 +137,31 @@ test("the packed release installs the way the session image installs it, before 
   );
 });
 
-test("the managed-update anchors are checked against upstream's own bytes", () => {
-  // runner-images images/repo-pod/paseo-managed-update.mjs edits two exact anchors in the
-  // built server and fails its image build if either is not found once, or if the CLI body
-  // around its anchor has moved. So this job compares both built files to the upstream
-  // tarball the runner-images pin names, not just the anchor strings. The rules and their
-  // anchors live in the checker, which has its own tests.
+test("the managed-update anchors are checked by the consumer's own rule", () => {
+  // runner-images images/repo-pod/paseo-managed-update.mjs replaces each of two exact
+  // strings in the built server, failing if either is not present exactly once. The CLI
+  // anchor is the whole installLatest body; the websocket anchor is one line. The checker
+  // applies exactly that rule on the built files. The rules and their anchors live in the
+  // checker, which has its own tests.
   const anchors = step("Check the managed-update anchors");
   assert.ok(stepIndex("Build daemon and CLI") < stepIndex("Check the managed-update anchors"));
   // The checker requires both files and both anchors, as the consumer does.
   assert.deepEqual(Object.keys(ANCHORS).sort(), ANCHORED_FILES.slice().sort());
-  for (const anchor of [
-    "installLatest(options = {})",
-    "daemonSelfUpdate: this.daemonRuntimeConfig?.desktopManaged !== true,",
-  ]) {
-    assert.ok(Object.values(ANCHORS).includes(anchor), `anchor ${anchor}`);
-  }
-  // It fetches upstream's tarball, checks its pinned sha256, and runs the checker.
-  assert.match(anchors.text, /registry\.npmjs\.org\/@getpaseo\/server\/-\/server-0\.11\.2\.tgz/);
-  assert.match(anchors.text, /7a727fcbb8f96ff044d4a60526af8b0f6adce2c827dc74b4bd75677e97798a50/);
-  assert.match(anchors.text, /sha256sum --check/);
+  assert.ok(Object.values(ANCHORS).includes(CLI_SIGNATURE));
+  assert.ok(ANCHORS[ANCHORED_FILES[0]].includes("installLatest(options = {})"));
+  assert.ok(ANCHORS[ANCHORED_FILES[0]].includes("maxBuffer: NPM_MAX_BUFFER_BYTES"));
+  assert.ok(
+    Object.values(ANCHORS).includes(
+      "daemonSelfUpdate: this.daemonRuntimeConfig?.desktopManaged !== true,",
+    ),
+  );
+  // It checks the built server, not a fetched upstream tarball: byte-identity would refuse a
+  // change to websocket-server.js that the consumer accepts (P-000289 H3 adds one).
   assert.match(
     flat(anchors.text),
-    /node scripts\/check-managed-update-anchors\.mjs "\$server" "\$upstream\/package\/dist\/server\/server"/,
+    /node scripts\/check-managed-update-anchors\.mjs packages\/server\/dist\/server\/server/,
   );
+  assert.doesNotMatch(anchors.text, /registry\.npmjs\.org/);
 });
 
 test("the server's unit suite runs on the smallest test set, and no Dockerfile compiles", () => {
