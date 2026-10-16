@@ -48,7 +48,18 @@ jobs:
           tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
           echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
       - name: Check the release rules
-        run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs scripts/check-managed-update-anchors.test.mjs
+        run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs scripts/check-managed-update-anchors.test.mjs scripts/console-release-provenance.test.mjs
+      - name: Check the console release ancestry
+        # The console's line, and the heap fix in it. The scheduler port's own
+        # commits cannot name themselves in a committed manifest, so they are
+        # proven by the built payload's markers in the step after the build.
+        # The 2026-10-16 v0.11.2-cvu.2 defect was a right-looking tag over a
+        # 0.10.3 v2-line build, so both checks are needed.
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 759532509 HEAD
+          git merge-base --is-ancestor d282eb2ed HEAD
       - name: Check the release tag
         # The pre-build guard, ahead of npm ci and every build step: the repository, the ref,
         # the tag's shape and its base version. A dispatch in a fork, or a tag the line does
@@ -92,6 +103,25 @@ jobs:
           echo '7a727fcbb8f96ff044d4a60526af8b0f6adce2c827dc74b4bd75677e97798a50  '"$upstream/server.tgz" | sha256sum --check
           tar -xzf "$upstream/server.tgz" -C "$upstream"
           node scripts/check-managed-update-anchors.mjs "$server" "$upstream/package/dist/server/server"
+      - name: Check the built payload carries both fixes
+        # The tag and the ancestry are claims; the built payload is the evidence.
+        # The 2026-10-16 v0.11.2-cvu.2 defect carried neither fix. This reads the
+        # just-built server dist for each fix's marker: the scheduler bound, the
+        # loop instrumentation, and the heap fix's UTF-16 detach. It runs on
+        # every qualification of the line, a pull request included, where no
+        # release tag exists yet.
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/console-payload.txt"
+          find packages/server/dist/server/server -type f \( -name '*.js' -o -name '*.json' \) \
+            -exec cat {} + > "$payload"
+          node --input-type=module - "$payload" <<'JS'
+          import fs from "node:fs";
+          import { assertPayloadCarriesFixes } from "./scripts/console-release-provenance.mjs";
+          assertPayloadCarriesFixes(fs.readFileSync(process.argv[2], "utf8"));
+          console.log("The built server carries both fixes.");
+          JS
       - name: Set the release version
         # Every workspace package takes the tag's version before packing (P-000269 H2). The
         # repo's own sync script rewrites the packages' internal dependency ranges too, so the

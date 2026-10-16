@@ -184,3 +184,22 @@ test("no Dockerfile in the change compiles anything", () => {
   // compiler into a Dockerfile under this workflow's name.
   assert.doesNotMatch(workflow, /docker build/i);
 });
+
+test("the console line's ancestry and its built payload are both checked", () => {
+  // The 2026-10-16 v0.11.2-cvu.2 defect: the tag named the console line, the payload was a
+  // 0.10.3 v2-line build. Both halves must be refused before a release is consumed.
+  const ancestry = step("Check the console release ancestry");
+  for (const commit of ["759532509", "d282eb2ed"]) {
+    assert.match(ancestry.text, new RegExp(`git merge-base --is-ancestor ${commit} HEAD`));
+  }
+  // The payload check reads what was built, and runs after the build.
+  const payload = step("Check the built payload carries both fixes");
+  assert.match(payload.text, /packages\/server\/dist\/server\/server/);
+  assert.match(payload.text, /assertPayloadCarriesFixes/);
+  assert.ok(stepIndex("Build daemon and CLI") < stepIndex("Check the built payload carries both fixes"));
+  // The provenance script has its own tests in the release-rules step.
+  assert.match(
+    step("Check the release rules").text,
+    /scripts\/console-release-provenance\.test\.mjs/,
+  );
+});
