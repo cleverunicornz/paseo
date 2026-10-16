@@ -452,19 +452,17 @@ interface WorkspaceGitTarget {
 
 /**
  * One lite-checkout cache slot per cwd. `checkout` is null for a retired
- * entry: an invalidation keeps the slot so the per-cwd identity survives, and
+ * entry or a read that has not published yet, and
  * `peekCachedCheckout` reads a retired entry as "no cached checkout".
  */
 interface CachedCheckoutEntry {
   checkout: ProjectCheckoutLitePayload | null;
   /**
-   * The invalidation identity the entry's read was made under: 0 for a cwd
-   * never invalidated, otherwise the service-wide invalidation sequence value
-   * of the last invalidation. A read captures it before starting and publishes
-   * only if it is unchanged, so a read that began before an invalidation never
-   * republishes the facts that invalidation retired.
+   * A unique publication identity. Reads and invalidations replace it;
+   * eviction removes permission to publish. A recreated slot never reuses an
+   * identity still held by an older read.
    */
-  generation: number;
+  generation: symbol;
 }
 
 interface RepoGitTarget {
@@ -639,19 +637,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
    * directory that was never observed still warms and a closed target's entry
    * is retired by its own invalidation, not by the target's lifetime.
    *
-   * Every entry carries the invalidation identity of the read that wrote it, so
-   * a read that began before an invalidation never publishes, whatever cwd it
-   * ran for: observed or not, the identity is per cwd, never per target.
+   * Only the read holding a slot's current identity can publish. An evicted
+   * slot refuses all its outstanding reads, with no per-cwd tombstones outside
+   * this bounded cache.
    */
   private readonly checkoutCache = new LRUCache<string, CachedCheckoutEntry>({
     max: WORKSPACE_GIT_CHECKOUT_CACHE_MAX,
   });
-  /**
-   * The service-wide count of checkout invalidations. Every invalidation stamps
-   * the cwd's cache slot with a fresh, never-repeated value, so no read that
-   * captured an earlier identity can match it - including across slot eviction.
-   */
-  private checkoutInvalidationSequence = 0;
   private readonly branchValidationCache = new LRUCache<
     string,
     WorkspaceGitAuxiliaryReadCacheEntry<WorkspaceGitBranchValidationResult>
@@ -3344,30 +3336,31 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
    * Publish the lite checkout derived from the freshest facts this read
    * established, so a later reconciliation sweep - or a client status request -
    * can read it without Git. The identity captured when the read began must
-   * still be current: a read that started before an invalidation never
-   * republishes the facts that invalidation retired.
+   * still be current: invalidation, eviction or a newer read retires it.
    */
   private publishCachedCheckout(
     cwd: string,
-    generation: number,
+    generation: symbol,
     checkout: ProjectCheckoutLitePayload,
   ): void {
-    // A read that began before an invalidation must not publish: the cwd's
-    // identity has moved past the one that read captured.
+    // An absent slot also refuses publication. A newer read always reserves a
+    // new identity, including when it recreates a slot after eviction.
     const current = this.checkoutCache.peek(cwd);
-    if (current && current.generation !== generation) {
+    if (current?.generation !== generation) {
       return;
     }
     this.checkoutCache.set(cwd, { checkout, generation });
   }
 
   /**
-   * The invalidation identity a read must still see at publish time to publish:
-   * the cwd's stamped identity, or 0 for a cwd never invalidated. It exists for
-   * every cwd, independent of target existence.
+   * Reserve this read's publication identity before it starts. Preserve a warm
+   * value during a refresh, but retire every older read's right to publish.
    */
-  private captureCheckoutGeneration(cwd: string): number {
-    return this.checkoutCache.peek(cwd)?.generation ?? 0;
+  private captureCheckoutGeneration(cwd: string): symbol {
+    const generation = Symbol();
+    const checkout = this.checkoutCache.peek(cwd)?.checkout ?? null;
+    this.checkoutCache.set(cwd, { checkout, generation });
+    return generation;
   }
 
   private checkoutLiteFromRuntimeGit(
@@ -3387,13 +3380,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   /**
    * Retire the cached checkout for a cwd and any read in flight behind it. The
    * next read goes live; a read that began before this call cannot publish. The
-   * slot keeps the cwd's fresh identity so the retirement holds for reads with
-   * no workspace target too.
+   * slot's identity is never reused, even if eviction removes the slot before
+   * the read resolves. This also holds for cwds with no workspace target.
    */
   private invalidateCachedCheckout(cwd: string): void {
     this.checkoutCache.set(cwd, {
       checkout: null,
-      generation: ++this.checkoutInvalidationSequence,
+      generation: Symbol(),
     });
   }
 
