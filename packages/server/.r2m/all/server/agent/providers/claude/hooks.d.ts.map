@@ -1,0 +1,1 @@
+{"version":3,"file":"hooks.d.ts","sourceRoot":"","sources":["../../../../../../src/server/agent/providers/claude/hooks.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,YAAY,CAAC;AAEhD,KAAK,WAAW,GAAG,WAAW,CAAC,aAAa,CAAC,OAAO,CAAC,CAAC,CAAC;AAEvD;;;;;;GAMG;AACH,wBAAgB,gBAAgB,CAAC,GAAG,EAAE,WAAW,EAAE,KAAK,EAAE,OAAO,GAAG,WAAW,CAS9E"}

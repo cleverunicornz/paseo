@@ -1,0 +1,1 @@
+{"version":3,"file":"workflow-output.d.ts","sourceRoot":"","sources":["../../../../../../../src/server/agent/providers/claude/subagents/workflow-output.ts"],"names":[],"mappings":"AAKA,wBAAgB,4BAA4B,CAAC,UAAU,EAAE,MAAM,GAAG,MAAM,GAAG,SAAS,CAkBnF;AAED,wBAAgB,yBAAyB,CAAC,QAAQ,EAAE,MAAM,GAAG,MAAM,GAAG,SAAS,CAa9E;AAED,wBAAgB,0BAA0B,CAAC,MAAM,EAAE,OAAO,GAAG,MAAM,GAAG,SAAS,CAoB9E"}

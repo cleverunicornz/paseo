@@ -1,0 +1,357 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { z } from "zod";
+import { writeJsonFileAtomic } from "../atomic-file.js";
+import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
+import { toStoredAgentRecord } from "./agent-projections.js";
+import { AgentOwnerSchema, daemonExecutionKey } from "./agent-owner.js";
+const SERIALIZABLE_CONFIG_SCHEMA = z
+    .object({
+    modeId: z.string().nullable().optional(),
+    model: z.string().nullable().optional(),
+    thinkingOptionId: z.string().nullable().optional(),
+    featureValues: z.record(z.string(), z.unknown()).nullable().optional(),
+    providerOptions: z.record(z.string(), z.unknown()).nullable().optional(),
+    toolPolicy: z
+        .object({
+        preapproved: z.array(z.object({ kind: z.literal("mcp"), server: z.string(), tool: z.string() }).strict()),
+    })
+        .strict()
+        .nullable()
+        .optional(),
+    systemPrompt: z.string().nullable().optional(),
+    mcpServers: z.record(z.string(), z.any()).nullable().optional(),
+})
+    .nullable()
+    .optional();
+const PERSISTENCE_HANDLE_SCHEMA = z
+    .object({
+    provider: z.string(),
+    sessionId: z.string(),
+    nativeHandle: z.any().optional(),
+    metadata: z.record(z.string(), z.any()).optional(),
+})
+    .nullable()
+    .optional();
+const STORED_AGENT_SCHEMA = z.object({
+    id: z.string(),
+    provider: z.string(),
+    cwd: z.string(),
+    workspaceId: z.string().optional(),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+    lastActivityAt: z.string().optional(),
+    lastUserMessageAt: z.string().nullable().optional(),
+    title: z.string().nullable().optional(),
+    labels: z.record(z.string(), z.string()).default({}),
+    lastStatus: AgentStatusSchema.default("closed"),
+    lastModeId: z.string().nullable().optional(),
+    config: SERIALIZABLE_CONFIG_SCHEMA,
+    runtimeInfo: z
+        .object({
+        provider: z.string(),
+        sessionId: z.string().nullable(),
+        model: z.string().nullable().optional(),
+        thinkingOptionId: z.string().nullable().optional(),
+        modeId: z.string().nullable().optional(),
+        extra: z.record(z.string(), z.unknown()).optional(),
+    })
+        .optional(),
+    features: z.array(AgentFeatureSchema).optional(),
+    persistence: PERSISTENCE_HANDLE_SCHEMA,
+    lastError: z.string().nullable().optional(),
+    requiresAttention: z.boolean().optional(),
+    attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
+    attentionTimestamp: z.string().nullable().optional(),
+    internal: z.boolean().optional(),
+    archivedAt: z.string().nullable().optional(),
+    owner: AgentOwnerSchema.optional(),
+});
+export function parseStoredAgentRecord(value) {
+    return STORED_AGENT_SCHEMA.parse(value);
+}
+export class AgentStorage {
+    constructor(baseDir, logger) {
+        this.cache = new Map();
+        this.pathById = new Map();
+        this.pathsById = new Map();
+        this.pendingWrites = new Map();
+        this.deleting = new Set();
+        this.daemonAgentIdsByExecution = new Map();
+        this.daemonExecutionKeysByAgentId = new Map();
+        this.loaded = false;
+        this.loadPromise = null;
+        this.baseDir = baseDir;
+        this.logger = logger.child({ module: "agent", component: "agent-storage" });
+    }
+    async initialize() {
+        await this.load();
+    }
+    async list() {
+        await this.load();
+        return Array.from(this.cache.values());
+    }
+    async get(agentId) {
+        await this.load();
+        return this.cache.get(agentId) ?? null;
+    }
+    async listByProviderSession(provider, providerHandleId) {
+        await this.load();
+        return Array.from(this.cache.values()).filter((record) => record.persistence?.provider === provider &&
+            (record.persistence.sessionId === providerHandleId ||
+                record.persistence.nativeHandle === providerHandleId));
+    }
+    async listByWorkspace(workspaceId) {
+        await this.load();
+        return Array.from(this.cache.values()).filter((record) => record.workspaceId === workspaceId);
+    }
+    async findByDaemonExecution(owner) {
+        await this.load();
+        const agentId = this.daemonAgentIdsByExecution.get(daemonExecutionKey(owner));
+        return agentId ? (this.cache.get(agentId) ?? null) : null;
+    }
+    async upsert(record) {
+        await this.load();
+        await this.queueRecordWrite(record);
+    }
+    queueRecordWrite(record) {
+        return this.queueRecordMutation(record.id, () => record);
+    }
+    queueRecordMutation(agentId, mutate) {
+        const prev = this.pendingWrites.get(agentId) ?? Promise.resolve();
+        const next = prev.then(async () => {
+            if (this.deleting.has(agentId)) {
+                return undefined;
+            }
+            const record = mutate(this.cache.get(agentId) ?? null);
+            await this.writeRecord(record);
+            return undefined;
+        });
+        const tracked = next.finally(() => {
+            if (this.pendingWrites.get(agentId) === tracked) {
+                this.pendingWrites.delete(agentId);
+            }
+        });
+        this.pendingWrites.set(agentId, tracked);
+        return tracked;
+    }
+    async writeRecord(record) {
+        const agentId = record.id;
+        const nextPath = this.buildRecordPath(record);
+        const previousPath = this.pathById.get(agentId);
+        await writeJsonFileAtomic(nextPath, record);
+        this.addIndexedPath(agentId, nextPath);
+        if (previousPath && previousPath !== nextPath) {
+            try {
+                await fs.unlink(previousPath);
+            }
+            catch {
+                // ignore cleanup errors
+            }
+            this.removeIndexedPath(agentId, previousPath);
+        }
+        this.cache.set(agentId, record);
+        this.indexOwner(record);
+        this.pathById.set(agentId, nextPath);
+    }
+    beginDelete(agentId) {
+        this.deleting.add(agentId);
+    }
+    async remove(agentId) {
+        await this.load();
+        this.beginDelete(agentId);
+        await (this.pendingWrites.get(agentId) ?? Promise.resolve());
+        const paths = Array.from(this.pathsById.get(agentId) ?? []);
+        await Promise.all(paths.map(async (filePath) => {
+            try {
+                await fs.unlink(filePath);
+            }
+            catch (error) {
+                const code = error.code;
+                if (code && code !== "ENOENT") {
+                    this.logger.warn({ err: error, agentId, filePath }, "Failed to remove agent record file");
+                }
+            }
+        }));
+        this.cache.delete(agentId);
+        this.removeOwnerIndex(agentId);
+        this.pathById.delete(agentId);
+        this.pathsById.delete(agentId);
+    }
+    async applySnapshot(agent, options) {
+        await this.load();
+        const hasTitleOverride = options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
+        const hasInternalOverride = options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
+        await this.queueRecordMutation(agent.id, (existing) => {
+            const record = toStoredAgentRecord(agent, {
+                title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
+                createdAt: existing?.createdAt,
+                internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
+            });
+            // Preserve soft-delete/archive status across snapshot flushes. The
+            // projection runs inside the per-agent write queue so it cannot commit a
+            // stale pre-archive record after the archive mutation.
+            if (existing && existing.archivedAt !== undefined) {
+                record.archivedAt = existing.archivedAt;
+            }
+            return record;
+        });
+    }
+    async setTitle(agentId, title) {
+        await this.load();
+        await this.waitForPendingWrite(agentId);
+        const record = await this.get(agentId);
+        if (!record) {
+            throw new Error(`Agent ${agentId} not found`);
+        }
+        await this.upsert({ ...record, title });
+    }
+    async flush() {
+        await this.load().catch(() => undefined);
+        const writes = Array.from(this.pendingWrites.values());
+        await Promise.allSettled(writes);
+    }
+    async load() {
+        if (this.loaded) {
+            return Array.from(this.cache.values());
+        }
+        if (!this.loadPromise) {
+            this.loadPromise = this.doLoad();
+        }
+        return this.loadPromise;
+    }
+    async doLoad() {
+        this.cache.clear();
+        this.pathById.clear();
+        this.pathsById.clear();
+        this.daemonAgentIdsByExecution.clear();
+        this.daemonExecutionKeysByAgentId.clear();
+        try {
+            const records = await this.scanDisk();
+            this.loaded = true;
+            return records;
+        }
+        catch (error) {
+            if (error.code === "ENOENT") {
+                this.loaded = true;
+                return [];
+            }
+            this.logger.error({ err: error }, "Failed to load agents");
+            this.loaded = true;
+            return [];
+        }
+    }
+    async scanDisk() {
+        const records = [];
+        let entries = [];
+        try {
+            entries = await fs.readdir(this.baseDir, { withFileTypes: true });
+        }
+        catch (error) {
+            if (error.code === "ENOENT") {
+                return [];
+            }
+            throw error;
+        }
+        const rootRecordPaths = entries
+            .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+            .map((entry) => path.join(this.baseDir, entry.name));
+        const projectDirs = entries
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => path.join(this.baseDir, entry.name));
+        const projectFileLists = await Promise.all(projectDirs.map(async (projectDir) => {
+            try {
+                const files = await fs.readdir(projectDir, { withFileTypes: true });
+                return files
+                    .filter((file) => file.isFile() && file.name.endsWith(".json"))
+                    .map((file) => path.join(projectDir, file.name));
+            }
+            catch {
+                return [];
+            }
+        }));
+        const allFilePaths = [...rootRecordPaths, ...projectFileLists.flat()];
+        const loaded = await Promise.all(allFilePaths.map(async (filePath) => {
+            const record = await this.readRecordFile(filePath);
+            return record ? { record, filePath } : null;
+        }));
+        for (const item of loaded) {
+            if (!item)
+                continue;
+            const { record, filePath } = item;
+            records.push(record);
+            this.cache.set(record.id, record);
+            this.indexOwner(record);
+            this.pathById.set(record.id, filePath);
+            this.addIndexedPath(record.id, filePath);
+        }
+        return records;
+    }
+    async readRecordFile(filePath) {
+        try {
+            const content = await fs.readFile(filePath, "utf8");
+            const parsed = JSON.parse(content);
+            return parseStoredAgentRecord(parsed);
+        }
+        catch (error) {
+            this.logger.error({ err: error, filePath }, "Skipping invalid agent record");
+            return null;
+        }
+    }
+    buildRecordPath(record) {
+        const projectDir = projectDirNameFromCwd(record.cwd);
+        return path.join(this.baseDir, projectDir, `${record.id}.json`);
+    }
+    addIndexedPath(agentId, filePath) {
+        const paths = this.pathsById.get(agentId) ?? new Set();
+        paths.add(filePath);
+        this.pathsById.set(agentId, paths);
+    }
+    removeIndexedPath(agentId, filePath) {
+        const paths = this.pathsById.get(agentId);
+        if (!paths) {
+            return;
+        }
+        paths.delete(filePath);
+        if (paths.size === 0) {
+            this.pathsById.delete(agentId);
+        }
+    }
+    indexOwner(record) {
+        this.removeOwnerIndex(record.id);
+        if (record.owner?.kind === "daemon") {
+            const key = daemonExecutionKey(record.owner);
+            const previousAgentId = this.daemonAgentIdsByExecution.get(key);
+            if (previousAgentId && previousAgentId !== record.id) {
+                this.daemonExecutionKeysByAgentId.delete(previousAgentId);
+            }
+            this.daemonAgentIdsByExecution.set(key, record.id);
+            this.daemonExecutionKeysByAgentId.set(record.id, key);
+        }
+    }
+    removeOwnerIndex(agentId) {
+        const key = this.daemonExecutionKeysByAgentId.get(agentId);
+        if (!key)
+            return;
+        if (this.daemonAgentIdsByExecution.get(key) === agentId) {
+            this.daemonAgentIdsByExecution.delete(key);
+        }
+        this.daemonExecutionKeysByAgentId.delete(agentId);
+    }
+    async waitForPendingWrite(agentId) {
+        await (this.pendingWrites.get(agentId) ?? Promise.resolve()).catch(() => undefined);
+    }
+}
+function projectDirNameFromCwd(cwd) {
+    // path.win32.parse handles drive letters, UNC roots, and Unix roots on all platforms
+    const { root } = path.win32.parse(cwd);
+    const withoutRoot = cwd.slice(root.length).replace(/[\\/]+$/, "");
+    // Sanitize root: strip colons and separators, keep letters (e.g. "C:\" → "C", "\\server\share\" → "server-share")
+    const sanitizedRoot = root.replace(/[:\\/]+/g, "-").replace(/^-+|-+$/g, "");
+    const prefix = sanitizedRoot ? sanitizedRoot + "-" : "";
+    if (!withoutRoot) {
+        return sanitizedRoot || "root";
+    }
+    return prefix + withoutRoot.replace(/[\\/]+/g, "-");
+}
+//# sourceMappingURL=agent-storage.js.map

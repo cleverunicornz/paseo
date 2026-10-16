@@ -1,0 +1,73 @@
+const TOOL_CALL_CONTENT_MAX_LENGTH = 64 * 1024;
+export const PLUGIN_TIMELINE_DATA_MAX_BYTES = 64 * 1024;
+export function assertPluginTimelineDataSize(data) {
+    const serializedBytes = Buffer.byteLength(JSON.stringify(data), "utf8");
+    if (serializedBytes > PLUGIN_TIMELINE_DATA_MAX_BYTES) {
+        throw new Error(`Plugin timeline item data exceeds ${PLUGIN_TIMELINE_DATA_MAX_BYTES} bytes`);
+    }
+}
+/**
+ * Independent copy of the first `length` UTF-16 code units of `text`.
+ *
+ * `slice` returns a string that shares the whole `text` backing store, so a capped item keeps its
+ * multi-megabyte source alive. The UTF-16 round trip detaches the copy; the UTF-8 one would
+ * replace a surrogate pair split at the cap with replacement characters.
+ */
+function retainTextPrefix(text, length) {
+    return text.slice(0, length);
+}
+function limitFailedShellError(item) {
+    if (item.type !== "tool_call" ||
+        item.detail.type !== "shell" ||
+        item.status !== "failed" ||
+        typeof item.error !== "object" ||
+        item.error === null ||
+        !("content" in item.error) ||
+        typeof item.error.content !== "string" ||
+        item.error.content.length <= TOOL_CALL_CONTENT_MAX_LENGTH) {
+        return item;
+    }
+    return {
+        ...item,
+        error: {
+            ...item.error,
+            content: retainTextPrefix(item.error.content, TOOL_CALL_CONTENT_MAX_LENGTH),
+        },
+    };
+}
+function limitPlainText(item) {
+    if (item.type !== "tool_call" ||
+        item.detail.type !== "plain_text" ||
+        typeof item.detail.text !== "string" ||
+        item.detail.text.length <= TOOL_CALL_CONTENT_MAX_LENGTH) {
+        return item;
+    }
+    const notice = "\n\n[Content truncated]";
+    return {
+        ...item,
+        detail: {
+            ...item.detail,
+            text: retainTextPrefix(item.detail.text, TOOL_CALL_CONTENT_MAX_LENGTH - notice.length) + notice,
+        },
+    };
+}
+export function limitAgentTimelineItemContent(item) {
+    item = limitFailedShellError(item);
+    item = limitPlainText(item);
+    if (item.type !== "tool_call" ||
+        item.detail.type !== "shell" ||
+        typeof item.detail.output !== "string") {
+        return item;
+    }
+    if (item.detail.output.length <= TOOL_CALL_CONTENT_MAX_LENGTH) {
+        return item;
+    }
+    return {
+        ...item,
+        detail: {
+            ...item.detail,
+            output: retainTextPrefix(item.detail.output, TOOL_CALL_CONTENT_MAX_LENGTH),
+        },
+    };
+}
+//# sourceMappingURL=agent-timeline-content.js.map
