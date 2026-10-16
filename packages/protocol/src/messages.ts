@@ -192,6 +192,7 @@ export const MutableDaemonConfigSchema = z
       .object({
         maxProcessesPerSecond: z.number().int().positive(),
         maxProcessConcurrency: z.number().int().positive(),
+        maxQueueDepth: z.number().int().positive(),
       })
       .optional(),
     app: z.object({ baseUrl: z.string() }).optional(),

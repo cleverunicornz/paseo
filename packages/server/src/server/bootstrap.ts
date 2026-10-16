@@ -404,6 +404,7 @@ export interface PaseoDaemonConfig {
   git?: {
     maxProcessesPerSecond: number;
     maxProcessConcurrency: number;
+    maxQueueDepth: number;
   };
   autoArchiveAfterMerge?: boolean;
   enableTerminalAgentHooks?: boolean;
@@ -938,6 +939,10 @@ export async function createPaseoDaemon(
     if (git) configureGitProcessPolicy(git);
   });
   daemonConfigStore.onFieldChange("git.maxProcessConcurrency", () => {
+    const git = daemonConfigStore.get().git;
+    if (git) configureGitProcessPolicy(git);
+  });
+  daemonConfigStore.onFieldChange("git.maxQueueDepth", () => {
     const git = daemonConfigStore.get().git;
     if (git) configureGitProcessPolicy(git);
   });

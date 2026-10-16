@@ -525,6 +525,243 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("caches the lite checkout from a refresh and drops it on a state change", async () => {
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const service = createService({ getCheckoutStatus });
+
+    expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "warm" });
+
+    const cached = service.peekCachedCheckout(REPO_CWD);
+    expect(cached).toMatchObject({
+      cwd: REPO_CWD,
+      isGit: true,
+      currentBranch: "main",
+      worktreeRoot: REPO_CWD,
+    });
+
+    // A state change (an external git mutation, a branch switch) invalidates it.
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+
+    // The next refresh republishes it.
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "re-warm" });
+    expect(service.peekCachedCheckout(REPO_CWD)).toEqual(cached);
+
+    service.dispose();
+  });
+
+  test("caches a plain directory as a non-Git lite checkout", async () => {
+    const getCheckoutStatus = vi.fn(async () => ({ isGit: false as const }));
+    const service = createService({ getCheckoutStatus });
+
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "plain-directory" });
+
+    expect(service.peekCachedCheckout(REPO_CWD)).toMatchObject({
+      cwd: REPO_CWD,
+      isGit: false,
+      worktreeRoot: null,
+    });
+
+    service.dispose();
+  });
+
+  test("a closed or unobserved workspace has no cached checkout", async () => {
+    const service = createService();
+
+    expect(service.peekCachedCheckout(join(REPO_CWD, "never-seen"))).toBeNull();
+
+    service.dispose();
+  });
+
+  test("getCheckout serves the warmed cache without a Git read, and goes live after a state change", async () => {
+    let branch = "main";
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { currentBranch: branch }),
+    );
+    const service = createService({ getCheckoutStatus });
+
+    // The client status path warms the cache with one live read.
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("main");
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+
+    // Further status requests are served from the cache: no Git read at all.
+    for (let index = 0; index < 5; index += 1) {
+      expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("main");
+    }
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+
+    // A state change retires it; the next read goes live once, and re-warms.
+    branch = "changed-after-state-change";
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe(branch);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe(branch);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+
+    service.dispose();
+  });
+
+  test("a failed forced refresh retires the cached checkout instead of serving it as fresh", async () => {
+    let branch = "main";
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { currentBranch: branch }),
+    );
+    const service = createService({ getCheckoutStatus });
+
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "warm" });
+    expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch).toBe("main");
+
+    // The branch moved, then the forced refresh that would have republished it
+    // fails. The cache must not keep serving the retired branch.
+    branch = "changed-before-forced-refresh";
+    getCheckoutStatus.mockRejectedValueOnce(new Error("forced-refresh-failed"));
+    await expect(
+      service.getSnapshot(REPO_CWD, { force: true, reason: "forced-error" }),
+    ).rejects.toThrow("forced-refresh-failed");
+
+    expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe(branch);
+
+    service.dispose();
+  });
+
+  test("a slow read begun before an invalidation never republishes the retired facts", async () => {
+    let branch = "main";
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { currentBranch: branch }),
+    );
+    const service = createService({ getCheckoutStatus });
+
+    await service.getSnapshot(REPO_CWD, { force: true, reason: "warm" });
+
+    // A refresh starts and its status read hangs.
+    const oldRead = createDeferred<CheckoutStatusGit>();
+    getCheckoutStatus.mockImplementationOnce(async () => oldRead.promise);
+    const refresh = service.getSnapshot(REPO_CWD, { force: true, reason: "old-in-flight" });
+    await vi.waitFor(() => expect(getCheckoutStatus).toHaveBeenCalledTimes(2));
+
+    // The branch changes and the workspace is invalidated while the read is out.
+    branch = "changed-after-old-read";
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+
+    // The old read resolves with the retired branch; it must not publish it.
+    oldRead.resolve(createCheckoutStatus(REPO_CWD, { currentBranch: "main" }));
+    await refresh;
+
+    // The scheduled successor refresh fails too: the cache stays empty and a
+    // live read returns the branch that is actually current.
+    getCheckoutStatus.mockRejectedValueOnce(new Error("successor-failed"));
+    await vi.advanceTimersByTimeAsync(1_001);
+    await flushPromises();
+
+    expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe(branch);
+
+    service.dispose();
+  });
+
+  test("an unobserved slow read begun before an invalidation never overwrites a newer read", async () => {
+    // No workspace target ever observes this cwd: the client status path is its
+    // only reader. The invalidation identity must not depend on a target
+    // existing, or a slow read captured before the invalidation can publish
+    // over the fresh read that completed after it.
+    const oldRead = createDeferred<CheckoutStatusGit>();
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { currentBranch: "fresh" }),
+    );
+    getCheckoutStatus.mockImplementationOnce(async () => oldRead.promise);
+    const service = createService({ getCheckoutStatus });
+
+    // The status read starts and hangs.
+    const pending = service.getCheckout(REPO_CWD);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+
+    // The cwd is invalidated while the slow read is out; a second read goes
+    // live and completes with the current facts.
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+    expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch).toBe("fresh");
+
+    // The slow read resolves with the retired facts. It must be discarded, so
+    // both the next client call and the reconciliation sweep keep reading the
+    // fresh entry.
+    oldRead.resolve(createCheckoutStatus(REPO_CWD, { currentBranch: "obsolete" }));
+    await pending;
+
+    expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+    expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch).toBe("fresh");
+
+    service.dispose();
+  });
+
+  test.each([false, true])(
+    "retirement survives 4,096 LRU evictions (evict fresh entry too: %s)",
+    async (evictFreshEntry) => {
+      const oldRead = createDeferred<CheckoutStatusGit>();
+      const getCheckoutStatus = vi.fn(async (cwd: string) =>
+        createCheckoutStatus(cwd, { currentBranch: "fresh" }),
+      );
+      getCheckoutStatus.mockImplementationOnce(async () => oldRead.promise);
+      const service = createService({ getCheckoutStatus });
+      try {
+        const pending = service.getCheckout(REPO_CWD);
+        expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+        service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+
+        // Use the real bound and public invalidation path, with no observed targets.
+        for (let index = 0; index < 4_096; index += 1) {
+          service.onWorkspaceStateMayHaveChanged(`${REPO_CWD}-other-${index}`);
+        }
+        expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+        expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+
+        if (evictFreshEntry) {
+          for (let index = 0; index < 4_096; index += 1) {
+            service.onWorkspaceStateMayHaveChanged(`${REPO_CWD}-other-${index}`);
+          }
+          expect(service.peekCachedCheckout(REPO_CWD)).toBeNull();
+        }
+        oldRead.resolve(createCheckoutStatus(REPO_CWD, { currentBranch: "obsolete" }));
+        await pending;
+
+        // An absent slot must also refuse the old publication. The next client
+        // read goes live again only when the fresh entry itself was evicted.
+        expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch ?? null).toBe(
+          evictFreshEntry ? null : "fresh",
+        );
+        expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+        expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch).toBe("fresh");
+        expect(getCheckoutStatus).toHaveBeenCalledTimes(evictFreshEntry ? 3 : 2);
+        expect(service.getMetrics().workspaceTargetCount).toBe(0);
+      } finally {
+        service.dispose();
+      }
+    },
+  );
+
+  test("a newer concurrent checkout read supersedes an older read without invalidation", async () => {
+    const oldRead = createDeferred<CheckoutStatusGit>();
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { currentBranch: "fresh" }),
+    );
+    getCheckoutStatus.mockImplementationOnce(async () => oldRead.promise);
+    const service = createService({ getCheckoutStatus });
+    try {
+      const pending = service.getCheckout(REPO_CWD);
+      expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+      oldRead.resolve(createCheckoutStatus(REPO_CWD, { currentBranch: "obsolete" }));
+      await pending;
+      expect((await service.getCheckout(REPO_CWD)).currentBranch).toBe("fresh");
+      expect(service.peekCachedCheckout(REPO_CWD)?.currentBranch).toBe("fresh");
+      expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+    } finally {
+      service.dispose();
+    }
+  });
+
   test("bounds refresh generations and re-enqueues hot workspace successors fairly", async () => {
     const hotCwds = Array.from({ length: WORKSPACE_GIT_REFRESH_CONCURRENCY }, (_, index) =>
       path.resolve(`/tmp/hot-repo-${index}`),
