@@ -463,6 +463,27 @@ describe("DaemonSession", () => {
           p99Ms: 4,
           maxMs: 7,
         },
+        loopHealth: {
+          timerLateness: { count: 12, p50Ms: 2, p95Ms: 9, maxMs: 250 },
+          eventLoopUtilization: { utilization: 0.42, activeMs: 120, idleMs: 180 },
+          gc: {
+            count: 5,
+            totalPauseMs: 40,
+            maxPauseMs: 12,
+            byKind: [["minor", 4]],
+          },
+          heap: {
+            heapUsedBytes: 1024 * 1024 * 12,
+            heapUsedDeltaBytes: 1024 * 512,
+            heapTotalBytes: 1024 * 1024 * 32,
+            rssBytes: 1024 * 1024 * 64,
+            externalBytes: 1024 * 1024 * 3,
+          },
+          nativeHandles: {
+            total: 189434,
+            byType: [["FSWatcher", 189000]],
+          },
+        },
         runtime: {
           inflightRequests: 1,
           peakInflightRequests: 3,
@@ -523,5 +544,97 @@ describe("DaemonSession", () => {
       "Checkout diff: targets=6, subscriptions=7, watchers=8, fallbackRefreshTargets=9",
     );
     expect(message.payload.diagnostic).toContain("Agent lifecycle: idle=8, running=2");
+  });
+
+  test("diagnostics carries the loop-blocker series", async () => {
+    const { subsystem, emitted } = makeSubsystem({
+      getWebSocketRuntimeMetrics: () => ({
+        collectedAt: "2026-01-02T03:04:05.000Z",
+        windowMs: 30_000,
+        uptimeSeconds: 12.345,
+        memory: {
+          rss: 1024 * 1024 * 64,
+          heapTotal: 1024 * 1024 * 32,
+          heapUsed: 1024 * 1024 * 12,
+          external: 1024 * 1024 * 3,
+          arrayBuffers: 1024 * 512,
+        },
+        final: false,
+        sessions: { activeConnections: 2, externalSessionKeys: 3, reconnectGraceSessions: 1 },
+        sockets: { activeSockets: 2, pendingConnections: 1 },
+        counters: {
+          connectedAwaitingHello: 1,
+          helloResumed: 0,
+          helloNew: 2,
+          pendingDisconnected: 0,
+          sessionDisconnectedWaitingReconnect: 0,
+          sessionSocketDisconnectedAttached: 0,
+          sessionCleanup: 0,
+          validationFailed: 0,
+          binaryBeforeHelloRejected: 0,
+          pendingMessageRejectedBeforeHello: 0,
+          missingConnectionForMessage: 0,
+          unexpectedHelloOnActiveConnection: 0,
+          relayExternalSocketAttached: 0,
+          originRejected: 0,
+          hostRejected: 0,
+        },
+        inboundMessageTypesTop: [],
+        inboundSessionRequestTypesTop: [],
+        outboundMessageTypesTop: [],
+        outboundSessionMessageTypesTop: [],
+        outboundAgentStreamTypesTop: [],
+        outboundAgentStreamAgentsTop: [],
+        outboundBinaryFrameTypesTop: [],
+        bufferedAmount: { p95: 0, max: 0 },
+        eventLoopDelay: { p50Ms: 1, p99Ms: 4, maxMs: 7 },
+        loopHealth: {
+          timerLateness: { count: 12, p50Ms: 2, p95Ms: 9, maxMs: 250 },
+          eventLoopUtilization: { utilization: 0.42, activeMs: 120, idleMs: 180 },
+          gc: { count: 5, totalPauseMs: 40, maxPauseMs: 12, byKind: [["minor", 4]] },
+          heap: {
+            heapUsedBytes: 1024 * 1024 * 12,
+            heapUsedDeltaBytes: 1024 * 512,
+            heapTotalBytes: 1024 * 1024 * 32,
+            rssBytes: 1024 * 1024 * 64,
+            externalBytes: 1024 * 1024 * 3,
+          },
+          nativeHandles: { total: 189434, byType: [["FSWatcher", 189000]] },
+        },
+        runtime: {
+          inflightRequests: 1,
+          peakInflightRequests: 3,
+          terminalSubscriptionCount: 4,
+          terminalDirectorySubscriptionCount: 5,
+          checkoutDiffTargetCount: 6,
+          checkoutDiffSubscriptionCount: 7,
+          checkoutDiffWatcherCount: 8,
+          checkoutDiffFallbackRefreshTargetCount: 9,
+        },
+        latency: [],
+        agents: {
+          total: 10,
+          byLifecycle: { idle: 8, running: 2 },
+          withActiveForegroundTurn: 2,
+          timelineStats: { totalItems: 42, maxItemsPerAgent: 12 },
+        },
+      }),
+    });
+
+    await subsystem.handleDiagnosticsRequest({ type: "diagnostics.request", requestId: "d-3" });
+
+    const message = emitted[0];
+    if (message?.type !== "diagnostics.response") {
+      throw new Error("expected diagnostics response");
+    }
+    const { diagnostic } = message.payload;
+    expect(diagnostic).toContain(
+      "Loop lateness: timer p50=2ms, p95=9ms, max=250ms, utilization=0.42",
+    );
+    expect(diagnostic).toContain("GC: count=5, maxPause=12ms");
+    expect(diagnostic).toContain("heapUsed=12.0 MiB");
+    expect(diagnostic).toContain("kinds=minor=4");
+    expect(diagnostic).toContain("Native handles: total=189434");
+    expect(diagnostic).toContain("FSWatcher=189000");
   });
 });

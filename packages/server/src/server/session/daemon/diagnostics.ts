@@ -317,6 +317,9 @@ function collectWebSocketRuntimeEntries(options: DaemonDiagnosticsOptions): Diag
       )}`,
     },
     { label: "Event loop delay", value: formatEventLoopDelay(snapshot.eventLoopDelay) },
+    { label: "Loop lateness", value: formatLoopLateness(snapshot.loopHealth) },
+    { label: "GC", value: formatGcSeries(snapshot.loopHealth) },
+    { label: "Native handles", value: formatNativeHandles(snapshot.loopHealth) },
     { label: "Latency", value: formatLatencyStats(snapshot.latency) },
     { label: "Inbound messages", value: formatTopCounts(snapshot.inboundMessageTypesTop) },
     {
@@ -374,6 +377,38 @@ function formatEventLoopDelay(
   return `p50=${formatMilliseconds(stats.p50Ms)}, p99=${formatMilliseconds(
     stats.p99Ms,
   )}, max=${formatMilliseconds(stats.maxMs)}`;
+}
+
+function formatLoopLateness(
+  health: DaemonWebSocketRuntimeDiagnosticSnapshot["loopHealth"],
+): string {
+  if (!health) return "unavailable";
+  const { timerLateness } = health;
+  const utilization = health.eventLoopUtilization;
+  const utilizationText =
+    utilization === null ? "utilization=unavailable" : `utilization=${utilization.utilization}`;
+  return `timer p50=${formatMilliseconds(timerLateness.p50Ms)}, p95=${formatMilliseconds(
+    timerLateness.p95Ms,
+  )}, max=${formatMilliseconds(timerLateness.maxMs)}, ${utilizationText}`;
+}
+
+function formatGcSeries(health: DaemonWebSocketRuntimeDiagnosticSnapshot["loopHealth"]): string {
+  if (!health) return "unavailable";
+  const { gc, heap } = health;
+  return `count=${gc.count}, maxPause=${formatMilliseconds(
+    gc.maxPauseMs,
+  )}, heapUsed=${formatBytes(heap.heapUsedBytes)}, delta=${formatBytes(
+    heap.heapUsedDeltaBytes,
+  )}, kinds=${formatTopCounts(gc.byKind)}`;
+}
+
+function formatNativeHandles(
+  health: DaemonWebSocketRuntimeDiagnosticSnapshot["loopHealth"],
+): string {
+  if (!health) return "unavailable";
+  return `total=${health.nativeHandles.total}, types=${formatTopCounts(
+    health.nativeHandles.byType,
+  )}`;
 }
 
 function formatNumberRecord(record: object | undefined): string {

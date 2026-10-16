@@ -8,6 +8,7 @@ import { join } from "path";
 import { getHostName } from "./host-name.js";
 import { randomUUID } from "node:crypto";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import { LoopHealthMonitor, type LoopHealthSnapshot } from "./loop-health.js";
 import type { AgentManager, AgentMetricsSnapshot } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
@@ -229,6 +230,7 @@ function createFallbackWorkspaceGitService(): WorkspaceGitService {
       unsubscribe: () => {},
     }),
     peekSnapshot: () => null,
+    peekCachedCheckout: () => null,
     getCheckout: async (cwd: string) => ({
       cwd,
       isGit: false,
@@ -582,6 +584,7 @@ export class VoiceAssistantWebSocketServer {
   private applicationSocketLeaseInterval: ReturnType<typeof setInterval> | null = null;
   private readonly applicationSocketLease = new ApplicationSocketLease<WebSocketLike>();
   private eventLoopDelayMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
+  private loopHealthMonitor: LoopHealthMonitor | null = null;
   private unsubscribeSpeechReadiness: (() => void) | null = null;
   private unsubscribeDaemonConfigChange: (() => void) | null = null;
   private unsubscribeTerminalActivity: (() => void) | null = null;
@@ -840,6 +843,8 @@ export class VoiceAssistantWebSocketServer {
   private startRuntimeMetricsInterval(): void {
     this.eventLoopDelayMonitor = monitorEventLoopDelay({ resolution: 10 });
     this.eventLoopDelayMonitor.enable();
+    this.loopHealthMonitor = new LoopHealthMonitor();
+    this.loopHealthMonitor.start();
     const runtimeMetricsInterval = setInterval(() => {
       this.flushRuntimeMetrics();
     }, WS_RUNTIME_METRICS_FLUSH_MS);
@@ -875,6 +880,13 @@ export class VoiceAssistantWebSocketServer {
     };
     monitor.reset();
     return snapshot;
+  }
+
+  // The loop-blocker series the poll-phase gauge cannot see: true timer
+  // lateness under microtask pressure, the collector's pause series, and the
+  // native handle count.
+  private snapshotLoopHealth(): LoopHealthSnapshot | null {
+    return this.loopHealthMonitor?.snapshot() ?? null;
   }
 
   private verifyWsUpgrade(
@@ -1079,6 +1091,8 @@ export class VoiceAssistantWebSocketServer {
     this.flushRuntimeMetrics({ final: true });
     this.eventLoopDelayMonitor?.disable();
     this.eventLoopDelayMonitor = null;
+    this.loopHealthMonitor?.stop();
+    this.loopHealthMonitor = null;
 
     const uniqueConnections = new Set<SessionConnection>([
       ...this.sessions.values(),
@@ -2531,6 +2545,7 @@ export class VoiceAssistantWebSocketServer {
       outboundBinaryFrameTypesTop: runtimeMetrics.outboundBinaryFrameTypesTop,
       bufferedAmount: runtimeMetrics.bufferedAmount,
       eventLoopDelay: this.snapshotEventLoopDelay(),
+      loopHealth: this.snapshotLoopHealth(),
       uptimeSeconds: getProcessUptimeSeconds(),
       memory: getProcessMemoryDiagnostics(),
       runtime: sessionMetrics,
