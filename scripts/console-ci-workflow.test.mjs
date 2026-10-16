@@ -192,6 +192,13 @@ test("the console line's ancestry and its built payload are both checked", () =>
   for (const commit of ["759532509", "d282eb2ed"]) {
     assert.match(ancestry.text, new RegExp(`git merge-base --is-ancestor ${commit} HEAD`));
   }
+  // The ancestry check names commits by SHA, so the clone must carry them as
+  // objects: a shallow checkout fails with "Not a valid object name" (run
+  // 38845067423).
+  assert.match(
+    jobBody(workflow, "daemon"),
+    /uses: actions\/checkout@[0-9a-f]+\n\s+with:\n(?:\s+#.*\n)*\s+fetch-depth: 0/,
+  );
   // The payload check reads what was built, and runs after the build.
   const payload = step("Check the built payload carries both fixes");
   assert.match(payload.text, /packages\/server\/dist\/server\/server/);

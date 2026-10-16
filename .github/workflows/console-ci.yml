@@ -38,6 +38,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # The console release ancestry check below names upstream 0.11.2 and
+          # the heap fix by commit; a shallow clone does not carry them as
+          # objects. Full history is what those two `merge-base --is-ancestor`
+          # calls need, and what proves the release is really on this line.
+          fetch-depth: 0
       - name: Install verified Node 22
         shell: bash
         run: |
