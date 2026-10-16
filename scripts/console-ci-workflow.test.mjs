@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { ANCHORED_FILES, ANCHORS, CLI_SIGNATURE } from "./check-managed-update-anchors.mjs";
+import { PORT_COMMITS, SCHEDULER_SOURCE_COMMIT } from "./console-release-provenance.mjs";
+
+/** The full ids the checklist must name; the gate's own copies are prefixes. */
+const UPSTREAM_0_11_2_FULL = "75953250959979b8f088bbca8dbd6ee61d0151b1";
+const HEAP_FIX_COMMIT_FULL = "d282eb2edb418d6988f10837c826d652c1596c4f";
 
 const workflow = readFileSync(
   new URL("../.github/workflows/console-ci.yml", import.meta.url),
@@ -199,16 +204,91 @@ test("the console line's ancestry and its built payload are both checked", () =>
     jobBody(workflow, "daemon"),
     /uses: actions\/checkout@[0-9a-f]+\n\s+with:\n(?:\s+#.*\n)*\s+fetch-depth: 0/,
   );
-  // The payload check reads what was built, and runs after the build.
+  // The payload check reads what was built, and runs after the build. It RUNS the
+  // built code through the behavior probes: the r1 validator reverted the bound
+  // and either heap helper with every marker string intact, and a substring
+  // search accepted all three mutants.
   const payload = step("Check the built payload carries both fixes");
-  assert.match(payload.text, /packages\/server\/dist\/server\/server/);
-  assert.match(payload.text, /assertPayloadCarriesFixes/);
+  assert.match(payload.text, /assertPayloadCarriesFixes\("packages\/server\/dist\/server"\)/);
   assert.ok(
     stepIndex("Build daemon and CLI") < stepIndex("Check the built payload carries both fixes"),
   );
-  // The provenance script has its own tests in the release-rules step.
-  assert.match(
-    step("Check the release rules").text,
-    /scripts\/console-release-provenance\.test\.mjs/,
+  // The provenance script has its own tests in the release-rules step, and the
+  // probes are not a marker list at all: no substring constants remain.
+  const releaseRules = step("Check the release rules");
+  assert.match(releaseRules.text, /scripts\/console-release-provenance\.test\.mjs/);
+  assert.match(releaseRules.text, /scripts\/release-assets\.test\.mjs/);
+  assert.doesNotMatch(workflow, /PAYLOAD_MARKERS/);
+});
+
+test("the prepublished identity is checked on the real packed assets", () => {
+  // The r1 control: real 0.11.2 tarballs renamed to the tag's version passed the
+  // old gate. This step reads each tarball's own embedded package.json, the
+  // checksum tables against the tarballs' bytes, and SOURCE_COMMIT against the run.
+  const identity = step("Check the release identity and its packed payload");
+  assert.match(identity.text, /readReleaseAssets/);
+  assert.match(identity.text, /assertPrepublicationProvenance/);
+  assert.match(identity.text, /expectedReleaseAssets/);
+  assert.match(identity.text, /packed\.version, version/);
+  assert.match(identity.text, /assets\.sourceCommit, runCommit/);
+  // It runs on a release dispatch, after the packs, before the upload.
+  assert.match(identity.text, /if: github\.event_name == 'workflow_dispatch'/);
+  assert.ok(
+    stepIndex("Pack release packages") <
+      stepIndex("Check the release identity and its packed payload"),
   );
+});
+
+test("the published release is qualified from its downloaded assets, read-only", () => {
+  // POSTPUBLICATION: a downloaded release is the evidence. The job downloads the
+  // release it just published, installs the tarballs as the image does, and runs
+  // the probes against the INSTALLED server's dist, so the proof is of the
+  // published bytes rather than of this run's build tree.
+  const job = jobBody(workflow, "qualify-published");
+  assert.match(job, /needs: publish/);
+  assert.match(job, /permissions:\n {6}contents: read\n/);
+  assert.doesNotMatch(job, /contents: write/);
+  const download = jobSteps(workflow, "qualify-published").find((entry) =>
+    /gh release download/.test(entry.text),
+  );
+  assert.ok(download, "step downloading the release");
+  const qualify = jobSteps(workflow, "qualify-published").find((entry) =>
+    /assertReleaseProvenance/.test(entry.text),
+  );
+  assert.ok(qualify, "step qualifying the release");
+  assert.match(qualify.text, /installedRoot, "@getpaseo\/server\/dist\/server"/);
+  assert.match(qualify.text, /assertPayloadCarriesFixes/);
+  assert.match(qualify.text, /readReleaseAssets/);
+  // The write token stays the publish job's alone; the qualifier only reads.
+  assert.equal([...workflow.matchAll(/contents: write/g)].length, 1);
+});
+
+test("the tracked checklist names the full commits and requires the kit receipt", () => {
+  // F4: the gate before the operator ask must name the real identity, in full,
+  // and must require a receipt for the selected kit and the published payload.
+  // Abbreviations and marker claims are what let cvu.2 through.
+  const checklist = readFileSync(
+    new URL("../docs/console-release-checklist.md", import.meta.url),
+    "utf8",
+  );
+  for (const commit of [
+    UPSTREAM_0_11_2_FULL,
+    HEAP_FIX_COMMIT_FULL,
+    PORT_COMMITS.schedulerBound,
+    PORT_COMMITS.incrementalReconciliation,
+    PORT_COMMITS.loopInstrumentation,
+    SCHEDULER_SOURCE_COMMIT,
+  ]) {
+    assert.match(checklist, new RegExp(commit), `the checklist names ${commit} in full`);
+  }
+  // The receipt and the version binding are required before the ask.
+  assert.match(checklist, /pct current/);
+  assert.match(checklist, /kit sha/);
+  assert.match(checklist, /receipt/i);
+  // The payload rule is behavioral, and markers are explicitly not proof.
+  assert.match(checklist, /behavior/i);
+  assert.match(checklist, /marker string as proof/);
+  // The two halves are separated, as F3 requires.
+  assert.match(checklist, /Prepublication identity/);
+  assert.match(checklist, /Postpublication qualification/);
 });

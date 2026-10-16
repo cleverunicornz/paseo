@@ -387,6 +387,74 @@ describe("runGitCommand", () => {
     await Promise.all([active, queued]);
   });
 
+  it("retires refused background submissions from both metric sets", async () => {
+    // Regression (validator r1 F1): the submit-time records of a queue-full
+    // refusal outlived every window reset, so retained state grew with
+    // cumulative backpressure. Two batches of 1,000 refusals, each drained
+    // before the next, must leave no pending runtime-metrics record and no
+    // unfinished submission.
+    const {
+      runGitCommand,
+      runWithGitCommandClass,
+      createRunGitCommand,
+      snapshotGitCommandRuntimeMetrics,
+      startGitCommandMetrics,
+      stopGitCommandMetrics,
+      waitForGitCommandMetricsIdle,
+    } = await loadRunGitCommand(1, { queueDepth: 1 });
+
+    const named = createRunGitCommand("refused-background");
+    startGitCommandMetrics();
+
+    const observed: Array<{ totalRefusals: number; pendingProvenanceTop: unknown }> = [];
+    let totalRefusals = 0;
+
+    for (let pass = 0; pass < 2; pass += 1) {
+      enqueueSpawnBehaviors({ delayMs: 0 }, { delayMs: 0 });
+      const active = runGitCommand(["status"], { cwd: process.cwd() });
+      await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(pass * 2 + 1));
+      const queued = runGitCommand(["status", "--short"], { cwd: process.cwd() });
+
+      let refusals = 0;
+      const refuse = (error: unknown) => {
+        expect((error as { name?: string }).name).toBe("GitProcessQueueFullError");
+        refusals += 1;
+      };
+      const refuseOne = () =>
+        runWithGitCommandClass("background", () =>
+          named(["status", "--porcelain"], { cwd: process.cwd() }),
+        ).catch(refuse);
+      await Promise.all(Array.from({ length: 1000 }, refuseOne));
+      totalRefusals += refusals;
+      expect(refusals).toBe(1000);
+
+      await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(pass * 2 + 2));
+      await Promise.all([active, queued]);
+
+      // The window resets twice; a refused record must not survive either.
+      // This is read before the idle wait so the runtime-metrics leak is
+      // reported as itself, not as a downstream timeout.
+      expect(snapshotGitCommandRuntimeMetrics().pendingProvenanceTop).toEqual([]);
+      const afterReset = snapshotGitCommandRuntimeMetrics();
+      expect(afterReset.pendingProvenanceTop).toEqual([]);
+      expect(afterReset.pending).toBe(0);
+      expect(afterReset.active).toBe(0);
+      observed.push({ totalRefusals, pendingProvenanceTop: afterReset.pendingProvenanceTop });
+    }
+
+    expect(observed).toEqual([
+      { totalRefusals: 1000, pendingProvenanceTop: [] },
+      { totalRefusals: 2000, pendingProvenanceTop: [] },
+    ]);
+
+    // The submission list is drained too: `idle` returns and `stop` does not
+    // refuse for orphaned submissions.
+    await waitForGitCommandMetricsIdle({ quietMs: 0, timeoutMs: 1_000 });
+    const drained = stopGitCommandMetrics();
+    expect(drained.pending).toBe(0);
+    expect(drained.submitted).toBe(drained.completed);
+  });
+
   it("never defers a foreground command for queue depth, however deep the queue is", async () => {
     const { runGitCommand, runWithGitCommandClass } = await loadRunGitCommand(1, { queueDepth: 1 });
 

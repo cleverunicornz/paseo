@@ -54,7 +54,7 @@ jobs:
           tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
           echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
       - name: Check the release rules
-        run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs scripts/check-managed-update-anchors.test.mjs scripts/console-release-provenance.test.mjs
+        run: node --test scripts/console-release-channel.test.mjs scripts/console-ci-workflow.test.mjs scripts/check-managed-update-anchors.test.mjs scripts/console-release-provenance.test.mjs scripts/release-assets.test.mjs
       - name: Check the console release ancestry
         # The console's line, and the heap fix in it. The scheduler port's own
         # commits cannot name themselves in a committed manifest, so they are
@@ -105,22 +105,25 @@ jobs:
           node scripts/check-managed-update-anchors.mjs packages/server/dist/server/server
       - name: Check the built payload carries both fixes
         # The tag and the ancestry are claims; the built payload is the evidence.
-        # The 2026-10-16 v0.11.2-cvu.2 defect carried neither fix. This reads the
-        # just-built server dist for each fix's marker: the scheduler bound, the
-        # loop instrumentation, and the heap fix's UTF-16 detach. It runs on
-        # every qualification of the line, a pull request included, where no
-        # release tag exists yet.
+        # The 2026-10-16 v0.11.2-cvu.2 defect carried neither fix. This RUNS the
+        # just-built server: `scripts/console-payload-probes/*.mjs` drive the
+        # built scheduler, the built limiter, the built streamer and the built
+        # loop monitor, and each asserts the fix's behavior. A marker search
+        # could not refuse the r1 validator's mutants - the bound disabled and
+        # either heap helper reverted, each with every marker string intact - so
+        # this stage proves behavior, not strings. It runs on every
+        # qualification of the line, a pull request included, where no release
+        # tag exists yet.
         shell: bash
         run: |
           set -euo pipefail
-          payload="$RUNNER_TEMP/console-payload.txt"
-          find packages/server/dist/server/server -type f \( -name '*.js' -o -name '*.json' \) \
-            -exec cat {} + > "$payload"
-          node --input-type=module - "$payload" <<'JS'
-          import fs from "node:fs";
+          node --input-type=module - <<'JS'
           import { assertPayloadCarriesFixes } from "./scripts/console-release-provenance.mjs";
-          assertPayloadCarriesFixes(fs.readFileSync(process.argv[2], "utf8"));
-          console.log("The built server carries both fixes.");
+          const observations = assertPayloadCarriesFixes("packages/server/dist/server");
+          for (const observation of observations) {
+            console.log(JSON.stringify(observation));
+          }
+          console.log("The built server behaves as both fixes require.");
           JS
       - name: Set the release version
         # Every workspace package takes the tag's version before packing (P-000269 H2). The
@@ -152,6 +155,67 @@ jobs:
           sha512sum *.tgz > SHA512SUMS
           printf '%s\n' "$GITHUB_SHA" > SOURCE_COMMIT
           node --version > NODE_VERSION
+      - name: Check the release identity and its packed payload
+        # PREPUBLICATION identity, on the real packed assets: the run's head, the
+        # tag's commit and SOURCE_COMMIT are one commit, and each tarball's OWN
+        # embedded package.json carries the tag's version - not merely its name.
+        # The r1 validator renamed real 0.11.2 tarballs to `-0.11.2-cvu.3.tgz`
+        # and the old gate accepted them; this stage reads the contents.
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module - "$RUNNER_TEMP/paseo-release" "$RELEASE_TAG" "$GITHUB_SHA" <<'JS'
+          import assert from "node:assert/strict";
+          import {
+            assertPrepublicationProvenance,
+            expectedReleaseAssets,
+            expectedAssetVersion,
+            RELEASE_PACKAGES,
+          } from "./scripts/console-release-provenance.mjs";
+          import { readReleaseAssets } from "./scripts/release-assets.mjs";
+
+          const [releaseDir, tag, runCommit] = process.argv.slice(2);
+          const version = expectedAssetVersion(tag);
+          const assets = readReleaseAssets({ releaseDir, expectedPackageNames: RELEASE_PACKAGES });
+
+          // The packed bytes are read, not their names.
+          const wanted = [...expectedReleaseAssets(version)].sort();
+          assert.deepEqual([...assets.assetNames].sort(), wanted, "the packed asset set");
+          for (const name of RELEASE_PACKAGES) {
+            const packed = assets.packages.find((item) => item.name === `@getpaseo/${name}`);
+            assert.ok(packed, `@getpaseo/${name} is not packed`);
+            assert.equal(packed.version, version, `the packed @getpaseo/${name}`);
+          }
+          // The checksums bind the tarballs' bytes, and SOURCE_COMMIT is the run's head.
+          for (const [label, table, key] of [
+            ["SHA256SUMS", assets.checksum256, "sha256"],
+            ["SHA512SUMS", assets.checksum512, "sha512"],
+          ]) {
+            assert.equal(table.length, RELEASE_PACKAGES.length, `${label} entries`);
+            for (const entry of table) {
+              assert.equal(
+                assets.digests.get(entry.file)?.[key],
+                entry.digest,
+                `${label}'s ${entry.file}`,
+              );
+            }
+          }
+          assert.equal(assets.sourceCommit, runCommit, "SOURCE_COMMIT is the run's head");
+          assert.equal(assets.nodeVersion, process.version, "NODE_VERSION");
+
+          // The prepublication rule, including the built payload's behavior.
+          assertPrepublicationProvenance({
+            tag,
+            runCommit,
+            releaseCommit: runCommit,
+            accountedAncestors: ["upstream-0.11.2", "heap-fix"],
+            builtServerDir: "packages/server/dist/server",
+          });
+          console.log(`The packed ${tag} is the run's commit and packs the tag's version.`);
+          JS
       - name: Install the release packages as the session image does
         # As runner-images images/repo-pod/install-paseo-release.sh: the seven packages in one
         # global install, each at the packages' version, the CLI resolving the installed server.
@@ -223,6 +287,87 @@ jobs:
           prerelease=()
           if [ "$channel" = prerelease ]; then prerelease=(--prerelease); fi
           gh release create "$RELEASE_TAG" "$RUNNER_TEMP/paseo-release/"* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$RELEASE_TAG" "${prerelease[@]}" --notes 'Source-built daemon packages. Package names and protocol remain compatible with the upstream release. Install all seven packages together; SHA256SUMS and SHA512SUMS bind the assets. SOURCE_COMMIT and NODE_VERSION retain build identity.'
+
+  qualify-published:
+    # POSTPUBLICATION qualification, on what was really published. A release is a
+    # claim; only the downloaded assets are evidence. This job has no write token:
+    # it reads the release it just published and proves it. It downloads the seven
+    # tarballs, installs them as the session image installs them (so their own
+    # dependency graph resolves), and runs the payload behavior probes against the
+    # INSTALLED server's dist - not this run's build directory, which could have
+    # been repacked or replaced.
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    needs: publish
+    runs-on: { group: ci, labels: automation-test-s }
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install verified Node 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --output /tmp/paseo-node.tar.xz https://nodejs.org/dist/v22.23.3/node-v22.23.3-linux-x64.tar.xz
+          echo 'df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de  /tmp/paseo-node.tar.xz' | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/paseo-node"
+          tar -xJf /tmp/paseo-node.tar.xz --strip-components=1 -C "$RUNNER_TEMP/paseo-node"
+          echo "$RUNNER_TEMP/paseo-node/bin" >> "$GITHUB_PATH"
+      - name: Download the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          published="$RUNNER_TEMP/paseo-published"
+          mkdir -p "$published"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$published"
+      - name: Qualify the published release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          published="$RUNNER_TEMP/paseo-published"
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          test -n "$tag_commit"
+          # Install the seven downloaded tarballs as the session image does: one
+          # global install, so their own dependencies resolve and the probes load
+          # the published bytes, not the build tree.
+          image="$RUNNER_TEMP/paseo-published-image"
+          npm install --global --prefix "$image" --no-audit --no-fund "$published/"*.tgz
+          node --input-type=module - "$published" "$image/lib/node_modules" "$RELEASE_TAG" "$tag_commit" <<'JS'
+          import path from "node:path";
+          import {
+            assertPayloadCarriesFixes,
+            assertReleaseProvenance,
+            RELEASE_PACKAGES,
+          } from "./scripts/console-release-provenance.mjs";
+          import { readReleaseAssets } from "./scripts/release-assets.mjs";
+
+          const [releaseDir, installedRoot, tag, tagCommit] = process.argv.slice(2);
+          const assets = readReleaseAssets({ releaseDir, expectedPackageNames: RELEASE_PACKAGES });
+
+          // The behavior proof runs against the INSTALLED server's dist: the
+          // published bytes with their published dependency graph.
+          const installedServer = path.join(installedRoot, "@getpaseo/server/dist/server");
+          const observations = assertPayloadCarriesFixes(installedServer);
+
+          const result = assertReleaseProvenance({
+            tag,
+            tagCommit,
+            assets,
+            payloadObservations: observations,
+          });
+          console.log(
+            JSON.stringify({
+              qualified: true,
+              installedServer,
+              probes: observations.map((observation) => observation.probe),
+              ...result,
+            }),
+          );
+          JS
 
   server-unit:
     # The server's unit suite. It starts on the smallest test set, automation-test-s, per the

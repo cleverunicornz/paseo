@@ -224,15 +224,44 @@ export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnap
   });
 }
 
-function submitGitCommandMetric(args: string[], cwd: string): GitCommandMetricsState | null {
+function submitGitCommandMetric(
+  args: string[],
+  cwd: string,
+): { state: GitCommandMetricsState; submission: GitCommandSubmissionMetric } | null {
   const state = gitCommandMetricsState;
   if (!state) {
     return null;
   }
-  state.submissions.push({ args: [...args], cwd });
+  const submission: GitCommandSubmissionMetric = { args: [...args], cwd };
+  state.submissions.push(submission);
   state.submitted += 1;
   state.lastSubmittedAtMs = Date.now();
-  return state;
+  return { state, submission };
+}
+
+/**
+ * Undo one submission's bookkeeping when the scheduler refused it before
+ * admission.
+ *
+ * A queue-full `background` submission is a deferral: the command never ran, so
+ * it must not stay counted as submitted-and-unfinished. Without this a refusal
+ * leaves a submission record that no later call removes, `stopGitCommandMetrics`
+ * refuses forever, and the submission list grows with cumulative backpressure.
+ * Only the exact record this call submitted is removed, so a concurrent
+ * submission's bookkeeping is untouched.
+ */
+function retireGitCommandMetric(
+  record: { state: GitCommandMetricsState; submission: GitCommandSubmissionMetric } | null,
+): void {
+  if (!record) {
+    return;
+  }
+  const index = record.state.submissions.indexOf(record.submission);
+  if (index < 0) {
+    return;
+  }
+  record.state.submissions.splice(index, 1);
+  record.state.submitted = Math.max(0, record.state.submitted - 1);
 }
 
 function beginGitCommandMetric(state: GitCommandMetricsState | null): void {
@@ -295,7 +324,8 @@ function executeGitCommand<Output>(
   decode: (output: Buffer) => Output,
   provenance?: string,
 ): Promise<GitCommandResult<Output>> {
-  const metricsState = submitGitCommandMetric(args, options.cwd);
+  const submissionRecord = submitGitCommandMetric(args, options.cwd);
+  const metricsState = submissionRecord?.state ?? null;
   const commandTrace = submitGitCommandTrace(args, options.cwd, {
     active: gitProcessScheduler.activeCount,
     pending: gitProcessScheduler.pendingCount,
@@ -582,7 +612,19 @@ function executeGitCommand<Output>(
     gitProcessScheduler.activeCount,
     gitProcessScheduler.pendingCount,
   );
-  return promise;
+  // A submission refused before admission never reaches `startCommand`, so its
+  // submit-time bookkeeping must be retired here: the named queue-full deferral
+  // stays, but no pending record outlives the refusal, and no submission stays
+  // counted as unfinished forever. `retire` tells us the command never started;
+  // on every other rejection (a timeout, a spawn error) the runtime metric was
+  // already consumed by `start`, so nothing is retired and each path keeps its
+  // own single accounting.
+  return promise.catch((error: unknown) => {
+    if (gitRuntimeMetrics.retire(runtimeMetric)) {
+      retireGitCommandMetric(submissionRecord);
+    }
+    throw error;
+  });
 }
 
 export const runGitCommand: RunGitCommand = runGitCommandWithProvenance;
