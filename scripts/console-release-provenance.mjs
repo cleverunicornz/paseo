@@ -200,7 +200,7 @@ export function assertPrepublicationProvenance({
 }
 
 /**
- * POSTPUBLICATION: qualify a downloaded release's real assets.
+ * Shared packed-byte checks before and after publication.
  *
  * Everything here comes from the files as downloaded: the embedded version of
  * each of the seven tarballs, the two checksum files' digests against the
@@ -213,7 +213,7 @@ export function assertPrepublicationProvenance({
  * server tarball's extracted `dist/server`, because behavior cannot be read out
  * of a tarball's names.
  */
-export function assertReleaseProvenance({ tag, tagCommit, assets, payloadObservations }) {
+export function assertPackedReleaseAssets({ tag, assets }) {
   const version = expectedAssetVersion(tag);
   if (!CONSOLE_BASE_VERSION.test(version)) {
     throw new Error(
@@ -229,10 +229,43 @@ export function assertReleaseProvenance({ tag, tagCommit, assets, payloadObserva
     tarballs,
     digests: assets.digests,
   });
+  return { version };
+}
+
+/** Qualify downloaded bytes and retain their receipt; optional coupled pins must agree. */
+export function assertReleaseProvenance({
+  tag,
+  tagCommit,
+  runCommit,
+  manifest_sha256,
+  assets,
+  payloadObservations,
+}) {
+  const { version } = assertPackedReleaseAssets({ tag, assets });
   assertManifestAndCommit({ assets, tagCommit });
+  if (runCommit !== undefined && (!FULL_COMMIT.test(runCommit) || runCommit !== tagCommit)) {
+    throw new Error(`The qualified run's commit ${runCommit} is not the tag's commit ${tagCommit}`);
+  }
+  if (manifest_sha256 !== undefined && manifest_sha256 !== assets.manifestSha256) {
+    throw new Error("The supplied consumer manifest_sha256 is not the downloaded SHA256SUMS hash");
+  }
   assertPayloadBehaviorProven(payloadObservations);
 
-  return { version, tagCommit, observations: payloadObservations };
+  return {
+    tag,
+    version,
+    runCommit: runCommit ?? null,
+    tagCommit,
+    nodeVersion: assets.nodeVersion,
+    sourceCommit: assets.sourceCommit,
+    manifest_sha256: assets.manifestSha256,
+    checksumFiles: Object.fromEntries(
+      ["SHA256SUMS", "SHA512SUMS"].map((file) => [file, assets.digests.get(file)]),
+    ),
+    packages: assets.packages.map((packed) => ({ ...packed, ...assets.digests.get(packed.file) })),
+    consumerManifestCompared: manifest_sha256 !== undefined,
+    observations: payloadObservations,
+  };
 }
 
 /** Exactly the expected assets: no missing file, no unexpected one. */
@@ -348,7 +381,7 @@ function assertPayloadBehaviorProven(payloadObservations) {
 if (isMainModule(import.meta.url)) {
   // Usage: node console-release-provenance.mjs <manifest.json>
   //   prepublish:  { tag, runCommit, releaseCommit, accountedAncestors, builtServerDir }
-  //   postpublish: { tag, tagCommit, releaseDir, payloadObservations }
+  //   postpublish: { tag, tagCommit, releaseDir, payloadObservations, runCommit?, manifest_sha256? }
   //
   // The postpublish manifest names a DIRECTORY of downloaded assets, not a set
   // of digests: the gate reads each file's own bytes, so a manifest carrying
@@ -364,6 +397,8 @@ if (isMainModule(import.meta.url)) {
       ? assertReleaseProvenance({
           tag: manifest.tag,
           tagCommit: manifest.tagCommit,
+          runCommit: manifest.runCommit,
+          manifest_sha256: manifest.manifest_sha256,
           assets: readReleaseAssets({
             releaseDir: manifest.releaseDir,
             expectedPackageNames: RELEASE_PACKAGES,
@@ -374,7 +409,7 @@ if (isMainModule(import.meta.url)) {
     process.stdout.write(
       `The ${isPostpublish ? "published release" : "built payload"} ${manifest.tag} carries upstream 0.11.2, the heap fix and the scheduler port.\n`,
     );
-    void result;
+    if (isPostpublish) process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
     process.stderr.write(`${error.message}\n`);
     process.exit(1);

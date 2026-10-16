@@ -395,3 +395,45 @@ test("the command line refuses a wrong release and names the reason", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("the release receipt retains all seven byte identities and both checksum file hashes", () => {
+  const input = assets();
+  const result = assertReleaseProvenance(input);
+  assert.equal(result.manifest_sha256, input.assets.manifestSha256);
+  assert.equal(result.sourceCommit, input.tagCommit);
+  assert.equal(result.consumerManifestCompared, false);
+  assert.equal(result.packages.length, 7);
+  for (const packed of result.packages) {
+    assert.deepEqual(packed, {
+      ...input.assets.packages.find((item) => item.file === packed.file),
+      ...input.assets.digests.get(packed.file),
+    });
+  }
+  assert.deepEqual(
+    result.checksumFiles,
+    Object.fromEntries(
+      ["SHA256SUMS", "SHA512SUMS"].map((file) => [file, input.assets.digests.get(file)]),
+    ),
+  );
+  assert.equal(
+    assertReleaseProvenance({
+      ...input,
+      runCommit: TAG_COMMIT,
+      manifest_sha256: input.assets.manifestSha256,
+    }).consumerManifestCompared,
+    true,
+  );
+});
+
+test("supplied coupled run and manifest identities cannot be silently ignored", () => {
+  const input = assets();
+  for (const runCommit of ["1".repeat(40), "3555fc1", null, ""]) {
+    assert.throws(() => assertReleaseProvenance({ ...input, runCommit }), /qualified run's commit/);
+  }
+  for (const manifest_sha256 of ["0".repeat(64), null, ""]) {
+    assert.throws(
+      () => assertReleaseProvenance({ ...input, manifest_sha256 }),
+      /consumer manifest_sha256/,
+    );
+  }
+});

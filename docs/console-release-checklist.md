@@ -19,19 +19,19 @@ full commit ids; `git merge-base --is-ancestor <id> HEAD` must hold for each
 ancestor before the operator is asked, and the payload behavior below must
 hold for each port.
 
-| Role                                                                        | Full commit (ancestor of the release)      |
-| --------------------------------------------------------------------------- | ------------------------------------------ |
-| Upstream 0.11.2, the console line's merge base                              | `75953250959979b8f088bbca8dbd6ee61d0151b1` |
-| Heap fix: detach streamed suffixes and capped prefixes                      | `d282eb2edb418d6988f10837c826d652c1596c4f` |
-| Port H1: bound the git scheduler queue and yield background sweeps          | `6e26eee129c9dbeb60be8f7324e353e84a52694a` |
-| Port H2: reconcile from a warm checkout cache, not a Git read per workspace | `6b2a53a7b60bd46c4602853279d369ea9fbae0c0` |
-| Port H3: expose the loop-blocker series beside the loop-delay gauge         | `8b5559630203c7f2dd616b5ea13cdba35d394e8b` |
-| Validated scheduler source (paseo PR #23), the ports' origin                | `98c30ca59bb42c8bd803f4ec4bc1716e61249633` |
+| Role                                                                        | Full commit (five ancestors; origin reference) |
+| --------------------------------------------------------------------------- | ---------------------------------------------- |
+| Upstream 0.11.2, the console line's merge base                              | `75953250959979b8f088bbca8dbd6ee61d0151b1`     |
+| Heap fix: detach streamed suffixes and capped prefixes                      | `d282eb2edb418d6988f10837c826d652c1596c4f`     |
+| Port H1: bound the git scheduler queue and yield background sweeps          | `6e26eee129c9dbeb60be8f7324e353e84a52694a`     |
+| Port H2: reconcile from a warm checkout cache, not a Git read per workspace | `6b2a53a7b60bd46c4602853279d369ea9fbae0c0`     |
+| Port H3: expose the loop-blocker series beside the loop-delay gauge         | `8b5559630203c7f2dd616b5ea13cdba35d394e8b`     |
+| Validated scheduler source (paseo PR #23), the ports' origin                | `98c30ca59bb42c8bd803f4ec4bc1716e61249633`     |
 
-The three port commits are on `console/main` through the pull request that
-made them; a document committed in that same pull request cannot name its own
-commits, so they are listed here for a human to resolve and proven
-mechanically by the payload's behavior, not by a string.
+The first five commits must be ancestors of the released commit. The PR #23
+commit is the port's origin reference. It is deliberately not a console
+ancestor: compare its fix hunks with the three console port commits. The
+port's behavior must also pass the compiled payload probes.
 
 ## What the scripts check, and how
 
@@ -73,9 +73,10 @@ published. A passing build is not that receipt.
       another line refuses: `scripts/console-release-channel.mjs guard` checks
       the repository, the ref, the tag's shape and the base version before
       anything is built.
-- [ ] **Every commit in the table above is an ancestor of the released commit.**
+- [ ] **The five console commits in the table are ancestors of the released commit.**
       The heap fix and upstream 0.11.2 are checked by the `daemon` job's ancestry
-      step; the three ports by name here.
+      step; check the three full port IDs too. Record the PR #23 origin mapping
+      separately; do not require that origin commit as an ancestor.
 - [ ] **The packed assets carry the tag's version in their contents.** Read each
       tarball's own `package.json`, not its file name: `npm pack` views, or
       `tar -xzOf <tarball> package/package.json`. A renamed copy keeps the
@@ -83,12 +84,16 @@ published. A passing build is not that receipt.
 - [ ] **The published release is downloaded and qualified.** The
       `qualify-published` job's run, from the downloaded assets: seven packages
       at the tag's version, both checksum tables matching the tarballs' bytes,
-      `manifest_sha256` equal to the `SHA256SUMS` bytes, `SOURCE_COMMIT` equal to
-      the tag's commit.
+      `manifest_sha256` equal to the hash of `SHA256SUMS`, `SOURCE_COMMIT` equal to
+      the tag's full commit and the qualified run's full commit. The job fetches
+      the exact tag from `cleverunicornz/paseo`, even in a shallow checkout. A
+      local tag or an origin pointing elsewhere cannot supply its identity.
 - [ ] **Both fixes' behavior is proven in that downloaded payload.** The
       `qualify-published` job runs the behavior probes against the INSTALLED
       server's `dist/server`; its log names all four probes. `manifest_sha256`
-      and the per-tarball digests from that run are the receipt.
+      and both per-tarball digests appear in that run's final JSON receipt, with
+      all seven filenames, embedded names/versions, source/tag IDs and both
+      checksum files' hashes. Retain that receipt with the selected kit receipt.
 - [ ] **The selected kit's receipt binds this release.** `pct current` (kit
       version and kit sha) on `cvu-console-1`, and the privileged-container
       image and repo-pod digest the kit pins, must name `v0.11.2-cvu.3`, its
@@ -98,6 +103,15 @@ published. A passing build is not that receipt.
       `scripts/check-managed-update-anchors.mjs` passes on the built server; the
       anchors are checked by the consumer's own rule, not by byte-identity
       (P-000289 H3 necessarily adds to `websocket-server.js`).
+
+The release receipt computes `manifest_sha256` from the downloaded `SHA256SUMS`
+bytes. Computing it does not verify a consumer pin. Independently compare the
+selected `images/repo-pod/paseo-release.json` tag, version, `SOURCE_COMMIT` and
+`manifest_sha256` with the published receipt before the kit ask. The standalone
+CLI compares optional `runCommit` and `manifest_sha256` inputs when supplied and
+records `consumerManifestCompared`; it does not read or qualify a selected kit.
+Its payload observations must come from the independent downloaded-byte run.
+A PR fixture cannot discharge this postpublication or selected-kit gate.
 
 ## After the release is published
 
