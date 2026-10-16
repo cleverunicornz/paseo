@@ -452,8 +452,8 @@ interface WorkspaceGitTarget {
 
 /**
  * One lite-checkout cache slot per cwd. `checkout` is null for a retired
- * entry or a read that has not published yet, and
- * `peekCachedCheckout` reads a retired entry as "no cached checkout".
+ * entry or a read that has not published yet. `peekCachedCheckout` reads
+ * either as "no cached checkout".
  */
 interface CachedCheckoutEntry {
   checkout: ProjectCheckoutLitePayload | null;
@@ -802,7 +802,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     // Captured before any Git read: if an invalidation lands while this read is
     // in flight, the identity moves and this read publishes nothing - whether
     // or not the cwd has a workspace target.
-    const generation = this.captureCheckoutGeneration(normalizedCwd);
+    const generation = this.reserveCheckoutGeneration(normalizedCwd);
     const status = await this.deps.getCheckoutStatus(normalizedCwd, {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
@@ -3280,7 +3280,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   ): Promise<WorkspaceGitRuntimeSnapshot> {
     // Captured before any Git read: if an invalidation lands while this refresh
     // is in flight, the identity moves and this refresh publishes nothing.
-    const generation = this.captureCheckoutGeneration(target.cwd);
+    const generation = this.reserveCheckoutGeneration(target.cwd);
     let facts = target.latestFacts;
     if (request.movedRemoteRefs.size > 0 && !request.refreshStructure && !request.refreshWorktree) {
       if (facts?.isGit && target.latestGit?.isGit) {
@@ -3356,7 +3356,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
    * Reserve this read's publication identity before it starts. Preserve a warm
    * value during a refresh, but retire every older read's right to publish.
    */
-  private captureCheckoutGeneration(cwd: string): symbol {
+  private reserveCheckoutGeneration(cwd: string): symbol {
     const generation = Symbol();
     const checkout = this.checkoutCache.peek(cwd)?.checkout ?? null;
     this.checkoutCache.set(cwd, { checkout, generation });
