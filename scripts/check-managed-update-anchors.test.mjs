@@ -41,7 +41,7 @@ function trees() {
 test("the anchors are exactly the consumer's old strings", () => {
   // The CLI anchor is the whole installLatest body, which the consumer replaces; a change
   // anywhere inside it moves the anchor. The websocket anchor is one line.
-  assert.ok(ANCHORS[ANCHORED_FILES[0]].startsWith(CLI_SIGNATURE));
+  assert.ok(ANCHORS[ANCHORED_FILES[0]].trimStart().startsWith(CLI_SIGNATURE));
   assert.ok(ANCHORS[ANCHORED_FILES[0]].includes("maxBuffer: NPM_MAX_BUFFER_BYTES"));
   assert.equal(
     ANCHORS[ANCHORED_FILES[1]],

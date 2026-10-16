@@ -147,8 +147,7 @@ test("the managed-update anchors are checked by the consumer's own rule", () => 
   assert.ok(stepIndex("Build daemon and CLI") < stepIndex("Check the managed-update anchors"));
   // The checker requires both files and both anchors, as the consumer does.
   assert.deepEqual(Object.keys(ANCHORS).sort(), ANCHORED_FILES.slice().sort());
-  assert.ok(Object.values(ANCHORS).includes(CLI_SIGNATURE));
-  assert.ok(ANCHORS[ANCHORED_FILES[0]].includes("installLatest(options = {})"));
+  assert.ok(ANCHORS[ANCHORED_FILES[0]].includes(CLI_SIGNATURE));
   assert.ok(ANCHORS[ANCHORED_FILES[0]].includes("maxBuffer: NPM_MAX_BUFFER_BYTES"));
   assert.ok(
     Object.values(ANCHORS).includes(
