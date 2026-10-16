@@ -1,4 +1,5 @@
 import type { SessionOutboundMessage, WSOutboundMessage } from "../messages.js";
+import type { LoopHealthSnapshot } from "../loop-health.js";
 import type { ProcessMemoryDiagnostics } from "../process-diagnostics.js";
 
 export interface WebSocketRuntimeCounters {
@@ -66,6 +67,12 @@ export interface WebSocketRuntimeDiagnosticSnapshot<
     p99Ms: number;
     maxMs: number;
   } | null;
+  /**
+   * The loop-blocker series: a microtask-aware timer lateness (the poll-phase
+   * `eventLoopDelay` above cannot see a promise storm), the GC pause series,
+   * and the native handle count.
+   */
+  loopHealth: LoopHealthSnapshot | null;
   uptimeSeconds: number;
   memory: ProcessMemoryDiagnostics;
   runtime: TRuntime;

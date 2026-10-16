@@ -217,9 +217,12 @@ function enqueueSpawnBehaviors(...behaviors: FakeSpawnBehavior[]): void {
   fakeSpawnController.queue.push(...behaviors);
 }
 
-async function loadRunGitCommand(concurrency: number) {
+async function loadRunGitCommand(concurrency: number, options?: { queueDepth?: number }) {
   vi.resetModules();
   vi.stubEnv("PASEO_GIT_CONCURRENCY", String(concurrency));
+  if (options?.queueDepth !== undefined) {
+    vi.stubEnv("PASEO_GIT_MAX_QUEUE_DEPTH", String(options.queueDepth));
+  }
   return import("./run-git-command.js");
 }
 
@@ -340,6 +343,150 @@ describe("runGitCommand", () => {
       failed: 0,
       maxConcurrent: 1,
     });
+  });
+
+  it("measures a command's timeout from its start, not from its queue time", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+
+    // The first command holds the only slot for 250ms while the second waits.
+    // The second runs for 40ms against a 100ms timeout: it must succeed,
+    // because the queue wait is never charged against its own run budget.
+    enqueueSpawnBehaviors({ delayMs: 250 }, { delayMs: 40, stdoutData: "ok" });
+
+    const first = runGitCommand(["status"], { cwd: process.cwd(), timeout: 5_000 });
+    const queuedAt = Date.now();
+    const second = runGitCommand(["rev-parse", "--show-toplevel"], {
+      cwd: process.cwd(),
+      timeout: 100,
+    });
+
+    await expect(second).resolves.toMatchObject({ stdout: "ok" });
+    expect(Date.now() - queuedAt).toBeGreaterThanOrEqual(250);
+    await first;
+  });
+
+  it("defers a background command with a named error when the scheduler queue is full", async () => {
+    const { runGitCommand, runWithGitCommandClass } = await loadRunGitCommand(1, { queueDepth: 1 });
+
+    enqueueSpawnBehaviors({ delayMs: 40 }, { delayMs: 0, stdoutData: "ok" });
+
+    const active = runGitCommand(["status"], { cwd: process.cwd() });
+    const queued = runWithGitCommandClass("background", () =>
+      runGitCommand(["status", "--short"], { cwd: process.cwd() }),
+    );
+
+    await expect(
+      runWithGitCommandClass("background", () =>
+        runGitCommand(["status", "--porcelain"], { cwd: process.cwd() }),
+      ),
+    ).rejects.toMatchObject({
+      name: "GitProcessQueueFullError",
+      code: "GIT_PROCESS_QUEUE_FULL",
+    });
+
+    await Promise.all([active, queued]);
+  });
+
+  it("retires refused background submissions from both metric sets", async () => {
+    // Regression (validator r1 F1): the submit-time records of a queue-full
+    // refusal outlived every window reset, so retained state grew with
+    // cumulative backpressure. Two batches of 1,000 refusals, each drained
+    // before the next, must leave no pending runtime-metrics record and no
+    // unfinished submission.
+    const {
+      runGitCommand,
+      runWithGitCommandClass,
+      createRunGitCommand,
+      snapshotGitCommandRuntimeMetrics,
+      startGitCommandMetrics,
+      stopGitCommandMetrics,
+      waitForGitCommandMetricsIdle,
+    } = await loadRunGitCommand(1, { queueDepth: 1 });
+
+    const named = createRunGitCommand("refused-background");
+    startGitCommandMetrics();
+
+    const observed: Array<{ totalRefusals: number; pendingProvenanceTop: unknown }> = [];
+    let totalRefusals = 0;
+
+    for (let pass = 0; pass < 2; pass += 1) {
+      enqueueSpawnBehaviors({ delayMs: 0 }, { delayMs: 0 });
+      const active = runGitCommand(["status"], { cwd: process.cwd() });
+      await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(pass * 2 + 1));
+      const queued = runGitCommand(["status", "--short"], { cwd: process.cwd() });
+
+      let refusals = 0;
+      const refuse = (error: unknown) => {
+        expect((error as { name?: string }).name).toBe("GitProcessQueueFullError");
+        refusals += 1;
+      };
+      const refuseOne = () =>
+        runWithGitCommandClass("background", () =>
+          named(["status", "--porcelain"], { cwd: process.cwd() }),
+        ).catch(refuse);
+      await Promise.all(Array.from({ length: 1000 }, refuseOne));
+      totalRefusals += refusals;
+      expect(refusals).toBe(1000);
+
+      await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(pass * 2 + 2));
+      await Promise.all([active, queued]);
+
+      // The window resets twice; a refused record must not survive either.
+      // This is read before the idle wait so the runtime-metrics leak is
+      // reported as itself, not as a downstream timeout.
+      expect(snapshotGitCommandRuntimeMetrics().pendingProvenanceTop).toEqual([]);
+      const afterReset = snapshotGitCommandRuntimeMetrics();
+      expect(afterReset.pendingProvenanceTop).toEqual([]);
+      expect(afterReset.pending).toBe(0);
+      expect(afterReset.active).toBe(0);
+      observed.push({ totalRefusals, pendingProvenanceTop: afterReset.pendingProvenanceTop });
+    }
+
+    expect(observed).toEqual([
+      { totalRefusals: 1000, pendingProvenanceTop: [] },
+      { totalRefusals: 2000, pendingProvenanceTop: [] },
+    ]);
+
+    // The submission list is drained too: `idle` returns and `stop` does not
+    // refuse for orphaned submissions.
+    await waitForGitCommandMetricsIdle({ quietMs: 0, timeoutMs: 1_000 });
+    const drained = stopGitCommandMetrics();
+    expect(drained.pending).toBe(0);
+    expect(drained.submitted).toBe(drained.completed);
+  });
+
+  it("never defers a foreground command for queue depth, however deep the queue is", async () => {
+    const { runGitCommand, runWithGitCommandClass } = await loadRunGitCommand(1, { queueDepth: 1 });
+
+    enqueueSpawnBehaviors(
+      { delayMs: 40 },
+      { delayMs: 0, stdoutData: "queued-background" },
+      ...Array.from({ length: 4 }, (_, index) => ({
+        delayMs: 0,
+        stdoutData: `foreground-${index}`,
+      })),
+    );
+
+    const active = runGitCommand(["status"], { cwd: process.cwd() });
+    const background = runWithGitCommandClass("background", () =>
+      runGitCommand(["status", "--short"], { cwd: process.cwd() }),
+    );
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+
+    // The queue bound is full, so the next background command yields...
+    await expect(
+      runWithGitCommandClass("background", () =>
+        runGitCommand(["status", "--porcelain"], { cwd: process.cwd() }),
+      ),
+    ).rejects.toMatchObject({ name: "GitProcessQueueFullError" });
+
+    // ...but every foreground command still enqueues and executes.
+    const foreground = Array.from({ length: 4 }, (_, index) =>
+      runGitCommand(["rev-parse", `f${index}`], { cwd: process.cwd() }),
+    );
+
+    await expect(Promise.all([active, background, ...foreground])).resolves.toHaveLength(6);
+    expect(fakeSpawnController.processes).toHaveLength(6);
   });
 
   it("records submitted Git commands before they start and refuses an incomplete measurement", async () => {

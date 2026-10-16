@@ -29,6 +29,7 @@ export interface GitCommandRuntimeMetricsSnapshot {
 interface GitCommandRuntimeMetric {
   queuedAtMs: number;
   startedAtMs: number | null;
+  operation: string;
   provenance: string;
 }
 
@@ -59,12 +60,38 @@ export class GitCommandRuntimeMetricsWindow {
   ) {}
 
   submit(operation: string, provenance = "unattributed"): GitCommandRuntimeMetric {
-    const metric = { queuedAtMs: this.clock(), startedAtMs: null, provenance };
+    const metric = { queuedAtMs: this.clock(), startedAtMs: null, operation, provenance };
     this.pendingCommands.add(metric);
     this.submittedCount += 1;
     this.operationCounts.set(operation, (this.operationCounts.get(operation) ?? 0) + 1);
     this.provenanceCounts.set(provenance, (this.provenanceCounts.get(provenance) ?? 0) + 1);
     return metric;
+  }
+
+  /**
+   * Retire a submission the limiter refused before it could be admitted.
+   *
+   * The scheduler rejects a `background` submission when its queue is at its
+   * bound, and that is a deferral, not a command: nothing ran, so nothing may
+   * stay pending. Without this the refusal's `submit` record outlives every
+   * window reset and retained state grows with cumulative backpressure
+   * (`pendingProvenanceTop` counted 2,000 refusals after the queue had drained).
+   *
+   * Only `submit`'s own bookkeeping is undone. The refusal keeps its named
+   * `GitProcessQueueFullError` deferral signal, and a submission that really
+   * started is never retired: `start` removes the metric from the pending set,
+   * so this is a no-op for it and returns `false`. The boolean is what tells a
+   * caller the command never started, which is the only case in which its
+   * submission record may be retired too.
+   */
+  retire(metric: GitCommandRuntimeMetric): boolean {
+    if (!this.pendingCommands.delete(metric)) {
+      return false;
+    }
+    this.submittedCount = Math.max(0, this.submittedCount - 1);
+    decrementCount(this.operationCounts, metric.operation);
+    decrementCount(this.provenanceCounts, metric.provenance);
+    return true;
   }
 
   observeLimiter(active: number, pending: number): void {
@@ -148,6 +175,15 @@ export class GitCommandRuntimeMetricsWindow {
     this.operationCounts.clear();
     this.provenanceCounts.clear();
     return snapshot;
+  }
+}
+
+function decrementCount(counts: Map<string, number>, key: string): void {
+  const next = (counts.get(key) ?? 0) - 1;
+  if (next > 0) {
+    counts.set(key, next);
+  } else {
+    counts.delete(key);
   }
 }
 

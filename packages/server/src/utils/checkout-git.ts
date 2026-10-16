@@ -29,7 +29,7 @@ import {
   ForgeCommandError,
 } from "../services/forge-cli-command.js";
 import { parseGitRevParsePath, resolveGitRevParsePath } from "./git-rev-parse-path.js";
-import { runGitCommand, type RunGitCommand } from "./run-git-command.js";
+import { GitProcessQueueFullError, runGitCommand, type RunGitCommand } from "./run-git-command.js";
 import { readGitFileContents } from "./git-file-contents.js";
 import { isPaseoOwnedWorktreeCwd, resolvePaseoWorktreesBaseRoot } from "./worktree.js";
 import {
@@ -929,6 +929,19 @@ function isNotGitRepositoryError(error: unknown): boolean {
   return error instanceof Error && /not a git repository/i.test(error.message);
 }
 
+/**
+ * A full scheduler queue refused the command without running it, so the refusal
+ * says nothing about the repository. Discovery and facts catches turn every
+ * other failure into a "no such fact" result; a deferral must propagate
+ * instead, so the caller yields the tick rather than caching the refusal as a
+ * fact about the checkout.
+ */
+function rethrowGitProcessQueueFullError(error: unknown): void {
+  if (error instanceof GitProcessQueueFullError) {
+    throw error;
+  }
+}
+
 function getRunGitCommand(context?: CheckoutContext): RunGitCommand {
   return context?.runGitCommand ?? runGitCommand;
 }
@@ -974,7 +987,8 @@ export async function getCurrentBranch(
       return await getRebaseHeadBranch(cwd, context);
     }
     return branch.length > 0 ? branch : null;
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     return null;
   }
 }
@@ -994,7 +1008,8 @@ async function getCurrentHeadSha(cwd: string, context?: CheckoutContext): Promis
     });
     const sha = stdout.trim();
     return sha.length > 0 ? sha : null;
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     return null;
   }
 }
@@ -1025,7 +1040,8 @@ async function getRebaseHeadBranch(cwd: string, context?: CheckoutContext): Prom
           return headName.slice("refs/heads/".length) || null;
         }
         return headName || null;
-      } catch {
+      } catch (error) {
+        rethrowGitProcessQueueFullError(error);
         return null;
       }
     }),
@@ -1042,6 +1058,7 @@ async function getWorktreeRoot(cwd: string, context?: CheckoutContext): Promise<
     });
     return parseGitRevParsePath(stdout);
   } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     if (!isNotGitRepositoryError(error)) {
       context?.logger?.warn(
         { err: error, cwd },
@@ -1341,7 +1358,8 @@ export async function getOriginRemoteUrl(
     });
     const url = stdout.trim();
     return url.length > 0 ? url : null;
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     return null;
   }
 }
@@ -1364,7 +1382,8 @@ async function getGitConfigValue(
     });
     const value = stdout.trim();
     return value.length > 0 ? value : null;
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     return null;
   }
 }
@@ -1486,7 +1505,8 @@ export async function resolveAbsoluteGitDir(
     });
     const gitDir = stdout.trim();
     return gitDir.length > 0 ? gitDir : null;
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     return null;
   }
 }
@@ -1498,7 +1518,8 @@ async function resolveGitCommonDir(cwd: string, context?: CheckoutContext): Prom
       envOverlay: READ_ONLY_GIT_ENV,
     });
     return resolveGitRevParsePath(cwd, stdout);
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     return null;
   }
 }
@@ -1559,11 +1580,13 @@ export async function resolveRepositoryDefaultBranch(
           },
         );
         return localName;
-      } catch {
+      } catch (error) {
+        rethrowGitProcessQueueFullError(error);
         return remoteShort;
       }
     }
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     // ignore
   }
 
@@ -1767,7 +1790,8 @@ async function getUpstreamStatus(
     const ahead = Number.parseInt(track.match(/ahead (\d+)/)?.[1] ?? "0", 10);
     const behind = Number.parseInt(track.match(/behind (\d+)/)?.[1] ?? "0", 10);
     return { ref, aheadBehind: { ahead, behind } };
-  } catch {
+  } catch (error) {
+    rethrowGitProcessQueueFullError(error);
     return null;
   }
 }
@@ -2046,7 +2070,10 @@ export async function getCheckoutSnapshotFacts(
     cwd,
     inspected.gitCommonDir,
     context,
-  ).catch(() => null);
+  ).catch((error: unknown) => {
+    rethrowGitProcessQueueFullError(error);
+    return null;
+  });
   let comparisonBaseRef: string | null = null;
   if (
     resolvedBaseRef &&
@@ -2054,7 +2081,10 @@ export async function getCheckoutSnapshotFacts(
     branchNameFromRef(resolvedBaseRef) !== inspected.currentBranch
   ) {
     comparisonBaseRef = await resolveBestComparisonBaseRef(cwd, resolvedBaseRef, context).catch(
-      () => null,
+      (error: unknown) => {
+        rethrowGitProcessQueueFullError(error);
+        return null;
+      },
     );
   }
 

@@ -8,14 +8,31 @@ import { loadPersistedConfig } from "./persisted-config.js";
 import type { PersistedConfig } from "./persisted-config.js";
 import type { MutableDaemonConfig } from "@getpaseo/protocol/messages";
 
+function gitLimitsFrom(
+  git:
+    | {
+        maxProcessesPerSecond?: number;
+        maxProcessConcurrency?: number;
+        maxQueueDepth?: number;
+      }
+    | undefined,
+): NonNullable<MutableDaemonConfig["git"]> {
+  const limits = git ?? {};
+  return {
+    maxProcessesPerSecond: limits.maxProcessesPerSecond ?? 64,
+    maxProcessConcurrency: limits.maxProcessConcurrency ?? 8,
+    maxQueueDepth: limits.maxQueueDepth ?? 256,
+  };
+}
+
 function reloadableConfig(
   persisted: PersistedConfig,
   options: { relayEnabledFallback?: boolean } = {},
 ): MutableDaemonConfig {
   const daemon = persisted.daemon ?? {};
   const relay = daemon.relay ?? {};
-  const git = daemon.git ?? {};
   const agents = persisted.agents ?? {};
+  const gitLimits = gitLimitsFrom(daemon.git);
   return {
     relay: {
       enabled: relay.enabled ?? options.relayEnabledFallback ?? true,
@@ -31,10 +48,7 @@ function reloadableConfig(
     agentProfiles: daemon.agentProfiles,
     cors: { allowedOrigins: [] },
     trustedProxies: ["loopback"],
-    git: {
-      maxProcessesPerSecond: git.maxProcessesPerSecond ?? 64,
-      maxProcessConcurrency: git.maxProcessConcurrency ?? 8,
-    },
+    git: gitLimits,
     app: { baseUrl: "https://app.paseo.sh" },
     pluginsEnabled: persisted.pluginsEnabled ?? false,
     plugins: persisted.plugins ?? {},
@@ -316,7 +330,7 @@ describe("DaemonConfigStore", () => {
         hostnames: ["launch.example.test"],
         cors: { allowedOrigins: ["https://launch.example.test"] },
         trustedProxies: true,
-        git: { maxProcessesPerSecond: 7, maxProcessConcurrency: 2 },
+        git: { maxProcessesPerSecond: 7, maxProcessConcurrency: 2, maxQueueDepth: 256 },
         app: { baseUrl: "https://launch.example.test" },
         catalogRefreshTimeoutMs: 9_000,
         browserTools: { enabled: false },
@@ -967,7 +981,7 @@ describe("DaemonConfigStore reload", () => {
         ...persisted.daemon,
         listen: "127.0.0.1:7777",
         browserTools: { enabled: true },
-        git: { maxProcessesPerSecond: 12, maxProcessConcurrency: 3 },
+        git: { maxProcessesPerSecond: 12, maxProcessConcurrency: 3, maxQueueDepth: 256 },
       },
     });
 
@@ -981,7 +995,11 @@ describe("DaemonConfigStore reload", () => {
       overrideControlledPaths: [],
     });
     expect(store.get().browserTools.enabled).toBe(true);
-    expect(store.get().git).toEqual({ maxProcessesPerSecond: 12, maxProcessConcurrency: 3 });
+    expect(store.get().git).toEqual({
+      maxProcessesPerSecond: 12,
+      maxProcessConcurrency: 3,
+      maxQueueDepth: 256,
+    });
   });
 
   test("applies the global plugin switch in both directions", () => {

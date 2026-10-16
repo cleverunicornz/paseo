@@ -47,7 +47,11 @@ import {
   isDescendantPath,
   warmCheckoutShortstatInBackground,
 } from "./checkout-git.js";
-import { startGitCommandMetrics, stopGitCommandMetrics } from "./run-git-command.js";
+import {
+  GitProcessQueueFullError,
+  startGitCommandMetrics,
+  stopGitCommandMetrics,
+} from "./run-git-command.js";
 import { createForgeResolver } from "../services/forge-resolver.js";
 import { GitHubCommandError, GitHubCliMissingError } from "../services/github-service.js";
 import type { CurrentPullRequestStatus, ForgeService } from "../services/forge-service.js";
@@ -386,6 +390,17 @@ describe("checkout git utilities", () => {
         msg: "Git worktree discovery failed; treating directory as non-Git",
       }),
     ]);
+  });
+
+  it("defers status discovery on a full scheduler queue instead of classifying non-Git", async () => {
+    // A queue-full refusal never ran the command: it says nothing about the
+    // directory. Discovery must propagate it so the caller defers the tick,
+    // never cache a real repository as non-Git.
+    await expect(
+      getCheckoutStatus(repoDir, {
+        runGitCommand: () => Promise.reject(new GitProcessQueueFullError(1)),
+      }),
+    ).rejects.toBeInstanceOf(GitProcessQueueFullError);
   });
 
   it("returns null for getCurrentBranch in a repo with no commits", async () => {
