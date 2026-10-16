@@ -1,0 +1,1 @@
+{"version":3,"file":"terminal-manager-factory.d.ts","sourceRoot":"","sources":["../../../src/terminal/terminal-manager-factory.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,uBAAuB,CAAC;AAG7D,MAAM,WAAW,gCAAgC;IAC/C,sBAAsB,CAAC,EAAE,MAAM,MAAM,GAAG,IAAI,CAAC;CAC9C;AAED,wBAAgB,+BAA+B,CAC7C,OAAO,GAAE,gCAAqC,GAC7C,eAAe,CAEjB"}

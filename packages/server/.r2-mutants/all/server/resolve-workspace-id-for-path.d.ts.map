@@ -1,0 +1,1 @@
+{"version":3,"file":"resolve-workspace-id-for-path.d.ts","sourceRoot":"","sources":["../../../src/server/resolve-workspace-id-for-path.ts"],"names":[],"mappings":"AAGA,OAAO,KAAK,EAAE,wBAAwB,EAAE,MAAM,yBAAyB,CAAC;AAaxE,wBAAgB,yBAAyB,CACvC,GAAG,EAAE,MAAM,EACX,UAAU,EAAE,QAAQ,CAAC,wBAAwB,CAAC,GAC7C,MAAM,GAAG,IAAI,CA0Bf"}

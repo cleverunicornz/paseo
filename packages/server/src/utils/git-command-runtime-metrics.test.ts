@@ -84,4 +84,42 @@ describe("GitCommandRuntimeMetricsWindow", () => {
       activeProvenanceTop: [],
     });
   });
+
+  test("retires a refused submission so it survives no window reset", () => {
+    const { metrics } = createMetricsWindow(1);
+
+    // A refusal: submitted, never started, then retired.
+    const refused = metrics.submit("status", "refused-background");
+    expect(metrics.retire(refused)).toBe(true);
+
+    // The next window sees nothing from it.
+    metrics.observeLimiter(0, 0);
+    expect(metrics.snapshotAndReset()).toMatchObject({
+      active: 0,
+      pending: 0,
+      submitted: 0,
+      started: 0,
+      completed: 0,
+      operationsTop: [],
+      provenanceTop: [],
+      pendingProvenanceTop: [],
+      activeProvenanceTop: [],
+    });
+
+    // A command that really started is never retired: `retire` reports that it
+    // had already left the pending set, so its accounting stays single.
+    const started = metrics.submit("fetch", "workspace-refresh:watch");
+    metrics.start(started);
+    expect(metrics.retire(started)).toBe(false);
+    expect(metrics.retire(started)).toBe(false);
+    metrics.finish(started, { success: true, timedOut: false });
+    expect(metrics.snapshotAndReset()).toMatchObject({
+      submitted: 1,
+      started: 1,
+      completed: 1,
+      failed: 0,
+      operationsTop: [["fetch", 1]],
+      provenanceTop: [["workspace-refresh:watch", 1]],
+    });
+  });
 });

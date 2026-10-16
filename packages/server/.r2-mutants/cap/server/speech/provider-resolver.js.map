@@ -1,0 +1,1 @@
+{"version":3,"file":"provider-resolver.js","sourceRoot":"","sources":["../../../../src/server/speech/provider-resolver.ts"],"names":[],"mappings":"AAEA,MAAM,UAAU,UAAU,CAAI,KAAoB;IAChD,IAAI,OAAO,KAAK,KAAK,UAAU,EAAE,CAAC;QAChC,OAAO,KAAgB,CAAC;IAC1B,CAAC;IACD,OAAO,GAAG,EAAE,CAAC,KAAK,CAAC;AACrB,CAAC"}

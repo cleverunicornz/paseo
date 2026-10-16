@@ -1,0 +1,296 @@
+import { createHash } from "node:crypto";
+import { z } from "zod";
+const TASK_NOTIFICATION_MARKER = "<task-notification>";
+const TAG_NAME_PATTERN = /[.*+?^${}()|[\]\\]/g;
+const OptionalNonEmptyTrimmedStringSchema = z.preprocess((value) => (typeof value === "string" ? value.trim() : value), z.string().min(1).optional());
+const TaskNotificationEnvelopeSchema = z.object({
+    messageId: z.string().nullable(),
+    taskId: z.string().nullable(),
+    toolUseId: z.string().nullable(),
+    status: z.string().nullable(),
+    summary: z.string().nullable(),
+    outputFile: z.string().nullable(),
+    rawText: z.string().nullable(),
+});
+const TaskNotificationUserContentBlockSchema = z
+    .object({
+    text: z.string().optional(),
+    input: z.string().optional(),
+})
+    .passthrough();
+const TaskNotificationUserContentSchema = z.union([
+    z.string(),
+    z.array(TaskNotificationUserContentBlockSchema),
+]);
+const TaskNotificationHistoryRecordSchema = z
+    .object({
+    type: z.string().optional(),
+    subtype: z.string().optional(),
+    uuid: z.string().optional(),
+    message_id: z.string().optional(),
+    task_id: z.string().optional(),
+    tool_use_id: z.string().optional(),
+    status: z.string().optional(),
+    summary: z.string().optional(),
+    output_file: z.string().optional(),
+    content: z.string().optional(),
+    message: z.object({ content: z.unknown().optional() }).passthrough().optional(),
+})
+    .passthrough();
+const MapTaskNotificationUserContentToToolCallInputSchema = z.object({
+    content: z.unknown(),
+    messageId: z.string().optional().nullable(),
+});
+function toNonEmptyString(value) {
+    const parsed = OptionalNonEmptyTrimmedStringSchema.safeParse(value);
+    if (!parsed.success) {
+        return null;
+    }
+    return parsed.data ?? null;
+}
+function collectUserContentParts(content) {
+    if (typeof content === "string") {
+        const normalized = toNonEmptyString(content);
+        return normalized ? [normalized] : [];
+    }
+    const parts = [];
+    for (const block of content) {
+        const text = toNonEmptyString(block.text);
+        if (text) {
+            parts.push(text);
+        }
+        const input = toNonEmptyString(block.input);
+        if (input) {
+            parts.push(input);
+        }
+    }
+    return parts;
+}
+function extractUserContentText(content) {
+    const parsedContent = TaskNotificationUserContentSchema.safeParse(content);
+    if (!parsedContent.success) {
+        return null;
+    }
+    const parts = collectUserContentParts(parsedContent.data);
+    if (parts.length === 0) {
+        return null;
+    }
+    return parts.join("\n\n");
+}
+function readTaskNotificationTagValue(input) {
+    const escapedTagName = input.tagName.replace(TAG_NAME_PATTERN, "\\$&");
+    const pattern = new RegExp(`<${escapedTagName}>\\s*([\\s\\S]*?)\\s*</${escapedTagName}>`, "i");
+    const match = input.text.match(pattern);
+    if (!match) {
+        return null;
+    }
+    return toNonEmptyString(match[1]);
+}
+function parseTaskNotificationFromUserContent(input) {
+    const parsedInput = MapTaskNotificationUserContentToToolCallInputSchema.safeParse(input);
+    if (!parsedInput.success) {
+        return null;
+    }
+    const rawText = extractUserContentText(parsedInput.data.content);
+    if (!rawText || !rawText.includes(TASK_NOTIFICATION_MARKER)) {
+        return null;
+    }
+    return TaskNotificationEnvelopeSchema.parse({
+        messageId: toNonEmptyString(parsedInput.data.messageId),
+        taskId: readTaskNotificationTagValue({ text: rawText, tagName: "task-id" }),
+        toolUseId: readTaskNotificationTagValue({ text: rawText, tagName: "tool-use-id" }) ??
+            readTaskNotificationTagValue({ text: rawText, tagName: "tool_use_id" }),
+        status: readTaskNotificationTagValue({ text: rawText, tagName: "status" }),
+        summary: readTaskNotificationTagValue({ text: rawText, tagName: "summary" }),
+        outputFile: readTaskNotificationTagValue({ text: rawText, tagName: "output-file" }) ??
+            readTaskNotificationTagValue({ text: rawText, tagName: "output_file" }),
+        rawText,
+    });
+}
+function parseTaskNotificationFromSystemRecord(record) {
+    const parsedRecord = TaskNotificationHistoryRecordSchema.safeParse(record);
+    if (!parsedRecord.success) {
+        return null;
+    }
+    const systemRecord = parsedRecord.data;
+    const isSystemTaskNotification = systemRecord.type === "system" && systemRecord.subtype === "task_notification";
+    const isQueuedTaskNotification = systemRecord.type === "queue-operation" && isTaskNotificationUserContent(systemRecord.content);
+    if (!isSystemTaskNotification && !isQueuedTaskNotification) {
+        return null;
+    }
+    const rawText = toNonEmptyString(systemRecord.content);
+    return TaskNotificationEnvelopeSchema.parse({
+        messageId: toNonEmptyString(systemRecord.uuid) ?? toNonEmptyString(systemRecord.message_id),
+        taskId: toNonEmptyString(systemRecord.task_id) ??
+            (rawText ? readTaskNotificationTagValue({ text: rawText, tagName: "task-id" }) : null),
+        toolUseId: toNonEmptyString(systemRecord.tool_use_id) ??
+            (rawText
+                ? (readTaskNotificationTagValue({ text: rawText, tagName: "tool-use-id" }) ??
+                    readTaskNotificationTagValue({ text: rawText, tagName: "tool_use_id" }))
+                : null),
+        status: toNonEmptyString(systemRecord.status) ??
+            (rawText ? readTaskNotificationTagValue({ text: rawText, tagName: "status" }) : null),
+        summary: toNonEmptyString(systemRecord.summary) ??
+            (rawText ? readTaskNotificationTagValue({ text: rawText, tagName: "summary" }) : null),
+        outputFile: toNonEmptyString(systemRecord.output_file) ??
+            (rawText
+                ? (readTaskNotificationTagValue({ text: rawText, tagName: "output-file" }) ??
+                    readTaskNotificationTagValue({ text: rawText, tagName: "output_file" }))
+                : null),
+        rawText,
+    });
+}
+function normalizeTaskNotificationCallIdSegment(segment) {
+    const normalized = segment.trim().replace(/[^a-zA-Z0-9._:-]+/g, "_");
+    return normalized.length > 0 ? normalized : null;
+}
+function buildTaskNotificationCallId(envelope) {
+    const messageSegment = envelope.messageId
+        ? normalizeTaskNotificationCallIdSegment(envelope.messageId)
+        : null;
+    if (messageSegment) {
+        return `task_notification_${messageSegment}`;
+    }
+    const taskSegment = envelope.taskId
+        ? normalizeTaskNotificationCallIdSegment(envelope.taskId)
+        : null;
+    if (taskSegment) {
+        return `task_notification_${taskSegment}`;
+    }
+    const seed = [envelope.status, envelope.summary, envelope.outputFile, envelope.rawText]
+        .filter((value) => typeof value === "string")
+        .join("|") || "task_notification";
+    const digest = createHash("sha1").update(seed).digest("hex").slice(0, 12);
+    return `task_notification_${digest}`;
+}
+function buildTaskNotificationLabel(envelope) {
+    if (envelope.summary) {
+        return envelope.summary;
+    }
+    if (envelope.status) {
+        return `Background task ${envelope.status.toLowerCase()}`;
+    }
+    return "Background task notification";
+}
+function buildTaskNotificationStatus(input) {
+    const normalizedStatus = input.status?.toLowerCase() ?? null;
+    if (normalizedStatus === "failed" || normalizedStatus === "error") {
+        return {
+            status: "failed",
+            error: { message: input.summary ?? "Background task failed" },
+        };
+    }
+    if (normalizedStatus === "canceled" || normalizedStatus === "cancelled") {
+        return { status: "canceled", error: null };
+    }
+    return { status: "completed", error: null };
+}
+function toTaskNotificationToolCall(envelope) {
+    const lifecycle = buildTaskNotificationStatus({
+        status: envelope.status,
+        summary: envelope.summary,
+    });
+    const label = buildTaskNotificationLabel(envelope);
+    const detailText = envelope.rawText ?? envelope.summary ?? undefined;
+    const metadata = {
+        synthetic: true,
+        source: "claude_task_notification",
+        ...(envelope.taskId ? { taskId: envelope.taskId } : {}),
+        ...(envelope.toolUseId ? { toolUseId: envelope.toolUseId } : {}),
+        ...(envelope.status ? { status: envelope.status } : {}),
+        ...(envelope.outputFile ? { outputFile: envelope.outputFile } : {}),
+    };
+    const base = {
+        type: "tool_call",
+        callId: buildTaskNotificationCallId(envelope),
+        name: "task_notification",
+        detail: {
+            type: "plain_text",
+            label,
+            icon: "wrench",
+            ...(detailText ? { text: detailText } : {}),
+        },
+        metadata,
+    };
+    if (lifecycle.status === "failed") {
+        return {
+            ...base,
+            status: "failed",
+            error: lifecycle.error,
+        };
+    }
+    if (lifecycle.status === "canceled") {
+        return {
+            ...base,
+            status: "canceled",
+            error: null,
+        };
+    }
+    return {
+        ...base,
+        status: "completed",
+        error: null,
+    };
+}
+export function isTaskNotificationUserContent(content) {
+    const rawText = extractUserContentText(content);
+    if (!rawText) {
+        return false;
+    }
+    return rawText.includes(TASK_NOTIFICATION_MARKER);
+}
+export function mapTaskNotificationUserContentToToolCall(input) {
+    const parsed = parseTaskNotificationFromUserContent(input);
+    if (!parsed) {
+        return null;
+    }
+    return toTaskNotificationToolCall(parsed);
+}
+export function mapTaskNotificationSystemRecordToToolCall(record) {
+    const parsed = parseTaskNotificationFromSystemRecord(record);
+    if (!parsed) {
+        return null;
+    }
+    return toTaskNotificationToolCall(parsed);
+}
+export function readTaskNotificationToolUseIdFromHistoryRecord(record) {
+    const parsedRecord = TaskNotificationHistoryRecordSchema.safeParse(record);
+    if (!parsedRecord.success) {
+        return null;
+    }
+    if (parsedRecord.data.type === "user" && parsedRecord.data.message) {
+        return (parseTaskNotificationFromUserContent({
+            content: parsedRecord.data.message.content,
+            messageId: parsedRecord.data.uuid ?? parsedRecord.data.message_id,
+        })?.toolUseId ?? null);
+    }
+    return parseTaskNotificationFromSystemRecord(record)?.toolUseId ?? null;
+}
+export function coerceTaskNotificationHistoryRecordToSystemMessage(record) {
+    const parsed = parseTaskNotificationFromSystemRecord(record);
+    if (!parsed) {
+        return null;
+    }
+    const normalizedStatus = parsed.status?.toLowerCase() ?? null;
+    let status;
+    if (normalizedStatus === "failed" || normalizedStatus === "error") {
+        status = "failed";
+    }
+    else if (normalizedStatus === "canceled" || normalizedStatus === "cancelled") {
+        status = "stopped";
+    }
+    else {
+        status = "completed";
+    }
+    return {
+        type: "system",
+        subtype: "task_notification",
+        ...(parsed.messageId ? { uuid: parsed.messageId } : {}),
+        ...(parsed.taskId ? { task_id: parsed.taskId } : {}),
+        status,
+        ...(parsed.summary ? { summary: parsed.summary } : {}),
+        ...(parsed.outputFile ? { output_file: parsed.outputFile } : {}),
+        ...(parsed.rawText ? { content: parsed.rawText } : {}),
+    };
+}
+//# sourceMappingURL=task-notification-tool-call.js.map

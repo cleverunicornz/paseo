@@ -1,0 +1,1 @@
+{"version":3,"file":"policy.d.ts","sourceRoot":"","sources":["../../../../src/server/browser-tools/policy.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,iBAAiB,EAAuB,MAAM,2BAA2B,CAAC;AAExF,MAAM,WAAW,kBAAkB;IACjC,SAAS,IAAI,OAAO,CAAC;CACtB;AAED,qBAAa,8BAA+B,YAAW,kBAAkB;IACpD,OAAO,CAAC,QAAQ,CAAC,WAAW;gBAAX,WAAW,EAAE,IAAI,CAAC,iBAAiB,EAAE,KAAK,CAAC;IAExE,SAAS,IAAI,OAAO;CAG5B"}

@@ -1,0 +1,1 @@
+{"version":3,"file":"stale-provider-session-error.d.ts","sourceRoot":"","sources":["../../../../src/server/agent/stale-provider-session-error.ts"],"names":[],"mappings":"AAAA,2FAA2F;AAC3F,qBAAa,yBAA0B,SAAQ,KAAK;gBACtC,SAAS,EAAE,MAAM;CAI9B;AAED,wBAAgB,2BAA2B,CAAC,KAAK,EAAE,OAAO,GAAG,KAAK,IAAI,yBAAyB,CAE9F"}

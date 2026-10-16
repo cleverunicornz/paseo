@@ -1,0 +1,1 @@
+{"version":3,"file":"commands.d.ts","sourceRoot":"","sources":["../../../../../../../src/server/agent/providers/opencode/v2/commands.ts"],"names":[],"mappings":"AAEA,OAAO,KAAK,EAAE,KAAK,EAAE,MAAM,UAAU,CAAC;AAEtC,OAAO,KAAK,EAAE,iBAAiB,EAAE,MAAM,6BAA6B,CAAC;AAErE,wBAAsB,QAAQ,CAAC,MAAM,EAAE,KAAK,EAAE,SAAS,EAAE,MAAM,GAAG,OAAO,CAAC,iBAAiB,EAAE,CAAC,CAgC7F"}

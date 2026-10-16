@@ -1,0 +1,80 @@
+import { createHash } from "node:crypto";
+const ADVISOR_SEVERITIES = {
+    nit: true,
+    concern: true,
+    blocker: true,
+};
+function readOptionalString(value) {
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+function readAdvisorNotes(message) {
+    const details = Reflect.get(message, "details");
+    if (!details || typeof details !== "object")
+        return [];
+    const notes = Reflect.get(details, "notes");
+    if (!Array.isArray(notes))
+        return [];
+    return notes.flatMap((value) => {
+        if (!value || typeof value !== "object")
+            return [];
+        const note = readOptionalString(Reflect.get(value, "note"));
+        if (!note)
+            return [];
+        const rawSeverity = Reflect.get(value, "severity");
+        const severity = typeof rawSeverity === "string" && rawSeverity in ADVISOR_SEVERITIES
+            ? rawSeverity
+            : undefined;
+        const advisor = readOptionalString(Reflect.get(value, "advisor"));
+        return [{ note, ...(severity ? { severity } : {}), ...(advisor ? { advisor } : {}) }];
+    });
+}
+function formatAdvisorNote(note) {
+    const prefix = [
+        note.severity ? `[${note.severity}]` : null,
+        note.advisor ? `[${note.advisor}]` : null,
+    ]
+        .filter(Boolean)
+        .join(" ");
+    return prefix ? `${prefix} ${note.note}` : note.note;
+}
+function buildAdvisorLabel(noteCount, blockerCount) {
+    if (noteCount === 0)
+        return "Advisor";
+    const label = `Advisor · ${noteCount} ${noteCount === 1 ? "note" : "notes"}`;
+    return blockerCount > 0
+        ? `${label} · ${blockerCount} ${blockerCount === 1 ? "blocker" : "blockers"}`
+        : label;
+}
+function buildAdvisorCallId(message, text) {
+    const id = readOptionalString(Reflect.get(message, "id"));
+    if (id)
+        return `omp-advisor:${id}`;
+    const digest = createHash("sha1").update(text.trim()).digest("hex").slice(0, 12);
+    return `omp-advisor:${digest}`;
+}
+export function mapOmpAdvisorMessageToToolCall(message, text) {
+    if (Reflect.get(message, "customType") !== "advisor")
+        return null;
+    const notes = readAdvisorNotes(message);
+    const blockerCount = notes.filter((note) => note.severity === "blocker").length;
+    return {
+        type: "tool_call",
+        callId: buildAdvisorCallId(message, text),
+        name: "advisor",
+        status: "completed",
+        detail: {
+            type: "plain_text",
+            label: buildAdvisorLabel(notes.length, blockerCount),
+            text: notes.length > 0 ? notes.map(formatAdvisorNote).join("\n\n") : text,
+            icon: "brain",
+        },
+        metadata: {
+            synthetic: true,
+            source: "omp_advisor",
+            noteCount: notes.length,
+            blockerCount,
+        },
+        error: null,
+    };
+}
+//# sourceMappingURL=advisor-message.js.map

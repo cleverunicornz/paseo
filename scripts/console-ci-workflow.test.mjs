@@ -199,16 +199,58 @@ test("the console line's ancestry and its built payload are both checked", () =>
     jobBody(workflow, "daemon"),
     /uses: actions\/checkout@[0-9a-f]+\n\s+with:\n(?:\s+#.*\n)*\s+fetch-depth: 0/,
   );
-  // The payload check reads what was built, and runs after the build.
+  // The payload check reads what was built, and runs after the build. It RUNS the
+  // built code through the behavior probes: the r1 validator reverted the bound
+  // and either heap helper with every marker string intact, and a substring
+  // search accepted all three mutants.
   const payload = step("Check the built payload carries both fixes");
-  assert.match(payload.text, /packages\/server\/dist\/server\/server/);
-  assert.match(payload.text, /assertPayloadCarriesFixes/);
+  assert.match(payload.text, /assertPayloadCarriesFixes\("packages\/server\/dist\/server"\)/);
   assert.ok(
     stepIndex("Build daemon and CLI") < stepIndex("Check the built payload carries both fixes"),
   );
-  // The provenance script has its own tests in the release-rules step.
-  assert.match(
-    step("Check the release rules").text,
-    /scripts\/console-release-provenance\.test\.mjs/,
+  // The provenance script has its own tests in the release-rules step, and the
+  // probes are not a marker list at all: no substring constants remain.
+  const releaseRules = step("Check the release rules");
+  assert.match(releaseRules.text, /scripts\/console-release-provenance\.test\.mjs/);
+  assert.match(releaseRules.text, /scripts\/release-assets\.test\.mjs/);
+  assert.doesNotMatch(workflow, /PAYLOAD_MARKERS/);
+});
+
+test("the prepublished identity is checked on the real packed assets", () => {
+  // The r1 control: real 0.11.2 tarballs renamed to the tag's version passed the
+  // old gate. This step reads each tarball's own embedded package.json, the
+  // checksum tables against the tarballs' bytes, and SOURCE_COMMIT against the run.
+  const identity = step("Check the release identity and its packed payload");
+  assert.match(identity.text, /readReleaseAssets/);
+  assert.match(identity.text, /assertPrepublicationProvenance/);
+  assert.match(identity.text, /expectedReleaseAssets/);
+  assert.match(identity.text, /packed\.version, version/);
+  assert.match(identity.text, /assets\.sourceCommit, runCommit/);
+  // It runs on a release dispatch, after the packs, before the upload.
+  assert.match(identity.text, /if: github\.event_name == 'workflow_dispatch'/);
+  assert.ok(stepIndex("Pack release packages") < stepIndex("Check the release identity and its packed payload"));
+});
+
+test("the published release is qualified from its downloaded assets, read-only", () => {
+  // POSTPUBLICATION: a downloaded release is the evidence. The job downloads the
+  // release it just published, installs the tarballs as the image does, and runs
+  // the probes against the INSTALLED server's dist, so the proof is of the
+  // published bytes rather than of this run's build tree.
+  const job = jobBody(workflow, "qualify-published");
+  assert.match(job, /needs: publish/);
+  assert.match(job, /permissions:\n {6}contents: read\n/);
+  assert.doesNotMatch(job, /contents: write/);
+  const download = jobSteps(workflow, "qualify-published").find((entry) =>
+    /gh release download/.test(entry.text),
   );
+  assert.ok(download, "step downloading the release");
+  const qualify = jobSteps(workflow, "qualify-published").find((entry) =>
+    /assertReleaseProvenance/.test(entry.text),
+  );
+  assert.ok(qualify, "step qualifying the release");
+  assert.match(qualify.text, /installedRoot, "@getpaseo\/server\/dist\/server"/);
+  assert.match(qualify.text, /assertPayloadCarriesFixes/);
+  assert.match(qualify.text, /readReleaseAssets/);
+  // The write token stays the publish job's alone; the qualifier only reads.
+  assert.equal([...workflow.matchAll(/contents: write/g)].length, 1);
 });

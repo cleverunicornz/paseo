@@ -1,0 +1,86 @@
+import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
+import { z } from "zod";
+export declare const ClaudeProviderOptionsSchema: z.ZodObject<{
+    allowedTools: z.ZodOptional<z.ZodArray<z.ZodString>>;
+    disallowedTools: z.ZodOptional<z.ZodArray<z.ZodString>>;
+    additionalDirectories: z.ZodOptional<z.ZodArray<z.ZodString>>;
+    extraArgs: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodNullable<z.ZodString>>>;
+    sandbox: z.ZodOptional<z.ZodObject<{
+        enabled: z.ZodOptional<z.ZodBoolean>;
+        failIfUnavailable: z.ZodOptional<z.ZodBoolean>;
+        autoAllowBashIfSandboxed: z.ZodOptional<z.ZodBoolean>;
+        excludedCommands: z.ZodOptional<z.ZodArray<z.ZodString>>;
+        allowUnsandboxedCommands: z.ZodOptional<z.ZodBoolean>;
+        network: z.ZodOptional<z.ZodObject<{
+            allowedDomains: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            deniedDomains: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            strictAllowlist: z.ZodOptional<z.ZodBoolean>;
+            allowManagedDomainsOnly: z.ZodOptional<z.ZodBoolean>;
+            allowUnixSockets: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            allowAllUnixSockets: z.ZodOptional<z.ZodBoolean>;
+            allowLocalBinding: z.ZodOptional<z.ZodBoolean>;
+            allowMachLookup: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            httpProxyPort: z.ZodOptional<z.ZodNumber>;
+            socksProxyPort: z.ZodOptional<z.ZodNumber>;
+            tlsTerminate: z.ZodOptional<z.ZodObject<{
+                caCertPath: z.ZodOptional<z.ZodString>;
+                caKeyPath: z.ZodOptional<z.ZodString>;
+            }, z.core.$strict>>;
+        }, z.core.$strict>>;
+        filesystem: z.ZodOptional<z.ZodObject<{
+            allowWrite: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            denyWrite: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            denyRead: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            allowRead: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            allowManagedReadPathsOnly: z.ZodOptional<z.ZodBoolean>;
+            disabled: z.ZodOptional<z.ZodBoolean>;
+        }, z.core.$strict>>;
+        ignoreViolations: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodArray<z.ZodString>>>;
+        enableWeakerNestedSandbox: z.ZodOptional<z.ZodBoolean>;
+        ripgrep: z.ZodOptional<z.ZodObject<{
+            command: z.ZodString;
+            args: z.ZodOptional<z.ZodArray<z.ZodString>>;
+        }, z.core.$strict>>;
+    }, z.core.$strict>>;
+    settings: z.ZodOptional<z.ZodObject<{
+        permissions: z.ZodOptional<z.ZodObject<{
+            allow: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            ask: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            deny: z.ZodOptional<z.ZodArray<z.ZodString>>;
+        }, z.core.$strict>>;
+        sandbox: z.ZodOptional<z.ZodObject<{
+            enabled: z.ZodOptional<z.ZodBoolean>;
+            failIfUnavailable: z.ZodOptional<z.ZodBoolean>;
+            autoAllowBashIfSandboxed: z.ZodOptional<z.ZodBoolean>;
+            excludedCommands: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            allowUnsandboxedCommands: z.ZodOptional<z.ZodBoolean>;
+            network: z.ZodOptional<z.ZodObject<{
+                allowedDomains: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                deniedDomains: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                strictAllowlist: z.ZodOptional<z.ZodBoolean>;
+                allowManagedDomainsOnly: z.ZodOptional<z.ZodBoolean>;
+                allowUnixSockets: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                allowAllUnixSockets: z.ZodOptional<z.ZodBoolean>;
+                allowLocalBinding: z.ZodOptional<z.ZodBoolean>;
+                allowMachLookup: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                httpProxyPort: z.ZodOptional<z.ZodNumber>;
+                socksProxyPort: z.ZodOptional<z.ZodNumber>;
+                tlsTerminate: z.ZodOptional<z.ZodObject<{
+                    caCertPath: z.ZodOptional<z.ZodString>;
+                    caKeyPath: z.ZodOptional<z.ZodString>;
+                }, z.core.$strict>>;
+            }, z.core.$strict>>;
+            filesystem: z.ZodOptional<z.ZodObject<{
+                allowWrite: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                denyWrite: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                denyRead: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                allowRead: z.ZodOptional<z.ZodArray<z.ZodString>>;
+                allowManagedReadPathsOnly: z.ZodOptional<z.ZodBoolean>;
+                disabled: z.ZodOptional<z.ZodBoolean>;
+            }, z.core.$strict>>;
+        }, z.core.$strict>>;
+    }, z.core.$strict>>;
+}, z.core.$strict>;
+export type ClaudeProviderOptions = z.infer<typeof ClaudeProviderOptionsSchema>;
+export declare function applyClaudeToolPolicy(options: ClaudeProviderOptions, toolPolicy: ToolPolicy | undefined): ClaudeProviderOptions;
+//# sourceMappingURL=options.d.ts.map

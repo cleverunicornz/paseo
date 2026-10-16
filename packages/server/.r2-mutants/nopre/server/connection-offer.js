@@ -1,0 +1,59 @@
+import os from "node:os";
+import { ConnectionOfferV2Schema } from "@getpaseo/protocol/connection-offer";
+export function buildOfferEndpoints({ listenHost, port }) {
+    const endpoints = [];
+    const isLoopbackHost = listenHost === "127.0.0.1" || listenHost === "localhost";
+    const isWildcardHost = listenHost === "0.0.0.0" || listenHost === "::" || listenHost === "[::]";
+    if (isWildcardHost) {
+        const lanIp = getPrimaryLanIp();
+        if (lanIp) {
+            endpoints.push(`${lanIp}:${port}`);
+        }
+    }
+    else if (!isLoopbackHost) {
+        endpoints.push(`${listenHost}:${port}`);
+    }
+    endpoints.push(`localhost:${port}`);
+    return dedupePreserveOrder(endpoints);
+}
+export async function createConnectionOfferV2(args) {
+    return ConnectionOfferV2Schema.parse({
+        v: 2,
+        serverId: args.serverId,
+        daemonPublicKeyB64: args.daemonPublicKeyB64,
+        relay: args.relay,
+    });
+}
+export function encodeOfferToFragmentUrl(args) {
+    const json = JSON.stringify(args.offer);
+    const encoded = Buffer.from(json, "utf8").toString("base64url");
+    return `${args.appBaseUrl.replace(/\/$/, "")}/#offer=${encoded}`;
+}
+function getPrimaryLanIp() {
+    const override = process.env.PASEO_PRIMARY_LAN_IP?.trim();
+    if (override)
+        return override;
+    const nets = os.networkInterfaces();
+    const names = Object.keys(nets).sort();
+    for (const name of names) {
+        const addrs = nets[name] ?? [];
+        for (const addr of addrs) {
+            if (addr.family === "IPv4" && !addr.internal) {
+                return addr.address;
+            }
+        }
+    }
+    return null;
+}
+function dedupePreserveOrder(values) {
+    const out = [];
+    const seen = new Set();
+    for (const value of values) {
+        if (seen.has(value))
+            continue;
+        seen.add(value);
+        out.push(value);
+    }
+    return out;
+}
+//# sourceMappingURL=connection-offer.js.map

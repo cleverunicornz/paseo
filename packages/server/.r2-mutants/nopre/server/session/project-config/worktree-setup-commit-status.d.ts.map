@@ -1,0 +1,1 @@
+{"version":3,"file":"worktree-setup-commit-status.d.ts","sourceRoot":"","sources":["../../../../../src/server/session/project-config/worktree-setup-commit-status.ts"],"names":[],"mappings":"AAAA,OAAO,EAGL,KAAK,cAAc,EACpB,MAAM,wCAAwC,CAAC;AAIhD,wBAAsB,kCAAkC,CAAC,KAAK,EAAE;IAC9D,QAAQ,EAAE,MAAM,CAAC;IACjB,aAAa,EAAE,cAAc,GAAG,IAAI,CAAC;CACtC,GAAG,OAAO,CAAC,OAAO,CAAC,CAMnB"}
