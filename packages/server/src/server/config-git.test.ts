@@ -25,6 +25,7 @@ describe("daemon Git process config", () => {
     expect(loadConfig(home, { env: {} }).git).toEqual({
       maxProcessesPerSecond: 64,
       maxProcessConcurrency: 8,
+      maxQueueDepth: 256,
     });
   });
 
@@ -34,6 +35,7 @@ describe("daemon Git process config", () => {
         git: {
           maxProcessesPerSecond: 5,
           maxProcessConcurrency: 4,
+          maxQueueDepth: 256,
         },
       },
     });
@@ -41,6 +43,7 @@ describe("daemon Git process config", () => {
     expect(loadConfig(home, { env: {} }).git).toEqual({
       maxProcessesPerSecond: 5,
       maxProcessConcurrency: 4,
+      maxQueueDepth: 256,
     });
   });
 
@@ -50,6 +53,7 @@ describe("daemon Git process config", () => {
         git: {
           maxProcessesPerSecond: 5,
           maxProcessConcurrency: 4,
+          maxQueueDepth: 256,
         },
       },
     });
@@ -64,6 +68,7 @@ describe("daemon Git process config", () => {
     ).toEqual({
       maxProcessesPerSecond: 12,
       maxProcessConcurrency: 6,
+      maxQueueDepth: 256,
     });
   });
 

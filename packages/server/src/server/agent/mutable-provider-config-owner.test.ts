@@ -89,6 +89,7 @@ function mutableConfig(persisted: PersistedConfig): MutableDaemonConfig {
     git: {
       maxProcessesPerSecond: persisted.daemon?.git?.maxProcessesPerSecond ?? 64,
       maxProcessConcurrency: persisted.daemon?.git?.maxProcessConcurrency ?? 8,
+      maxQueueDepth: persisted.daemon?.git?.maxQueueDepth ?? 256,
     },
     app: { baseUrl: persisted.app?.baseUrl ?? "https://app.paseo.sh" },
   };
@@ -157,7 +158,7 @@ describe("mutable provider config owner", () => {
       version: 1,
       daemon: {
         cors: { allowedOrigins: ["https://before.example.test"] },
-        git: { maxProcessesPerSecond: 64, maxProcessConcurrency: 8 },
+        git: { maxProcessesPerSecond: 64, maxProcessConcurrency: 8, maxQueueDepth: 256 },
       },
       app: { baseUrl: "https://before.example.test" },
     };
@@ -194,7 +195,7 @@ describe("mutable provider config owner", () => {
         daemon: {
           ...initial.daemon,
           cors: { allowedOrigins: ["https://after.example.test"] },
-          git: { maxProcessesPerSecond: 5, maxProcessConcurrency: 1 },
+          git: { maxProcessesPerSecond: 5, maxProcessConcurrency: 1, maxQueueDepth: 256 },
         },
         app: { baseUrl: "https://after.example.test" },
       };

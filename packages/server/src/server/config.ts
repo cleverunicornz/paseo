@@ -820,6 +820,9 @@ function resolveCoreDaemonOverridePaths(
   ) {
     paths.push("daemon.git.maxProcessConcurrency");
   }
+  if (parsePositiveGitOverride(env.PASEO_GIT_MAX_QUEUE_DEPTH)) {
+    paths.push("daemon.git.maxQueueDepth");
+  }
   if (env.PASEO_APP_BASE_URL !== undefined) paths.push("app.baseUrl");
   if (env.PASEO_PASSWORD?.trim()) paths.push("daemon.auth.password");
   return paths;

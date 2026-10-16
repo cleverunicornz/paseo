@@ -127,6 +127,13 @@ const WORKSPACE_GIT_AUXILIARY_READ_TTL_MS = 15_000;
 const WORKSPACE_GIT_INTERNAL_MIN_GAP_MS = 2_000;
 // Small values (booleans, short strings, small arrays); generous cap.
 const WORKSPACE_GIT_AUXILIARY_CACHE_MAX = 256;
+/**
+ * The checkout cache must hold the whole live estate, or a sweep re-reads what
+ * the LRU evicted and the warm path degrades to O(workspaces). The observed
+ * estate is a few hundred live records across under a thousand roots; the bound
+ * leaves headroom above that, and stays bounded for a daemon that sees more.
+ */
+const WORKSPACE_GIT_CHECKOUT_CACHE_MAX = 4_096;
 
 function mergeSets<T>(
   left: ReadonlySet<T>,
@@ -210,6 +217,7 @@ export interface WorkspaceGitService {
 
   onSnapshotUpdated(listener: WorkspaceGitSnapshotUpdatedListener): WorkspaceGitSubscription;
   peekSnapshot(cwd: string): WorkspaceGitRuntimeSnapshot | null;
+  peekCachedCheckout(cwd: string): ProjectCheckoutLitePayload | null;
   getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload>;
   getSnapshot(
     cwd: string,
@@ -442,6 +450,21 @@ interface WorkspaceGitTarget {
   closed: boolean;
 }
 
+/**
+ * One lite-checkout cache slot per cwd. `checkout` is null for a retired
+ * entry or a read that has not published yet. `peekCachedCheckout` reads
+ * either as "no cached checkout".
+ */
+interface CachedCheckoutEntry {
+  checkout: ProjectCheckoutLitePayload | null;
+  /**
+   * A unique publication identity. Reads and invalidations replace it;
+   * eviction removes permission to publish. A recreated slot never reuses an
+   * identity still held by an older read.
+   */
+  generation: symbol;
+}
+
 interface RepoGitTarget {
   repoGitRoot: string;
   cwd: string;
@@ -608,6 +631,19 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private readonly workingTreeWatchSetups = new Map<string, Promise<WorkingTreeWatchTarget>>();
   private readonly workingTreeWatchResolutions = new Map<string, Promise<WorkingTreeWatchTarget>>();
   private readonly workingTreeWatchAliases = new Map<string, string>();
+  /**
+   * The last lite checkout per cwd, served without Git to a reconciliation
+   * sweep or a client status request. It is service-level, not per target, so a
+   * directory that was never observed still warms and a closed target's entry
+   * is retired by its own invalidation, not by the target's lifetime.
+   *
+   * Only the read holding a slot's current identity can publish. An evicted
+   * slot refuses all its outstanding reads, with no per-cwd tombstones outside
+   * this bounded cache.
+   */
+  private readonly checkoutCache = new LRUCache<string, CachedCheckoutEntry>({
+    max: WORKSPACE_GIT_CHECKOUT_CACHE_MAX,
+  });
   private readonly branchValidationCache = new LRUCache<
     string,
     WorkspaceGitAuxiliaryReadCacheEntry<WorkspaceGitBranchValidationResult>
@@ -759,34 +795,53 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
+    const cached = this.peekCachedCheckout(normalizedCwd);
+    if (cached) {
+      return cached;
+    }
+    // Captured before any Git read: if an invalidation lands while this read is
+    // in flight, the identity moves and this read publishes nothing - whether
+    // or not the cwd has a workspace target.
+    const generation = this.reserveCheckoutGeneration(normalizedCwd);
     const status = await this.deps.getCheckoutStatus(normalizedCwd, {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
     });
-    if (!status.isGit) {
-      return checkoutLiteFromGitSnapshot(normalizedCwd, {
-        isGit: false,
-        currentBranch: null,
-        remoteUrl: null,
-        repoRoot: null,
-        isPaseoOwnedWorktree: false,
-        mainRepoRoot: null,
-      });
-    }
-    return checkoutLiteFromGitSnapshot(normalizedCwd, {
-      isGit: true,
-      currentBranch: status.currentBranch,
-      remoteUrl: status.remoteUrl,
-      repoRoot: status.repoRoot,
-      isPaseoOwnedWorktree: status.isPaseoOwnedWorktree,
-      mainRepoRoot: status.mainRepoRoot,
-    });
+    const checkout = status.isGit
+      ? checkoutLiteFromGitSnapshot(normalizedCwd, {
+          isGit: true,
+          currentBranch: status.currentBranch,
+          remoteUrl: status.remoteUrl,
+          repoRoot: status.repoRoot,
+          isPaseoOwnedWorktree: status.isPaseoOwnedWorktree,
+          mainRepoRoot: status.mainRepoRoot,
+        })
+      : checkoutLiteFromGitSnapshot(normalizedCwd, {
+          isGit: false,
+          currentBranch: null,
+          remoteUrl: null,
+          repoRoot: null,
+          isPaseoOwnedWorktree: false,
+          mainRepoRoot: null,
+        });
+    this.publishCachedCheckout(normalizedCwd, generation, checkout);
+    return checkout;
   }
 
   peekSnapshot(cwd: string): WorkspaceGitRuntimeSnapshot | null {
     cwd = resolve(cwd);
     return this.workspaceTargets.get(cwd)?.latestSnapshot ?? null;
+  }
+
+  /**
+   * The last completed lite checkout for a warmed workspace, or null when there
+   * is none (no target, or invalidated since the last refresh). Reads nothing
+   * from Git, so a whole-estate sweep costs no processes beyond the refreshes
+   * the workspace's own events already schedule.
+   */
+  peekCachedCheckout(cwd: string): ProjectCheckoutLitePayload | null {
+    return this.checkoutCache.get(resolve(cwd))?.checkout ?? null;
   }
 
   async getCheckoutDiff(
@@ -993,11 +1048,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   onWorkspaceStateMayHaveChanged(cwd: string): void {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
+    // The cached lite checkout may be stale now; a refresh republishes it.
+    // Bumping the generation retires any read already in flight, so it cannot
+    // republish the facts this invalidation just retired. This holds even for a
+    // directory no target has observed: its cached checkout is retired too.
+    this.invalidateCachedCheckout(normalizedCwd);
+    this.invalidateForge(normalizedCwd);
     const target = this.workspaceTargets.get(normalizedCwd);
     if (!target || target.closed) {
       return;
     }
-    this.invalidateForge(normalizedCwd);
     this.scheduleWorkspaceRefresh(target, {
       force: true,
       includeForge: true,
@@ -3188,6 +3248,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         failure = null;
       } catch (error) {
         failure = { error };
+        // A failed refresh must not leave the facts it failed to refresh being
+        // served as fresh. Retire the cache; the next read goes live.
+        this.invalidateCachedCheckout(target.cwd);
       }
 
       if (this.disposed || target.closed || this.workspaceTargets.get(target.cwd) !== target) {
@@ -3215,6 +3278,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     request: WorkspaceGitRefreshRequest,
     runRefreshGitCommand: RunGitCommand,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
+    // Captured before any Git read: if an invalidation lands while this refresh
+    // is in flight, the identity moves and this refresh publishes nothing.
+    const generation = this.reserveCheckoutGeneration(target.cwd);
     let facts = target.latestFacts;
     if (request.movedRemoteRefs.size > 0 && !request.refreshStructure && !request.refreshWorktree) {
       if (facts?.isGit && target.latestGit?.isGit) {
@@ -3258,7 +3324,70 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     const snapshot = this.combineSnapshot(target);
     target.latestSnapshotLoadedAtMs = this.deps.now().getTime();
+    this.publishCachedCheckout(
+      target.cwd,
+      generation,
+      this.checkoutLiteFromRuntimeGit(target.cwd, snapshot.git),
+    );
     return snapshot;
+  }
+
+  /**
+   * Publish the lite checkout derived from the freshest facts this read
+   * established, so a later reconciliation sweep - or a client status request -
+   * can read it without Git. The identity captured when the read began must
+   * still be current: invalidation, eviction or a newer read retires it.
+   */
+  private publishCachedCheckout(
+    cwd: string,
+    generation: symbol,
+    checkout: ProjectCheckoutLitePayload,
+  ): void {
+    // An absent slot also refuses publication. A newer read always reserves a
+    // new identity, including when it recreates a slot after eviction.
+    const current = this.checkoutCache.peek(cwd);
+    if (current?.generation !== generation) {
+      return;
+    }
+    this.checkoutCache.set(cwd, { checkout, generation });
+  }
+
+  /**
+   * Reserve this read's publication identity before it starts. Preserve a warm
+   * value during a refresh, but retire every older read's right to publish.
+   */
+  private reserveCheckoutGeneration(cwd: string): symbol {
+    const generation = Symbol();
+    const checkout = this.checkoutCache.peek(cwd)?.checkout ?? null;
+    this.checkoutCache.set(cwd, { checkout, generation });
+    return generation;
+  }
+
+  private checkoutLiteFromRuntimeGit(
+    cwd: string,
+    git: WorkspaceGitRuntimeSnapshot["git"],
+  ): ProjectCheckoutLitePayload {
+    return checkoutLiteFromGitSnapshot(cwd, {
+      isGit: git.isGit,
+      currentBranch: git.isGit ? git.currentBranch : null,
+      remoteUrl: git.isGit ? git.remoteUrl : null,
+      repoRoot: git.isGit ? git.repoRoot : null,
+      isPaseoOwnedWorktree: git.isGit ? git.isPaseoOwnedWorktree : false,
+      mainRepoRoot: git.isGit ? git.mainRepoRoot : null,
+    });
+  }
+
+  /**
+   * Retire the cached checkout for a cwd and any read in flight behind it. The
+   * next read goes live; a read that began before this call cannot publish. The
+   * slot's identity is never reused, even if eviction removes the slot before
+   * the read resolves. This also holds for cwds with no workspace target.
+   */
+  private invalidateCachedCheckout(cwd: string): void {
+    this.checkoutCache.set(cwd, {
+      checkout: null,
+      generation: Symbol(),
+    });
   }
 
   private async refreshRefDerivedSnapshot(

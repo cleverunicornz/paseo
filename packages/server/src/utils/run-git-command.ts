@@ -15,10 +15,13 @@ import {
 import { spawnProcess } from "./spawn.js";
 import {
   GitProcessScheduler,
+  type GitProcessClass,
   type GitProcessPriority,
   resolveGitProcessPolicy,
   type GitProcessPolicy,
 } from "./git-process-scheduler.js";
+
+export { GitProcessQueueFullError } from "./git-process-scheduler.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
@@ -27,9 +30,20 @@ const DEFAULT_STDERR_LIMIT = 2048;
 let gitProcessScheduler = new GitProcessScheduler(resolveGitProcessPolicy({ env: process.env }));
 let gitRuntimeMetrics = createGitCommandRuntimeMetricsWindow(gitProcessScheduler.policy);
 const gitCommandPriority = new AsyncLocalStorage<GitProcessPriority>();
+const gitCommandClass = new AsyncLocalStorage<GitProcessClass>();
 
 export function runWithGitCommandPriority<T>(priority: GitProcessPriority, operation: () => T): T {
   return gitCommandPriority.run(priority, operation);
+}
+
+/**
+ * Mark every Git command this operation submits as `background`: the
+ * reconciliation sweep's own reads, which yield when the queue is deep rather
+ * than making an agent or a user wait behind them. The default is `foreground`,
+ * which is never refused for queue depth.
+ */
+export function runWithGitCommandClass<T>(commandClass: GitProcessClass, operation: () => T): T {
+  return gitCommandClass.run(commandClass, operation);
 }
 
 function createGitCommandRuntimeMetricsWindow(policy: GitProcessPolicy) {
@@ -562,6 +576,7 @@ function executeGitCommand<Output>(
   };
   const promise = gitProcessScheduler.run(startCommand, {
     priority: gitCommandPriority.getStore() ?? "normal",
+    class: gitCommandClass.getStore() ?? "foreground",
   });
   gitRuntimeMetrics.observeLimiter(
     gitProcessScheduler.activeCount,

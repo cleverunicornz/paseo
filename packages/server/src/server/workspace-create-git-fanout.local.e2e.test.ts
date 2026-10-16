@@ -270,7 +270,11 @@ function waitForCheckoutDiffFiles(subscriptionId: string, expectedPaths: string[
 test.each([1, 2, 10])(
   "coalesces working-file and index events for one of %i observed sibling worktrees",
   async (siblingCount) => {
-    configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+    configureGitProcessPolicy({
+      maxProcessConcurrency: 8,
+      maxProcessesPerSecond: 64,
+      maxQueueDepth: 256,
+    });
     const fixture = await startObservedFixture(siblingCount);
     startGitCommandMetrics();
     await waitForGitCommandMetricsIdle({ quietMs: 1_500, timeoutMs: 30_000 });
@@ -319,7 +323,11 @@ test.each([1, 2, 10])(
 test.each([false, true])(
   "records unchanged index metadata work with base diff subscribed: %s",
   async (hasBaseDiffSubscription) => {
-    configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+    configureGitProcessPolicy({
+      maxProcessConcurrency: 8,
+      maxProcessesPerSecond: 64,
+      maxQueueDepth: 256,
+    });
     const fixture = await startObservedFixture(2);
 
     startGitCommandMetrics();
@@ -366,7 +374,11 @@ test.each([false, true])(
 test.each([1, 2, 10])(
   "records the Git command budget of creating a workspace with %i warm siblings",
   async (siblingCount) => {
-    configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+    configureGitProcessPolicy({
+      maxProcessConcurrency: 8,
+      maxProcessesPerSecond: 64,
+      maxQueueDepth: 256,
+    });
     const fixture = await startObservedFixture(siblingCount);
     startGitCommandMetrics();
     await waitForGitCommandMetricsIdle({ quietMs: 1_500, timeoutMs: 30_000 });
@@ -412,7 +424,11 @@ test.each([1, 2, 10])(
 );
 
 test("refreshes every workspace that depends on a changed shared base ref", async () => {
-  configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+  configureGitProcessPolicy({
+    maxProcessConcurrency: 8,
+    maxProcessesPerSecond: 64,
+    maxQueueDepth: 256,
+  });
   const fixture = await startObservedFixture(2);
   startGitCommandMetrics();
   await waitForGitCommandMetricsIdle({ quietMs: 1_500, timeoutMs: 30_000 });
@@ -463,7 +479,11 @@ test("refreshes every workspace that depends on a changed shared base ref", asyn
 }, 120_000);
 
 test("records the Git command ledger for repository metadata business rules", async () => {
-  configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+  configureGitProcessPolicy({
+    maxProcessConcurrency: 8,
+    maxProcessesPerSecond: 64,
+    maxQueueDepth: 256,
+  });
   const fixture = await startObservedFixture(2);
   await settleGitCommands();
 
@@ -614,7 +634,11 @@ test("records the Git command ledger for repository metadata business rules", as
 }, 120_000);
 
 test("workspace archive is admitted while 52 sibling observations hydrate", async () => {
-  configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+  configureGitProcessPolicy({
+    maxProcessConcurrency: 8,
+    maxProcessesPerSecond: 64,
+    maxQueueDepth: 256,
+  });
   const fixture = seedFixture(52);
   daemon = await createTestPaseoDaemon({
     paseoHomeRoot: fixture.paseoHomeRoot,
@@ -656,14 +680,22 @@ test("workspace archive is admitted while 52 sibling observations hydrate", asyn
 
 test("workspace create is admitted while 100 sibling observations hydrate", async () => {
   process.env.PASEO_GIT_MAX_PROCESSES_PER_SECOND = "64";
-  configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+  configureGitProcessPolicy({
+    maxProcessConcurrency: 8,
+    maxProcessesPerSecond: 64,
+    maxQueueDepth: 256,
+  });
   const fixture = seedFixture();
   daemon = await createTestPaseoDaemon({
     paseoHomeRoot: fixture.paseoHomeRoot,
     cleanup: false,
     mcpEnabled: false,
   });
-  configureGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+  configureGitProcessPolicy({
+    maxProcessConcurrency: 8,
+    maxProcessesPerSecond: 64,
+    maxQueueDepth: 256,
+  });
   client = new DaemonClient({
     url: `ws://127.0.0.1:${daemon.port}/ws`,
     appVersion: "0.3.0-beta.2",

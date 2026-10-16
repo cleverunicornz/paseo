@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { areEquivalentPaths } from "../utils/path.js";
+import { GitProcessQueueFullError } from "../utils/git-process-scheduler.js";
 import { deriveProjectKey } from "./project-key.js";
 import {
   createPersistedProjectRecord,
@@ -175,6 +176,8 @@ class ObservedPlacements {
   private readonly service: WorkspaceReconciliationService;
   private started = false;
   private checkoutReadCount = 0;
+  private checkoutAttemptCount = 0;
+  private queueFullError: Error | null = null;
 
   constructor(private readonly specs: ProjectSpec[]) {
     cleanupPaths.push(this.home);
@@ -266,6 +269,15 @@ class ObservedPlacements {
     this.workspaces.failNextRead(error);
   }
 
+  /** The Git queue is full: the sweep's own reads yield rather than queue. */
+  fullGitQueue(): void {
+    this.queueFullError = new GitProcessQueueFullError(256);
+  }
+
+  emptyGitQueue(): void {
+    this.queueFullError = null;
+  }
+
   holdNextRegistryRead(): Gate {
     return this.projects.holdNextRead();
   }
@@ -324,6 +336,10 @@ class ObservedPlacements {
     return this.checkoutReadCount;
   }
 
+  get gitReadAttempts(): number {
+    return this.checkoutAttemptCount;
+  }
+
   get pendingTimers(): number {
     return this.clock.pendingCount;
   }
@@ -369,6 +385,11 @@ class ObservedPlacements {
   }
 
   private async readCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
+    // A yielded read is not a completed live read: it never reached Git.
+    if (this.queueFullError) {
+      this.checkoutAttemptCount += 1;
+      throw this.queueFullError;
+    }
     this.checkoutReadCount += 1;
     const configured = [...this.checkoutByCwd.entries()].find(([root]) =>
       areEquivalentPaths(root, cwd),
@@ -597,5 +618,35 @@ describe("observed workspace placement", () => {
     expect(reconciliation.workspaceBatches).toEqual([]);
     expect(reconciliation.watchedRoots()).toEqual([]);
     expect(reconciliation.pendingTimers).toBe(0);
+  });
+
+  test("a full Git queue defers the tick, which retries and never surfaces an error", async () => {
+    const observed = new ObservedPlacements([
+      {
+        id: "project-one",
+        root: "repo",
+        workspaces: [{ id: "workspace-one", cwd: "repo/one" }],
+      },
+    ]);
+    await observed.start();
+    observed.makeProjectGit("project-one");
+
+    // The queue is the foreground's: the sweep's reads yield instead of waiting.
+    observed.fullGitQueue();
+    observed.change("repo", ".git");
+    await observed.advanceBy(DEBOUNCE_MS);
+
+    // The tick deferred: the read was attempted and yielded, so nothing reached
+    // Git and no change was published. Nothing surfaced to an agent or a user.
+    expect(observed.gitReads).toBe(0);
+    expect(observed.gitReadAttempts).toBeGreaterThan(0);
+    expect(observed.workspaceBatches).toEqual([]);
+
+    // The queue drained; the retry succeeds and publishes the workspace.
+    observed.emptyGitQueue();
+    await observed.advanceBy(5_000);
+    expect(observed.gitReads).toBeGreaterThan(0);
+    expect(observed.workspaceBatches).toEqual([["workspace-one"]]);
+    observed.dispose();
   });
 });
